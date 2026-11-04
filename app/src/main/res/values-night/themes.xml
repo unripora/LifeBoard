@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      深色窗口底色。只影响 Compose 完成首帧绘制前的空白窗口，
+      避免深色模式下打开应用先闪一下白屏。
+    -->
+    <style name="Theme.LifeBoard" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF161C22</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

@@ -1,0 +1,2 @@
+-keep class com.lifeboard.server.db.** { *; }
+-keep class com.lifeboard.server.provider.** { *; }

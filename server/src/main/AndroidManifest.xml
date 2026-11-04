@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <permission
+        android:name="com.lifeboard.permission.ACCESS_PROVIDER"
+        android:protectionLevel="signature" />
+
+    <application>
+        <provider
+            android:name="com.lifeboard.server.provider.LifeBoardProvider"
+            android:authorities="com.lifeboard.provider"
+            android:exported="true"
+            android:permission="com.lifeboard.permission.ACCESS_PROVIDER"
+            android:multiprocess="false" />
+    </application>
+
+</manifest>

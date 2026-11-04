@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 通知监听：飞书打卡、多邻国连胜识别（M4） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 精确闹钟：M2 提醒调度。侧载自用场景使用 USE_EXACT_ALARM，安装即授予 -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- 强提醒需申请电池优化白名单，否则后台响铃可能被杀 -->
+    <uses-permission
+        android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
+        tools:ignore="BatteryLife" />
+    <!-- 屏幕时长（M1） -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+    <!-- 采集规则要展示完整的已安装应用列表供用户挑选。
+         Android 11+ 默认做包可见性过滤，不声明这项只能看到寥寥几个应用。 -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.LifeBoard">
+
+        <!-- Legacy Xposed 模块声明：LSPosed 靠这几项识别模块。
+             入口类写在 assets/xposed_init，hook 目标为 system_server（进程名 android）。
+             xposedminversion 82：与本机可正常加载的 Legacy 模块保持一致，避免被版本过滤。
+             xposedscope 指向 res/values/arrays.xml 里的 xposed_scope，用于预填作用域。 -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="个人数据聚合与打卡提醒：三级提醒、多源数据同步、待办面板" />
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/xposed_scope" />
+
+        <activity
+            android:name="com.lifeboard.app.MainActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 强提醒：前台服务播闹钟铃声。specialUse 需声明子类型原因 -->
+        <service
+            android:name="com.lifeboard.server.remind.StrongRemindService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="用户在设定时段未完成任务时播放闹钟铃声，属一次性短时提醒" />
+        </service>
+
+        <!-- 提醒闹钟触发 -->
+        <receiver
+            android:name="com.lifeboard.server.remind.RemindReceiver"
+            android:exported="false" />
+
+        <!-- 开机/更新后重排闹钟（澎湃OS 需「自启动」权限才会执行） -->
+        <receiver
+            android:name="com.lifeboard.server.remind.BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 通知监听：识别飞书打卡、多邻国目标达成（M4） -->
+        <service
+            android:name="com.lifeboard.server.notice.NoticeListenerService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- 读屏采集通道。
+             有些行为只在应用界面内给提示、不发通知（如飞书打卡成功），
+             通知监听与 NMS hook 都覆盖不到。监听哪些应用由用户在界面上配置。 -->
+        <service
+            android:name="com.lifeboard.server.notice.ScreenCaptureAccessibilityService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/screen_capture_accessibility" />
+        </service>
+
+        <!-- system_server 通知 hook 的回传接收端（M4 修正）。
+             不能加 signature 权限：发送方 system_server 是平台签名，会被挡掉。
+             广播由 hook 侧用 setPackage 限定只投递给本应用，action 走隐式匹配，
+             所以下面必须声明 intent-filter，否则接收器收不到。
+             理论上其他 app 也能发这条 action 伪造打卡计数，自用场景接受该风险，
+             必要时二期换 system_server 侧直接写 Provider（需豁免调用权限）。 -->
+        <receiver
+            android:name="com.lifeboard.server.notice.SystemNoticeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.lifeboard.action.SYSTEM_NOTICE_REPORTED" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+
+</manifest>
