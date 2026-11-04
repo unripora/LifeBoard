@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">LifeBoard</string>
+    <!-- 无障碍服务说明。系统设置页会展示给用户，要写清楚只读指定应用的提示文字 -->
+    <string name="accessibility_service_description">用于识别指定应用内的操作结果提示（如打卡成功）。只读取你在应用内选定并配置规则的应用界面文字，不采集聊天内容，不上传任何数据。</string>
+</resources>

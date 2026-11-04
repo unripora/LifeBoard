@@ -1,0 +1,4 @@
+-keep class com.lifeboard.app.xposed.** { *; }
+-keep class com.lifeboard.core.** { *; }
+-keep class com.lifeboard.server.** { *; }
+-keepattributes *Annotation*

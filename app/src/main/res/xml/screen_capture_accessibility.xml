@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  读屏采集通道的无障碍配置。
+
+  刻意**不限定 packageNames**：监听哪个应用由用户在界面上选择并写入规则表，
+  代码里不写死任何具体应用。系统层面对事件仍然按需过滤（只处理有规则的包），
+  所以不会把无关应用的文本落库。
+
+  typeWindowContentChanged：大部分「操作成功」提示是页面内容变化，靠它捕获。
+  typeWindowStateChanged：页面切换兜底，部分机型的提示随新窗口一起出现。
+
+  flagIncludeNotImportantViews：提示文字常放在"不重要"的子节点里，
+  默认会被过滤掉，必须打开才能读到。
+
+  flagRetrieveInteractiveWindows：允许读取 windows 列表（全部窗口）。
+  提示弹窗往往是浮在主界面之上的**独立窗口**，只读 rootInActiveWindow
+  会漏掉它，必须遍历 windows 才能拿到弹窗里的文字。
+
+  canRetrieveWindowContent 必须为 true，否则拿不到节点树。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowContentChanged|typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagIncludeNotImportantViews|flagReportViewIds|flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="100" />

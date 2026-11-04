@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Activity 窗口主题。
+
+      这里是「应用启动瞬间、Compose 还没绘制之前」的窗口底色，
+      颜色必须与 Compose 主题的 background 接近，否则打开应用会先闪一下白/黑再变成主题色。
+
+      用 DayNight 父主题并配 values-night，让系统在深色下自动换深色窗口底色。
+      注意：应用内的明暗选择由 ThemeMode 控制（Compose 侧），
+      与这里互不冲突——这里只影响 Compose 绘制前的空白窗口。
+    -->
+    <style name="Theme.LifeBoard" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#FFF3EEE2</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

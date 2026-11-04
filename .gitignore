@@ -1,0 +1,23 @@
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 第三方参考源码（gkd、AutoAccounting），本地保留不进版本库
+external/
+
+# 过程文档与任务记录
+docs/
+
+# 构建与运行产物
+.kotlin/
+.temp/
+.screenshots/
+*.apk
+*.aab
+*.hprof
