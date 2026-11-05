@@ -26,10 +26,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.lifeboard.app.ui.rules.AppIcon
 import com.lifeboard.server.collect.SettingsNavigator
+import com.lifeboard.server.db.AppUsageEntity
 import java.time.LocalDate
 
 /**
@@ -73,6 +76,8 @@ fun ScreenTimeContent(vm: ScreenTimeViewModel = viewModel()) {
         loading = state.loading,
         onCollect = vm::collectNow,
     )
+
+    AppUsageCard(rows = state.appUsage, totalMinutes = state.todayMinutes)
 
     WeekCard(minutes = state.weekMinutes, daily = state.weekDaily, loading = state.loading)
 
@@ -133,6 +138,101 @@ private fun TodayCard(minutes: Double, loading: Boolean, onCollect: () -> Unit) 
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Button(onClick = onCollect, enabled = !loading) { Text("立即采集") }
+        }
+    }
+}
+
+/**
+ * 各应用使用明细卡片。
+ *
+ * 数据来自系统汇总（与小米「数字健康」同一份账本），按当天时长降序，
+ * 每行带应用图标、名称、时长和一条占比条——占比以当天总时长为分母，
+ * 用于看出哪些应用吃掉了大部分时间。
+ */
+@Composable
+private fun AppUsageCard(rows: List<AppUsageEntity>, totalMinutes: Double) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("各应用使用", style = MaterialTheme.typography.titleSmall)
+                if (rows.isNotEmpty()) {
+                    Text(
+                        "${rows.size} 个应用",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
+            if (rows.isEmpty()) {
+                Text(
+                    "还没有分应用数据。点上面的「立即采集」读一次系统的使用记录。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                return@Column
+            }
+
+            // 分母用当天总时长；总时长为 0 时退回各行之和，避免除零且条长仍可比较
+            val denominator = if (totalMinutes > 0.0) totalMinutes else rows.sumOf { it.minutes }
+            rows.forEach { row ->
+                AppUsageRow(row = row, denominator = denominator)
+            }
+        }
+    }
+}
+
+@Composable
+private fun AppUsageRow(row: AppUsageEntity, denominator: Double) {
+    val ratio = if (denominator > 0.0) {
+        (row.minutes / denominator).toFloat().coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        AppIcon(row.packageName, size = 32)
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    row.label.ifBlank { row.packageName },
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    ScreenTimeViewModel.formatMinutes(row.minutes),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            // 占比条：直观看出谁占大头，比纯数字快
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(4.dp)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(ratio)
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(MaterialTheme.colorScheme.primary),
+                )
+            }
         }
     }
 }

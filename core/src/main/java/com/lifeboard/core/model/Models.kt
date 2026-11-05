@@ -22,6 +22,30 @@ enum class RemindLevel(val code: Int) {
 }
 
 /**
+ * 任务时间的来源。
+ *
+ * 采集窗口和提醒时机是两个不同的问题：
+ * 规则里的时段决定「什么时候允许从这个应用计数」，
+ * 而任务想在什么时候被提醒，应该由任务自己决定。
+ *
+ * 之前两者被绑在一起，导致任务一旦关联规则就无法自定时间，
+ * 「每天喝 8 杯水」这类任务只能被迫跟随飞书的打卡时段。
+ */
+enum class TimeSource(val displayName: String, val description: String) {
+    /** 跟随关联规则的时段与提醒时刻（关联了规则才有意义） */
+    FOLLOW_RULE("跟随规则", "用规则里配的时段，规则什么时候生效就什么时候提醒"),
+
+    /** 任务自己配时段与提醒时刻，规则只作为数据来源 */
+    INDEPENDENT("自定义时间", "规则只管取数，提醒时间由这个任务自己定"),
+    ;
+
+    companion object {
+        fun fromName(name: String): TimeSource =
+            entries.firstOrNull { it.name == name } ?: FOLLOW_RULE
+    }
+}
+
+/**
  * 任务配置，对应面板上的一个待办事项。
  *
  * @property id 主键，0 表示未持久化
@@ -51,6 +75,8 @@ data class TaskConfig(
     val schedule: ScheduleRule = ScheduleRule.ALWAYS,
     val ruleId: Long = 0L,
     val enabled: Boolean = true,
+    /** 时间来源：跟随规则，还是任务自己定 */
+    val timeSource: TimeSource = TimeSource.FOLLOW_RULE,
     /**
      * 完成提醒档位，与 [remindLevel]（未完成提醒）相互独立。
      *

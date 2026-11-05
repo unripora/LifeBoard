@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.lifeboard.core.util.Dates
 import com.lifeboard.server.collect.DailyAggregateWorker
 import com.lifeboard.server.collect.ScreenTimeReader
+import com.lifeboard.server.db.AppUsageEntity
 import com.lifeboard.server.source.ScreenTimeDataSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -24,6 +25,8 @@ data class ScreenTimeUiState(
     val todayMinutes: Double = 0.0,
     val weekMinutes: Double = 0.0,
     val weekDaily: List<Pair<LocalDate, Double>> = emptyList(),
+    /** 今日各应用用量，已按分钟降序 */
+    val appUsage: List<AppUsageEntity> = emptyList(),
     val lastMessage: String = "",
 )
 
@@ -70,11 +73,15 @@ class ScreenTimeViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 return@launch
             }
-            withContext(Dispatchers.IO) {
-                // 走 Worker 的同一条链路，避免面板与定时任务写入逻辑分叉
-                DailyAggregateWorker.runNow(getApplication())
+            // 必须等 Worker 真正写完再读库：只入队不等，下面读到的还是上一次的旧值，
+            // 用户会以为「点一次没反应」，需要再点一次才出数
+            val ok = withContext(Dispatchers.IO) {
+                DailyAggregateWorker.collectNow(getApplication())
             }
-            loadStats(true, "已触发采集，稍候刷新")
+            loadStats(
+                granted,
+                if (ok) "已采集完成" else "采集失败，请检查授权后重试",
+            )
         }
     }
 
@@ -82,12 +89,14 @@ class ScreenTimeViewModel(app: Application) : AndroidViewModel(app) {
         val today = withContext(Dispatchers.IO) { reader.todayMinutes() }
         val week = withContext(Dispatchers.IO) { reader.thisWeekMinutes() }
         val daily = withContext(Dispatchers.IO) { reader.thisWeekDaily() }
+        val perApp = withContext(Dispatchers.IO) { reader.todayAppUsage() }
         _state.value = ScreenTimeUiState(
             loading = false,
             hasPermission = granted,
             todayMinutes = today,
             weekMinutes = week,
             weekDaily = daily,
+            appUsage = perApp,
             lastMessage = message,
         )
     }

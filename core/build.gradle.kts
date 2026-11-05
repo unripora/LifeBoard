@@ -34,4 +34,5 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     // LSPosed libxposed API 仅编译期使用，运行时由框架提供
     compileOnly(libs.libxposed.api)
+    testImplementation(libs.junit)
 }

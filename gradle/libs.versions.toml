@@ -15,6 +15,8 @@ libxposedApi = "102.0.0"
 # Legacy Xposed API 桩（仅编译期，运行时由 LSPosed 注入）
 # 实机已验证 AutoAccounting 用这套 API 可在 system_server 正常加载
 legacyXposedApi = "82"
+junit = "4.13.2"
+okhttp = "4.12.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -43,6 +45,8 @@ kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 
 libxposed-api = { group = "io.github.libxposed", name = "api", version.ref = "libxposedApi" }
 legacy-xposed-api = { group = "de.robv.android.xposed", name = "api", version.ref = "legacyXposedApi" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

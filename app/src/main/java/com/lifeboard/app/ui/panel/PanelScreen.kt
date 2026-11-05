@@ -21,6 +21,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -51,10 +52,17 @@ import java.time.LocalDate
 fun PanelScreen(
     onEditTask: (Long) -> Unit,
     onNewTask: () -> Unit,
+    onOpenMiHealthLogin: () -> Unit = {},
+    /** 变化时重新判定数据源健康度（如刚完成小米账号登录） */
+    refreshKey: Int = 0,
     vm: PanelViewModel = viewModel(),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     var pendingDelete by remember { mutableStateOf<TaskRow?>(null) }
+
+    LaunchedEffect(refreshKey) {
+        if (refreshKey > 0) vm.refreshHealth()
+    }
 
     Column(
         modifier = Modifier
@@ -106,7 +114,10 @@ fun PanelScreen(
         if (state.brokenSources.isNotEmpty()) {
             SourceHealthCard(
                 entries = state.brokenSources,
-                onOpenSettings = { vm.openSourceSettings(it) },
+                onOpenSettings = {
+                    // 应用内动作（如小米健康登录）没有系统设置页，交给外层覆盖页
+                    if (!vm.openSourceSettings(it)) onOpenMiHealthLogin()
+                },
             )
         }
 
