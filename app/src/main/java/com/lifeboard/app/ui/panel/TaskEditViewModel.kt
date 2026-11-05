@@ -8,6 +8,7 @@ import com.lifeboard.core.model.RemindLevel
 import com.lifeboard.core.model.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.model.TaskConfig
+import com.lifeboard.core.model.TimeSource
 import com.lifeboard.core.schedule.ScheduleRule
 import com.lifeboard.core.schedule.TimeWindow
 import com.lifeboard.server.panel.TaskRepository
@@ -16,8 +17,11 @@ import com.lifeboard.server.notice.toRuleSchedule
 import com.lifeboard.server.source.SourceRegistry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -59,12 +63,40 @@ data class TaskEditUiState(
     ),
     /** 关联的采集规则 id，0 表示不关联（此时用 schedule 兜底） */
     val ruleId: Long = 0L,
+    /** 时间来源：跟随规则 or 任务自己定 */
+    val timeSource: TimeSource = TimeSource.FOLLOW_RULE,
     val enabled: Boolean = true,
     val loading: Boolean = false,
     val saving: Boolean = false,
     val error: String = "",
     val done: Boolean = false,
+    /** 加载完成时的快照，用来判断用户这次有没有真的改过东西 */
+    val snapshot: TaskEditUiState? = null,
 ) {
+    /**
+     * 是否有未保存的改动。
+     *
+     * 编辑页拿加载快照比对；新建页没有快照，就和空白默认值比对，
+     * 否则用户填完名字直接退出，内容会静默丢失。
+     */
+    val dirty: Boolean
+        get() = !sameContent(snapshot ?: TaskEditUiState())
+
+    private fun sameContent(other: TaskEditUiState): Boolean =
+        title == other.title &&
+            source == other.source &&
+            metricBucket == other.metricBucket &&
+            threshold == other.threshold &&
+            weight == other.weight &&
+            remindLevel == other.remindLevel &&
+            doneRemindLevel == other.doneRemindLevel &&
+            doneToastEnabled == other.doneToastEnabled &&
+            windowOffsetMinutes == other.windowOffsetMinutes &&
+            schedule == other.schedule &&
+            ruleId == other.ruleId &&
+            timeSource == other.timeSource &&
+            enabled == other.enabled
+
     /** 当前数据源支持的分桶 */
     val availableBuckets: List<MetricBucket>
         get() = (source as? SourceRef.Builtin)?.let { SOURCE_BUCKETS[it.type] } ?: listOf(MetricBucket.FLAG)
@@ -86,6 +118,21 @@ data class RuleOption(
     /** 规则写入的量纲；任务关联后量纲跟它走，不再单独配 */
     val bucketName: String,
     val summary: String,
+    /** 规则名称里的识别关键词，用于两级选择时区分同一应用下的多条规则 */
+    val keywords: String = "",
+)
+
+/**
+ * 一个应用及其名下的规则。
+ *
+ * 数据源不能平铺成「源」列表：同一个应用（如飞书）下往往挂着多条规则
+ * （上班打卡、下班打卡、消息回复……），平铺后用户既看不出归属，
+ * 也容易在后续加规则时选错。所以选择器按「应用 → 规则」两级展开。
+ */
+data class AppRuleGroup(
+    val packageName: String,
+    val appLabel: String,
+    val rules: List<RuleOption>,
 )
 
 /**
@@ -104,6 +151,11 @@ class TaskEditViewModel(app: Application) : AndroidViewModel(app) {
     private val _rules = MutableStateFlow<List<RuleOption>>(emptyList())
     val rules: StateFlow<List<RuleOption>> = _rules.asStateFlow()
 
+    /** 按应用分组后的规则，数据源选择器用它做「应用 → 规则」两级展开 */
+    val ruleGroups: StateFlow<List<AppRuleGroup>> = combine(_rules, _state) { rules, state ->
+        groupByApp(rules, state.ruleId)
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
     init {
         viewModelScope.launch {
             val context = getApplication<Application>()
@@ -119,11 +171,32 @@ class TaskEditViewModel(app: Application) : AndroidViewModel(app) {
                         sourceName = rule.sourceName,
                         bucketName = rule.bucketName,
                         summary = rule.toRuleSchedule().summary(),
+                        keywords = rule.includeKeywords,
                     )
                 }
             }
             _rules.value = list
         }
+    }
+
+    /**
+     * 按应用分组，当前已关联的应用排最前。
+     *
+     * 排序目标不是"好看"，而是让正在编辑的任务一眼看到自己用的那条规则：
+     * 规则多了以后，用户回来改任务时最想确认的就是「我现在绑的是哪条」。
+     */
+    private fun groupByApp(rules: List<RuleOption>, ruleId: Long): List<AppRuleGroup> {
+        val current = rules.firstOrNull { it.id == ruleId }
+        return rules.groupBy { it.packageName }.map { (pkg, list) ->
+            AppRuleGroup(
+                packageName = pkg,
+                appLabel = list.first().appLabel,
+                rules = list,
+            )
+        }.sortedWith(
+            compareByDescending<AppRuleGroup> { it.packageName == current?.packageName }
+                .thenBy { it.appLabel },
+        )
     }
 
     /**
@@ -158,7 +231,7 @@ class TaskEditViewModel(app: Application) : AndroidViewModel(app) {
                 _state.value = _state.value.copy(loading = false, error = "任务不存在")
                 return@launch
             }
-            _state.value = TaskEditUiState(
+            val loaded = TaskEditUiState(
                 id = task.id,
                 title = task.title,
                 source = task.source,
@@ -171,21 +244,47 @@ class TaskEditViewModel(app: Application) : AndroidViewModel(app) {
                 windowOffsetMinutes = task.windowOffsetMinutes,
                 schedule = task.schedule,
                 ruleId = task.ruleId,
+                timeSource = task.timeSource,
                 enabled = task.enabled,
             )
             // 旧任务可能存有与规则不一致的量纲（导致任务永远为 0），加载时按规则纠正
-            if (task.ruleId != 0L) {
+            val corrected = if (task.ruleId != 0L) {
                 val rule = withContext(Dispatchers.IO) {
                     LifeBoardDatabase.get(getApplication()).captureRuleDao().getById(task.ruleId)
                 }
-                if (rule != null) {
-                    _state.value = _state.value.copy(
-                        metricBucket = runCatching { MetricBucket.valueOf(rule.bucketName) }
-                            .getOrDefault(task.metricBucket),
-                    )
-                }
+                loaded.copy(
+                    metricBucket = rule?.let {
+                        runCatching { MetricBucket.valueOf(it.bucketName) }.getOrDefault(loaded.metricBucket)
+                    } ?: loaded.metricBucket,
+                )
+            } else {
+                loaded
             }
+            // 快照取纠正后的状态：纠正属于加载行为，不该被当成"用户改了东西"
+            _state.value = corrected.copy(loading = false, snapshot = corrected)
         }
+    }
+
+    /**
+     * 放弃编辑，把状态还原成加载时的样子。
+     *
+     * 编辑器 ViewModel 跟着 Activity 级的作用域走，不重置的话
+     * 下次点「新建任务」会看到上次丢弃的内容。
+     */
+    fun reset() {
+        _state.value = _state.value.snapshot ?: TaskEditUiState()
+    }
+
+    /**
+     * 页面关闭后清掉一次性的完成标志。
+     *
+     * 必须做：`done` 一旦置 true 就再没人动过，而 [TaskEditScreen] 里
+     * `LaunchedEffect(state.done) { if (state.done) onDone() }` 会在每次重新进入时
+     * 立刻命中——表现为「点编辑进不去、闪一下就退回」，而且 taskId 相同时
+     * `LaunchedEffect(taskId)` 不会重跑，问题更明显。
+     */
+    fun consumeDone() {
+        if (_state.value.done) _state.value = _state.value.copy(done = false)
     }
 
     fun setTitle(value: String) {
@@ -231,6 +330,17 @@ class TaskEditViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setEnabled(value: Boolean) {
         _state.value = _state.value.copy(enabled = value)
+    }
+
+    /**
+     * 切换时间来源。
+     *
+     * 从「跟随规则」切到「自定义时间」时不动 schedule——它本来就是任务自己的时段，
+     * 之前只是被规则盖住了。反过来切回规则模式时也保留 schedule，
+     * 用户随时可以切回来，不用重配。
+     */
+    fun setTimeSource(value: TimeSource) {
+        _state.value = _state.value.copy(timeSource = value, error = "")
     }
 
     /** 时段调整，步进 30 分钟；作用在首个时段上（多时段在任务页暂不暴露） */
@@ -291,6 +401,7 @@ class TaskEditViewModel(app: Application) : AndroidViewModel(app) {
                 windowEndMinute = first.endMinute,
                 schedule = s.schedule,
                 ruleId = s.ruleId,
+                timeSource = s.timeSource,
                 enabled = s.enabled,
                 doneRemindLevel = s.doneRemindLevel,
                 doneToastEnabled = s.doneToastEnabled,

@@ -68,6 +68,36 @@ class ScreenCaptureAccessibilityService : AccessibilityService() {
     /** 每个包名待读的内容变化事件，只保留最后一条 */
     private val pendingContent = HashMap<String, PendingContent>()
 
+    /**
+     * 每个包名最近一条内容变化事件的时间。
+     * 合并判定的第一个条件（间隔够短）用它。
+     */
+    private val lastContentAt = HashMap<String, Long>()
+
+    /**
+     * 每个包名第一次收到事件的时间，用来估算「页面已经打开多久」。
+     *
+     * 对齐 GKD 的 `pageAgeMillis`：页面刚打开时事件最密集也最有价值，
+     * 这时合并会丢掉开屏/浮窗那一次。
+     */
+    private val pageFirstSeenAt = HashMap<String, Long>()
+
+    /**
+     * 每个包名最近一次「交互性事件」的时间。
+     *
+     * 对齐 GKD 的 `actionAgeMillis`：用户刚点完出现的提示必须立刻读。
+     * 这里把窗口切换也计入——打开弹窗本身就是一次交互。
+     */
+    private val lastActionAt = HashMap<String, Long>()
+
+    /**
+     * 每个包名最近一次「立即读取」的时间，用于吃掉爆发式的重复事件。
+     *
+     * 浮窗出现时 0.2 秒内能来 4 条 CONTENT_CHANGED，逐条读取等于把同一棵
+     * 节点树遍历 4 遍。这里只限制读取频率，不参与命中判定。
+     */
+    private val lastDispatchAt = HashMap<String, Long>()
+
     /** 合并读取任务，保证同一时刻只有一个在跑 */
     private var flushJob: Job? = null
 
@@ -161,7 +191,7 @@ class ScreenCaptureAccessibilityService : AccessibilityService() {
         if (!isStateChange && pauseOnScreenOff && !powerManager.isInteractive) return
 
         // 闸 2：没配规则的应用直接返回，不遍历节点树、不查库。
-        // 放在最前面是因为节点遍历（深度 12 的整棵树）才是真正的大头开销。
+        // 放在最前面是因为节点遍历（深度 40 的整棵树）才是真正的大头开销。
         val pkgRules = rulesByPackage[pkg] ?: return
         if (pkgRules.isEmpty()) return
 
@@ -170,11 +200,49 @@ class ScreenCaptureAccessibilityService : AccessibilityService() {
         // 留空表示全天可读。判断在遍历节点树之前，时段外连读都不读。
         if (!isInCaptureWindow(pkgRules, LocalDateTime.now())) return
 
+        val now = System.currentTimeMillis()
+        if (isStateChange) {
+            // 窗口切换 = 新的页面：重置页面年龄并记一次交互。
+            // 不重置的话同一应用用久了 pageFirstSeenAt 永远是旧值，
+            // 「刚打开页面」这个保护就彻底失效了。
+            pageFirstSeenAt[pkg] = now
+            lastActionAt[pkg] = now
+        } else {
+            pageFirstSeenAt.getOrPut(pkg) { now }
+        }
+
         if (isStateChange) {
             // 窗口切换（含独立弹窗出现）单发且信息量最大，立即读
             dispatch(pkg, e)
-        } else {
+            return
+        }
+
+        // 内容变化：先看是否真的该合并。用户刚操作完 / 页面刚打开时
+        // 一律立即读，否则「点击后弹出的提示」会被推迟到浮窗快消失才读。
+        val merge = synchronized(pendingContent) {
+            val decision = shouldMergeContent(pkg, now)
+            lastContentAt[pkg] = now
+            decision
+        }
+        if (merge) {
             mergeContentEvent(pkg, e)
+        } else {
+            // 立即读：先把排队中的同包事件清掉，避免同一画面读两次
+            synchronized(pendingContent) {
+                pendingContent.remove(pkg)?.let { runCatching { it.event.recycle() } }
+            }
+            // 同一包名在极短时间内连续投递时只读一次。
+            // 实测浮窗出现时 0.2 秒内会来 4 条 CONTENT_CHANGED，
+            // 逐条读等于把同一棵节点树遍历 4 遍，纯浪费。
+            // 这个去抖只影响「读取频率」，不影响命中判定：
+            // 被跳过的那些事件本来就读到同一画面。
+            val lastRead = lastDispatchAt[pkg]
+            if (lastRead != null && now - lastRead < DISPATCH_DEBOUNCE_MS) {
+                Log.d(TAG, "skip burst content event for $pkg")
+                return
+            }
+            lastDispatchAt[pkg] = now
+            dispatch(pkg, e)
         }
     }
 
@@ -208,9 +276,10 @@ class ScreenCaptureAccessibilityService : AccessibilityService() {
      * 而「点击后出现的提示」恰恰是后出现的，正好落在被丢弃的那一侧，
      * 于是弹窗文字永远进不来。合并到结尾则既省钱又读到最终画面。
      *
-     * 与 GKD 对齐：其 `contentMergeMillis = 100`，并且同 key 事件合成批次后取最后一条。
-     * [MAX_MERGE_WAIT_MS] 是兜底：页面持续变化（动画、滚动）时也保证至少读一次，
-     * 不会因为一直在刷新而永远推迟。
+     * 但**无条件合并一样会漏**：浮窗刚弹出时页面正在剧烈变化，
+     * 那几条事件恰是最有价值的，合并等于把它们推迟到浮窗快消失时才读。
+     * 故对齐 GKD 的三条件合并（见 [shouldMergeContent]）：
+     * 只有「间隔很短 + 页面已稳定 + 没有刚发生的交互」三者同时成立才合并。
      */
     @Suppress("DEPRECATION")
     private fun mergeContentEvent(pkg: String, event: AccessibilityEvent) {
@@ -223,6 +292,33 @@ class ScreenCaptureAccessibilityService : AccessibilityService() {
             pendingContent[pkg] = PendingContent(copy, existing?.firstAt ?: now, now)
         }
         ensureFlush()
+    }
+
+    /**
+     * 判定这次内容变化事件是否应该并入上一批。
+     *
+     * 对齐 GKD `MatchInputs` 的合并条件（其 `contentMergeMillis=100`、
+     * `pageSettleMillis=5000`、`followUpWindowMillis=3000`）：
+     *
+     * - 距上一条内容事件不足 [MERGE_WINDOW_MS]：高频刷新，可以合并；
+     * - 该包的事件流已持续超过 [PAGE_SETTLE_MS]：页面不是刚打开，
+     *   合并不会牺牲「开屏那一次」；
+     * - 距上次窗口切换超过 [ACTION_QUIET_MS]：不在动作后续窗口内。
+     *
+     * 三条都满足才合并，任一不满足就立即读取。
+     *
+     * 注意最后一条的「缺失视为允许」：本服务只订阅了 STATE/CONTENT 两类事件，
+     * 收不到 viewClicked，用户在 WebView 里点按钮不会刷新 [lastActionAt]。
+     * 若把 null 当作「刚交互过」，页面开着不动时就会永远不合并、每条都读，
+     * 白白放大开销；真正的交互保护由「页面年龄」这条覆盖开屏场景。
+     */
+    private fun shouldMergeContent(pkg: String, now: Long): Boolean {
+        val last = lastContentAt[pkg] ?: return false
+        if (now - last >= MERGE_WINDOW_MS) return false
+        val firstSeen = pageFirstSeenAt[pkg] ?: return false
+        if (now - firstSeen < PAGE_SETTLE_MS) return false
+        val lastAction = lastActionAt[pkg] ?: return true
+        return now - lastAction > ACTION_QUIET_MS
     }
 
     /** 保证有一个合并任务在跑；事件只由主线程投递，无需额外加锁 */
@@ -312,13 +408,12 @@ class ScreenCaptureAccessibilityService : AccessibilityService() {
         val dao = db.metricDao()
 
         // 一次事件里常包含整棵子树的文本，同一条提示会出现多次；
-        // 页面重绘还会在几百毫秒内反复触发。按内容去重，避免流水刷屏和重复计数。
+        // 页面重绘还会在几百毫秒内反复触发。
+        // 注意去重只用于「防止重复计数」，绝不能挡在写流水和首次计数之前：
+        // 曾经放在最前面，导致第一次读到却没命中的文本把 key 登记掉，
+        // 之后 10 秒内真正的命中全被 skip —— 表现就是「读到了却不算数」。
         texts.distinct().forEach { raw ->
             val hits = CaptureRuleMatcher.match(rules, raw, now)
-            if (isRecentDuplicate(pkg, raw)) {
-                Log.i(TAG, "skip recent duplicate text: ${raw.take(30)}")
-                return@forEach
-            }
 
             // 原始流水照记，**命中与否都记**：
             // 这页的用途就是「规则调不准时看真正读到了什么」，
@@ -336,6 +431,13 @@ class ScreenCaptureAccessibilityService : AccessibilityService() {
             }.onFailure { Log.w(TAG, "log raw failed", it) }
 
             if (hits.isEmpty()) return@forEach
+
+            // 去重放在命中之后，且只拦「同一条命中」的重复计数，
+            // 不拦没命中的文本——没命中本来就不计数，拦它只会白占 key。
+            if (isRecentDuplicate(pkg, raw)) {
+                Log.i(TAG, "skip recent duplicate hit: ${raw.take(30)}")
+                return@forEach
+            }
 
             hits.forEach { hit ->
                 val rule = hit.rule
@@ -452,16 +554,24 @@ class ScreenCaptureAccessibilityService : AccessibilityService() {
         event.text?.forEach { it?.toString()?.takeIf(String::isNotBlank)?.let(out::add) }
         event.contentDescription?.toString()?.takeIf { it.isNotBlank() }?.let(out::add)
 
-        val root: AccessibilityNodeInfo? = runCatching { event.source }.getOrNull()
-        if (root != null) {
-            runCatching { walk(root, out, depth = 0) }
-            runCatching { root.recycle() }
+        val fromSource: AccessibilityNodeInfo? = runCatching { event.source }.getOrNull()
+        if (fromSource != null) {
+            runCatching { walk(fromSource, out, depth = 0) }
+            runCatching { fromSource.recycle() }
         }
         return out
     }
 
+    /**
+     * 递归收集节点文本。
+     *
+     * [MAX_NODES] 是必须的护栏：WebView 类页面单棵子树能有上千个节点，
+     * 只限深度不限数量的话，一个事件就能把 IO 线程占满。
+     * 到上限就停，宁可少读一点也不能拖住后续事件。
+     */
     private fun walk(node: AccessibilityNodeInfo?, out: MutableList<String>, depth: Int) {
         if (node == null || depth > MAX_DEPTH) return
+        if (out.size >= MAX_NODES) return
         node.text?.toString()?.takeIf { it.isNotBlank() }?.let(out::add)
         node.contentDescription?.toString()?.takeIf { it.isNotBlank() }?.let(out::add)
         for (i in 0 until node.childCount) {
@@ -474,11 +584,49 @@ class ScreenCaptureAccessibilityService : AccessibilityService() {
     companion object {
         private const val TAG = "LifeBoardScreen"
 
-        private const val MAX_DEPTH = 12
+        /**
+         * 节点树遍历深度上限。
+         *
+         * 原值 12 是漏抓「更新打卡成功」浮窗的真实根因：
+         * 实测飞书打卡页的浮窗文本挂在第 **24** 层（FrameLayout → …
+         * → WebView → 5 层 View → TextView），深度 12 只覆盖到 154 个节点里的 18 个，
+         * 走了 12 层就返回，永远读不到。放宽到 40 后目标节点在范围内。
+         */
+        private const val MAX_DEPTH = 40
+
+        /** 单次采集的文本条数上限，防止 WebView 类页面把 IO 线程占满 */
+        private const val MAX_NODES = 400
+
         private const val DEDUP_WINDOW_MS = 10_000L
 
         /** 内容变化的合并窗口：页面安静这么久之后才读一次，读到的是最终画面 */
         private const val MERGE_WINDOW_MS = 150L
+
+        /**
+         * 页面「稳定」判定阈值，对齐 GKD `pageSettleMillis = 5000`。
+         *
+         * 距该包首次出现事件不足这个时长时，一律不合并：
+         * 开屏/首次进入应用时的事件最密集也最有价值。
+         */
+        private const val PAGE_SETTLE_MS = 5_000L
+
+        /**
+         * 交互后的静默要求，对齐 GKD `followUpWindowMillis = 3000`。
+         *
+         * 用户刚点完（或刚切换窗口）后出现的提示必须立刻读——
+         * 「点打卡 → 加载 → 弹成功浮窗」正落在这个窗口里，
+         * 无条件合并会把它推迟到浮窗快消失时才读，结果就是漏抓。
+         */
+        private const val ACTION_QUIET_MS = 3_000L
+
+        /**
+         * 爆发式事件的读取去抖。
+         *
+         * 实测浮窗出现前后 0.2 秒内会连续投递 4 条 CONTENT_CHANGED，
+         * 内容完全一样。这个值要小于浮窗存在的 5 秒，
+         * 保证不会因为去抖错过整个浮窗。
+         */
+        private const val DISPATCH_DEBOUNCE_MS = 250L
 
         /** 合并的最长等待：页面持续变化（动画、滚动）时也保证每秒至少读一次 */
         private const val MAX_MERGE_WAIT_MS = 1_000L

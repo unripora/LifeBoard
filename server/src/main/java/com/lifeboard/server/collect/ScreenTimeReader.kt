@@ -4,6 +4,7 @@ import android.content.Context
 import com.lifeboard.core.model.MetricBucket
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.util.Dates
+import com.lifeboard.server.db.AppUsageEntity
 import com.lifeboard.server.db.LifeBoardDatabase
 import com.lifeboard.server.db.MetricEntity
 import kotlinx.coroutines.Dispatchers
@@ -63,6 +64,11 @@ class ScreenTimeReader(private val context: Context) {
         val data = minutesBetween(start, today)
         return (0 until days).map { start.plusDays(it.toLong()) }
             .map { it to (data[it.toString()] ?: 0.0) }
+    }
+
+    /** 今日各应用用量，已按分钟降序；未采集过时为空列表 */
+    suspend fun todayAppUsage(): List<AppUsageEntity> = withContext(Dispatchers.IO) {
+        db.appUsageDao().getByDate(Dates.todayString())
     }
 
     /** 原始记录，排查误差时用 */

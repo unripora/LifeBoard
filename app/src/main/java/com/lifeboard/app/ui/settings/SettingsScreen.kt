@@ -18,6 +18,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -50,11 +51,59 @@ import com.lifeboard.server.notice.ScreenCaptureAccessibilityService
 fun SettingsScreen(
     appearance: AppearanceState,
     modifier: Modifier = Modifier,
+    onOpenMiHealthLogin: () -> Unit = {},
 ) {
     LazyColumn(
         modifier = modifier.fillMaxSize().padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        item {
+            GlassCard(modifier = Modifier.fillMaxWidth()) {
+                val ctx = LocalContext.current
+                // 用 remember 缓存，避免每次重组都做一次 Keystore 解密
+                val cred = remember { com.lifeboard.server.mihealth.MiHealthCredentialStore.load(ctx) }
+                val loggedIn = cred?.isValid() == true
+                Text("小米健康", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Text(
+                    if (loggedIn) {
+                        val who = cred?.account.orEmpty()
+                        if (who.isNotBlank()) {
+                            "已登录：$who。步数与睡眠会在每日聚合时自动同步。"
+                        } else {
+                            "已登录，步数与睡眠会在每日聚合时自动同步。"
+                        }
+                    } else {
+                        "登录小米账号后可读取步数与睡眠。不需要 root，" +
+                            "登录一次后凭据会自动续期。"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                // 凭据读不出来时把字段长度display出来，否则只能靠猜
+                if (!loggedIn) {
+                    Text(
+                        com.lifeboard.server.mihealth.MiHealthCredentialStore.debugInfo(ctx),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                OutlinedButton(
+                    onClick = onOpenMiHealthLogin,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        if (com.lifeboard.server.mihealth.MiHealthCredentialStore.isLoggedIn(
+                                LocalContext.current,
+                            )
+                        ) {
+                            "管理小米账号"
+                        } else {
+                            "登录小米账号"
+                        },
+                    )
+                }
+            }
+        }
         item {
             GlassCard(modifier = Modifier.fillMaxWidth()) {
                 Text("明暗模式", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)

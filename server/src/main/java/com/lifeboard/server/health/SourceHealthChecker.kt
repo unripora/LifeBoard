@@ -43,6 +43,7 @@ object SourceHealthChecker {
 
     private const val ACTION_USAGE_ACCESS = "usage_access"
     private const val ACTION_NOTICE_LISTENER = "notice_listener"
+    private const val ACTION_MI_HEALTH_LOGIN = "mi_health_login"
 
     /** 一期的全部数据源状态。二期源固定返回 NOT_IMPLEMENTED */
     fun checkAll(context: Context): List<Entry> {
@@ -76,7 +77,7 @@ object SourceHealthChecker {
                 },
                 actionKey = if (noticeOk) null else ACTION_NOTICE_LISTENER,
             ),
-            notImplemented(SourceType.MI_HEALTH, "需解包小米健康读取其数据库，二期接入"),
+            miHealthEntry(context),
             notImplemented(SourceType.LEGADO, "需解包 Legado 读取阅读记录，二期接入"),
             notImplemented(SourceType.READEST, "需读取 Readest 本地存储，二期接入"),
             notImplemented(SourceType.QC_BOOK_LOG, "待提供数据表结构，二期接入"),
@@ -110,12 +111,36 @@ object SourceHealthChecker {
             )
         }
 
+    /**
+     * 小米健康的健康度。
+     *
+     * 它不依赖系统权限，而是依赖「有没有登录小米账号」：
+     * 未登录时提示去登录，而不是显示缺失一个并不存在的授权开关。
+     */
+    private fun miHealthEntry(context: Context): Entry {
+        val loggedIn = com.lifeboard.server.mihealth.MiHealthCredentialStore.isLoggedIn(context)
+        return Entry(
+            source = SourceType.MI_HEALTH,
+            state = if (loggedIn) State.OK else State.NO_PERMISSION,
+            message = if (loggedIn) {
+                "已登录，可读取步数与睡眠"
+            } else {
+                "未登录小米账号，无法读取步数与睡眠"
+            },
+            actionKey = if (loggedIn) null else ACTION_MI_HEALTH_LOGIN,
+        )
+    }
+
     /** 打开某个源对应的设置页 */
     fun openSettings(context: Context, actionKey: String): Boolean = when (actionKey) {
         ACTION_USAGE_ACCESS -> SettingsNavigator.openUsageAccess(context)
         ACTION_NOTICE_LISTENER -> SettingsNavigator.openNotificationListenerSettings(context)
+        // 小米健康没有系统授权页，唯一入口是应用内的登录页，交给 UI 层处理
         else -> false
     }
+
+    /** 是否需要由应用内页面处理（而非打开系统设置页） */
+    fun isInAppAction(actionKey: String): Boolean = actionKey == ACTION_MI_HEALTH_LOGIN
 
     /**
      * 把最新检查结果写回 source_health 表。

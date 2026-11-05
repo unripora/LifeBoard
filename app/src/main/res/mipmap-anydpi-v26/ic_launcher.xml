@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标：背景是 logo 主色，前景是 mipmap-*/ic_launcher_foreground.png
+     （由 app/src/img/logo.png 生成，内容缩到安全区内，避免被裁掉边缘）。 -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@drawable/ic_launcher_background" />
-    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
 </adaptive-icon>

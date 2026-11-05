@@ -8,6 +8,7 @@ import com.lifeboard.core.model.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.model.StreakInfo
 import com.lifeboard.core.model.TaskConfig
+import com.lifeboard.core.model.TimeSource
 import com.lifeboard.core.schedule.RepeatType
 import com.lifeboard.core.schedule.ScheduleRule
 import com.lifeboard.core.schedule.TimeWindow
@@ -231,6 +232,7 @@ fun TaskEntity.toConfig(source: SourceRef, ruleBucket: String? = null): TaskConf
     schedule = toScheduleRule(),
     ruleId = ruleId,
     enabled = enabled,
+    timeSource = TimeSource.fromName(timeSource),
     doneRemindLevel = RemindLevel.fromCode(doneRemindLevel),
     doneToastEnabled = doneToastEnabled,
     windowOffsetMinutes = windowOffsetMinutes,
@@ -286,6 +288,7 @@ fun TaskConfig.toEntity(): TaskEntity = TaskEntity(
     anchorDay = schedule.anchorDay,
     anchorMonth = schedule.anchorMonth,
     ruleId = ruleId,
+    timeSource = timeSource.name,
     doneRemindLevel = doneRemindLevel.code,
     doneToastEnabled = doneToastEnabled,
     windowOffsetMinutes = windowOffsetMinutes,

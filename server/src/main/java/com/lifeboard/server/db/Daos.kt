@@ -173,3 +173,29 @@ interface CustomSourceDao {
     @Query("DELETE FROM custom_source WHERE id = :id")
     suspend fun deleteById(id: Long)
 }
+
+@Dao
+interface AppUsageDao {
+
+    /** 观察某天的分应用用量，按分钟降序，界面直接消费 */
+    @Query("SELECT * FROM app_usage WHERE date = :date ORDER BY minutes DESC")
+    fun observeByDate(date: String): Flow<List<AppUsageEntity>>
+
+    @Query("SELECT * FROM app_usage WHERE date = :date ORDER BY minutes DESC")
+    suspend fun getByDate(date: String): List<AppUsageEntity>
+
+    /** 同一天同一应用覆盖写入，重复采集不产生重复行 */
+    @Upsert
+    suspend fun upsertAll(rows: List<AppUsageEntity>)
+
+    @Query("DELETE FROM app_usage WHERE date = :date")
+    suspend fun deleteByDate(date: String)
+
+    /**
+     * 只保留最近 N 天，清理更早的记录。
+     *
+     * 分应用数据每天几十行，不清会一直涨；用户实际只会回看最近一两周。
+     */
+    @Query("DELETE FROM app_usage WHERE date < :keepFrom")
+    suspend fun trimBefore(keepFrom: String)
+}

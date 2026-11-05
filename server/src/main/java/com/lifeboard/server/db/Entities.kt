@@ -43,6 +43,19 @@ data class TaskEntity(
      */
     val ruleId: Long = 0L,
     /**
+     * 任务时间的来源。
+     *
+     * - `FOLLOW_RULE`（默认）：时段与提醒时刻都取自 [ruleId] 指向的规则，
+     *   只有关联了规则才有意义；未关联时自动回落到任务自身时段
+     * - `INDEPENDENT`：忽略规则的时间，用任务自己配的时段与提醒时刻。
+     *   适合「每天喝 8 杯水」这类与规则采集窗口无关的任务——
+     *   规则只是数据来源，提醒时间该由任务自己说了算
+     *
+     * 为什么要有它：之前任务完全不能自定时间，一旦关联规则就被绑死在
+     * 规则的采集窗口上；但采集窗口和提醒时机是两个不同的问题。
+     */
+    val timeSource: String = "FOLLOW_RULE",
+    /**
      * 完成提醒档位，与 [remindLevel]（未完成提醒）相互独立。
      *
      * 0 = 不提醒（默认，保持老任务行为不变）
@@ -222,4 +235,25 @@ data class CustomSourceEntity(
     /** 量纲，取 [com.lifeboard.core.model.MetricBucket] 的枚举名 */
     val bucket: String = "COUNT",
     val createdAt: Long = System.currentTimeMillis(),
+)
+
+/**
+ * 分应用屏幕使用时长。
+ *
+ * 为什么单独一张表：`metric` 的主键是 (sourceType, date, bucket)，没有应用这个维度，
+ * 而「屏幕使用」的总时长与「各应用各用了多久」是两种粒度的数据，
+ * 塞进同一张表会破坏主键语义。这里用 (date, packageName) 做主键，
+ * 同一天同一应用重复采集时直接覆盖，天然幂等。
+ *
+ * @param date 日期 yyyy-MM-dd
+ * @param packageName 应用包名
+ * @param minutes 当天该应用的前台时长（分钟）
+ * @param label 采集时的应用展示名，用于列表直接渲染，避免每次查 PackageManager
+ */
+@Entity(tableName = "app_usage", primaryKeys = ["date", "packageName"])
+data class AppUsageEntity(
+    val date: String,
+    val packageName: String,
+    val minutes: Double,
+    val label: String = "",
 )
