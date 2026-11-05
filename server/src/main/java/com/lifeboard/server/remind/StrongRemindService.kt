@@ -238,15 +238,19 @@ class StrongRemindService : Service() {
          * 通用入口：未完成提醒与完成提醒共用同一套响铃。
          *
          * 两者只是文案不同——响铃、震动、停止按钮的实现完全一样。
+         *
+         * @return true 表示前台服务已启动；false 表示被系统拒绝（后台限制常见），
+         *   调用方应据此退回到「带声音的通知」兜底，否则用户什么也听不到
          */
-        fun start(context: Context, task: TaskConfig, title: String, body: String) {
+        fun start(context: Context, task: TaskConfig, title: String, body: String): Boolean {
             val intent = Intent(context, StrongRemindService::class.java).apply {
                 putExtra(EXTRA_TITLE, title)
                 putExtra(EXTRA_BODY, body)
                 putExtra(EXTRA_TASK_ID, task.id)
             }
-            runCatching { ContextCompat.startForegroundService(context, intent) }
+            return runCatching { ContextCompat.startForegroundService(context, intent) }
                 .onFailure { Log.e(TAG, "start strong remind failed", it) }
+                .isSuccess
         }
 
         private fun bodyOf(evaluation: Evaluation): String {

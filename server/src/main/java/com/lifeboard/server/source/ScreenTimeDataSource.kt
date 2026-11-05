@@ -1,7 +1,6 @@
 package com.lifeboard.server.source
 
 import android.app.AppOpsManager
-import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.os.Process
@@ -17,16 +16,17 @@ import java.time.LocalDate
 /**
  * 屏幕使用时长采集器（M1）。
  *
- * 走 `UsageStatsManager.queryEvents` 公开 API，不需要任何 hook 注入，
+ * 走 `UsageStatsManager` 公开 API，不需要任何 hook 注入，
  * 因此 [requiresInjection] 恒为 false，模块进程内即可运行。
  *
- * 算法：遍历当日事件流，遇到 [UsageEvents.Event.ACTIVITY_RESUMED] 记一个起点，
- * 遇到 [UsageEvents.Event.ACTIVITY_PAUSED] / [UsageEvents.Event.ACTIVITY_STOPPED] 结算一段。
- * 只有开头没有结尾的那一段（正在使用中）用"当日已过时长"封顶，
- * 否则今天的数据会永远比实际少最后这一个前台会话。
+ * **数据来源是系统汇总，不自己算**：系统本身一直在记账，
+ * 小米「数字健康」读的也是这份数据。这里只用 `queryUsageStats`
+ * 取它算好的结果，不再自己遍历事件流配对 RESUME/PAUSE——
+ * 那样等于把系统已经算完的账重算一遍，边界情况（跨零点、Activity
+ * 连续跳转、进程异常退出）全靠自己兜，很容易和系统数字对不上。
  *
- * 已知限制：不扣除熄屏时间。熄屏时系统会给前台 Activity 补发 PAUSED 事件，
- * 依据 AOSP 行为这是成立的，但澎湃OS 有厂商改动，需在实机上与"数字健康"对比校验。
+ * 已知限制：汇总数据有延迟，当天正在使用的那一段可能还没计入，
+ * 「今天」的数字会偏小，隔天之后才完全准确。
  */
 class ScreenTimeDataSource(private val context: Context) : DataSource {
 
@@ -90,49 +90,36 @@ class ScreenTimeDataSource(private val context: Context) : DataSource {
     }
 
     /**
-     * 计算某天的屏幕使用分钟数。
+     * 计算某天的屏幕使用分钟数（读系统汇总，不自己累加事件流）。
      *
-     * @return 分钟数，保留一位小数；未授权或发生异常时返回 0
+     * 为什么改成读汇总：系统（`UsageStatsManager`）本身就在持续记账，
+     * 小米「数字健康」读的也是这份数据。之前用 `queryEvents` 自己遍历
+     * RESUME/PAUSE 配对累加，等于把系统已经算好的账重算一遍——
+     * 代码多、边界情况（跨零点、Activity 连续跳转、异常退出）全靠自己兜，
+     * 很容易和系统数字对不上。现在直接取汇总，系统怎么算就怎么用。
+     *
+     * **已知代价**：汇总数据有延迟，当天正在使用的这一段可能还没计入，
+     * 所以「今天」的数字会偏小，过一天后才完全准确。对「每日屏幕时长」
+     * 这种统计用途可以接受，实时性要求高的场景才需要回到事件流方案。
+     *
+     * @return 分钟数；未授权或发生异常时返回 0
      */
     fun queryScreenMinutes(day: LocalDate): Double {
         val usm = usageStats ?: return 0.0
         val begin = Dates.startOfDayMillis(day)
         val end = Dates.endOfDayMillis(day)
-        // 正在进行的会话最多算到"现在"，而不是算到明天 0 点
-        val cap = minOf(end, System.currentTimeMillis())
-        if (cap <= begin) return 0.0
 
         return runCatching {
-            var foregroundSince = 0L
-            var totalMillis = 0L
-            val events = usm.queryEvents(begin, end)
-            val event = UsageEvents.Event()
-            while (events.hasNextEvent()) {
-                events.getNextEvent(event)
-                when (event.eventType) {
-                    UsageEvents.Event.ACTIVITY_RESUMED -> {
-                        // 连续两次 RESUMED（Activity 间跳转）时，先把上段结算掉，避免漏计
-                        if (foregroundSince > 0L) {
-                            totalMillis += (event.timeStamp - foregroundSince).coerceAtLeast(0L)
-                        }
-                        foregroundSince = event.timeStamp
-                    }
+            // 用 INTERVAL_DAILY 分桶取汇总，再按「最后一次使用时间」筛出目标日期。
+            // 不直接取第一个桶：queryUsageStats 返回的区间可能横跨多天，
+            // 桶的顺序和边界各 ROM 不完全一致，按 lastTimeUsed 过滤更可靠。
+            val stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, begin, end)
+                ?: return@runCatching 0.0
 
-                    UsageEvents.Event.ACTIVITY_PAUSED,
-                    UsageEvents.Event.ACTIVITY_STOPPED,
-                    -> {
-                        if (foregroundSince > 0L) {
-                            totalMillis += (event.timeStamp - foregroundSince).coerceAtLeast(0L)
-                            foregroundSince = 0L
-                        }
-                    }
-                }
-            }
-            // 收尾：仍在使用中的最后一段
-            if (foregroundSince > 0L) {
-                totalMillis += (cap - foregroundSince).coerceAtLeast(0L)
-            }
-            totalMillis / 60_000.0
+            stats.asSequence()
+                .filter { it.lastTimeUsed in begin until end }
+                .sumOf { it.totalTimeInForeground }
+                .let { it / 60_000.0 }
         }.getOrElse {
             Log.w(TAG, "queryScreenMinutes failed for $day", it)
             0.0
@@ -140,44 +127,26 @@ class ScreenTimeDataSource(private val context: Context) : DataSource {
     }
 
     /**
-     * 计算某天各应用的前台时长（分钟），按用量降序。
-     * M1 面板暂未使用，留作后续"分应用明细"与误差校验时的排查手段。
+     * 各应用某天的前台时长（分钟），按用量降序。
+     *
+     * 同样读系统汇总：`queryUsageStats` 的每一项本来就是「一个应用的汇总」，
+     * 直接取包名与前台时长即可，不需要自己配对了。
+     * 面板暂未展示，留作「分应用明细」与误差校验用。
      */
     fun queryPerAppMinutes(day: LocalDate): List<Pair<String, Double>> {
         val usm = usageStats ?: return emptyList()
         val begin = Dates.startOfDayMillis(day)
         val end = Dates.endOfDayMillis(day)
-        val cap = minOf(end, System.currentTimeMillis())
-        if (cap <= begin) return emptyList()
 
         return runCatching {
-            val openSince = mutableMapOf<String, Long>()
-            val acc = mutableMapOf<String, Long>()
-            val events = usm.queryEvents(begin, end)
-            val event = UsageEvents.Event()
-            while (events.hasNextEvent()) {
-                events.getNextEvent(event)
-                val pkg = event.packageName ?: continue
-                when (event.eventType) {
-                    UsageEvents.Event.ACTIVITY_RESUMED -> {
-                        openSince[pkg]?.let { acc[pkg] = (acc[pkg] ?: 0L) + (event.timeStamp - it) }
-                        openSince[pkg] = event.timeStamp
-                    }
-
-                    UsageEvents.Event.ACTIVITY_PAUSED,
-                    UsageEvents.Event.ACTIVITY_STOPPED,
-                    -> {
-                        openSince.remove(pkg)?.let {
-                            acc[pkg] = (acc[pkg] ?: 0L) + (event.timeStamp - it)
-                        }
-                    }
-                }
-            }
-            openSince.forEach { (pkg, since) ->
-                acc[pkg] = (acc[pkg] ?: 0L) + (cap - since).coerceAtLeast(0L)
-            }
-            acc.map { (pkg, ms) -> pkg to ms / 60_000.0 }
+            val stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, begin, end)
+                ?: return@runCatching emptyList()
+            stats.asSequence()
+                .filter { it.lastTimeUsed in begin until end }
+                .filter { it.totalTimeInForeground > 0L }
+                .map { it.packageName to it.totalTimeInForeground / 60_000.0 }
                 .sortedByDescending { it.second }
+                .toList()
         }.getOrElse {
             Log.w(TAG, "queryPerAppMinutes failed for $day", it)
             emptyList()

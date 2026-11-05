@@ -160,10 +160,17 @@ class PanelViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 打开某个断源对应的设置页 */
-    fun openSourceSettings(entry: SourceHealthChecker.Entry) {
-        val key = entry.actionKey ?: return
+    /** 打开某个断源对应的设置页；应用内页面返回 false，由界面层接管 */
+    fun openSourceSettings(entry: SourceHealthChecker.Entry): Boolean {
+        val key = entry.actionKey ?: return true
+        if (SourceHealthChecker.isInAppAction(key)) return false
         SourceHealthChecker.openSettings(getApplication(), key)
+        return true
+    }
+
+    /** 重新判定数据源健康度。登录小米账号后调用，让面板立刻反映最新授权状态 */
+    fun refreshHealth() {
+        reloadHealth()
     }
 
     /** 重新判定今日全部任务并刷新本周得分 */

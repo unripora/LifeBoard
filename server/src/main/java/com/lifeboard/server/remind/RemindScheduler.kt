@@ -8,6 +8,7 @@ import android.content.Intent
 import android.os.Build
 import android.util.Log
 import com.lifeboard.core.model.RemindLevel
+import com.lifeboard.core.model.TimeSource
 import com.lifeboard.core.schedule.ScheduleRule
 import com.lifeboard.core.util.Dates
 import com.lifeboard.server.db.CaptureRuleEntity
@@ -161,13 +162,17 @@ object RemindScheduler {
     /**
      * 任务的实际生效规则。
      *
-     * 关联了采集规则的任务，时段与周期完全取自那条规则——
-     * 用户在规则里配了 09:00-09:30 和 18:00-18:30，任务就该在这两段之外才提醒，
-     * 不需要再去任务页重复设一遍检测时段。
-     * 未关联或规则已被删除时，回落到任务自身的 schedule，老数据行为不变。
+     * 两种模式：
+     * - [TimeSource.FOLLOW_RULE]：时段与周期取自关联规则——用户在规则里配了
+     *   09:00-09:30 和 18:00-18:30，任务就该在这两段之外才提醒。
+     * - [TimeSource.INDEPENDENT]：忽略规则时间，用任务自己配的时段。
+     *   规则只负责取数，提醒时机由任务说了算。
+     *
+     * 未关联规则（或规则已被删除）时一律回落到任务自身 schedule，老数据行为不变。
      */
     private fun TaskEntity.resolveSchedule(rule: CaptureRuleEntity?): ScheduleRule =
-        rule?.toRuleSchedule() ?: toScheduleRule()
+        if (timeSource == TimeSource.INDEPENDENT.name) toScheduleRule()
+        else rule?.toRuleSchedule() ?: toScheduleRule()
 
     /**
      * 计算今天的提醒触发时刻（毫秒），时刻已过或时间非法时返回 null。

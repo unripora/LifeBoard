@@ -18,8 +18,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         RawNotificationEntity::class,
         CaptureRuleEntity::class,
         CustomSourceEntity::class,
+        AppUsageEntity::class,
     ],
-    version = 7,
+    version = 9,
     exportSchema = true,
 )
 abstract class LifeBoardDatabase : RoomDatabase() {
@@ -32,6 +33,7 @@ abstract class LifeBoardDatabase : RoomDatabase() {
     abstract fun rawNotificationDao(): RawNotificationDao
     abstract fun captureRuleDao(): CaptureRuleDao
     abstract fun customSourceDao(): CustomSourceDao
+    abstract fun appUsageDao(): AppUsageDao
 
     companion object {
         const val NAME = "lifeboard.db"
@@ -68,6 +70,41 @@ abstract class LifeBoardDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v7 → v8：任务表新增「时间来源」。
+         *
+         * 老任务全部按 FOLLOW_RULE 处理，行为与升级前完全一致；
+         * 想自己定时间的新任务才改成 INDEPENDENT。
+         */
+        private val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE task ADD COLUMN timeSource TEXT NOT NULL DEFAULT 'FOLLOW_RULE'",
+                )
+            }
+        }
+
+        /**
+         * v8 → v9：新增分应用屏幕用量表。
+         *
+         * 只是加一张新表，不动已有结构，老数据完全不受影响。
+         */
+        private val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `app_usage` (
+                        `date` TEXT NOT NULL,
+                        `packageName` TEXT NOT NULL,
+                        `minutes` REAL NOT NULL,
+                        `label` TEXT NOT NULL,
+                        PRIMARY KEY(`date`, `packageName`)
+                    )
+                    """.trimIndent(),
+                )
+            }
+        }
+
         @Volatile
         private var instance: LifeBoardDatabase? = null
 
@@ -79,7 +116,7 @@ abstract class LifeBoardDatabase : RoomDatabase() {
                     NAME,
                     // 侧载自用，库里只有几天内的采集数据，结构变更时直接重建
                     // 比手写迁移省事；等实机验收通过后再补正式迁移
-                ).addMigrations(MIGRATION_5_6, MIGRATION_6_7)
+                ).addMigrations(MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)
                     .fallbackToDestructiveMigration()
                     .build().also { instance = it }
             }

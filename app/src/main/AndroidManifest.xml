@@ -4,6 +4,9 @@
 
     <!-- 通知监听：飞书打卡、多邻国连胜识别（M4） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 小米健康数据走云端接口，必须联网 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- 精确闹钟：M2 提醒调度。侧载自用场景使用 USE_EXACT_ALARM，安装即授予 -->
     <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
