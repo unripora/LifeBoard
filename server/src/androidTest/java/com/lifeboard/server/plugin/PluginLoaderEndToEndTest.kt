@@ -65,7 +65,7 @@ class PluginLoaderEndToEndTest {
     }
 
     @Test
-    fun untrustedPlugin_isNotLoaded_andNotReportedAsBroken() {
+    fun untrustedPlugin_isNotLoaded_butShowsUpAsPending() {
         installDemoArchive()
 
         // 首次扫描：包在，但用户还没信任，不应加载，也不该被当成坏包
@@ -73,6 +73,15 @@ class PluginLoaderEndToEndTest {
 
         assertTrue(loaded.isEmpty())
         assertTrue(PluginLoader.brokenPlugins().isEmpty())
+
+        // 但它必须出现在「待信任」里：否则用户通过文件选择器装完后，
+        // 界面上什么都看不到，会以为安装失败了
+        val pending = PluginLoader.pendingPlugins()
+        assertEquals(1, pending.size)
+        val row = pending.first()
+        assertEquals("com.lifeboard.plugin.demo", row.packageName)
+        assertFalse(row.unsigned)
+        assertNotNull("有签名的待信任插件要能被信任", row.identity)
     }
 
     @Test
