@@ -2,6 +2,7 @@ package com.lifeboard.server.source
 
 import android.content.Context
 import com.lifeboard.core.model.MetricBucket
+import com.lifeboard.core.model.MetricSpec
 import com.lifeboard.core.model.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.server.db.CustomSourceEntity
@@ -39,14 +40,27 @@ object SourceRegistry {
             LifeBoardDatabase.get(context).customSourceDao().getAll().map { it.toRef() }
         }
 
-    /** 按 key 解析；内置优先，其次自建源，都不中则回落到手动打卡 */
+    /** 按 key 解析；内置优先，其次自建源，再次插件源，都不中则回落到手动打卡 */
     suspend fun resolve(context: Context, key: String): SourceRef = withContext(Dispatchers.IO) {
-        SourceType.entries.firstOrNull { it.name == key }?.let { return@withContext SourceRef.Builtin(it) }
+        resolveSyncOrNull(context, key)?.let { return@withContext it }
 
         val customId = SourceRef.parseCustomId(key)
         if (customId != null) {
             val entity = LifeBoardDatabase.get(context).customSourceDao().getById(customId)
             if (entity != null) return@withContext entity.toRef()
+        }
+
+        // 插件源：插件是运行时装的，宿主这里拿不到它声明的展示名与量纲，
+        // 只能用 key 反解出的 pluginId / metricKey 兜一个最小引用，
+        // 真正的元数据在 M2 的插件注册表接入后再补齐。
+        SourceRef.parsePluginKey(key)?.let { (pluginId, metricKey) ->
+            val bucket = MetricSpec.bucketOf(metricKey) ?: MetricBucket.COUNT
+            return@withContext SourceRef.Plugin(
+                pluginId = pluginId,
+                metricKey = metricKey,
+                displayName = "$pluginId·$metricKey",
+                bucket = bucket,
+            )
         }
 
         // 旧数据里可能存着已经被删掉的自建源，或历史上写死过的未知键，
@@ -65,8 +79,18 @@ object SourceRegistry {
             val customs = LifeBoardDatabase.get(context).customSourceDao().getAll()
                 .associateBy { SourceRef.customKey(it.id) }
             keys.distinct().associateWith { key ->
-                SourceType.entries.firstOrNull { it.name == key }?.let { return@associateWith SourceRef.Builtin(it) }
-                customs[key]?.toRef() ?: SourceRef.Builtin(SourceType.MANUAL)
+                SourceType.entries.firstOrNull { it.name == key }
+                    ?.let { return@associateWith SourceRef.Builtin(it) }
+                customs[key]?.toRef()?.let { return@associateWith it }
+                SourceRef.parsePluginKey(key)?.let { (pluginId, metricKey) ->
+                    return@associateWith SourceRef.Plugin(
+                        pluginId = pluginId,
+                        metricKey = metricKey,
+                        displayName = "$pluginId·$metricKey",
+                        bucket = MetricSpec.bucketOf(metricKey) ?: MetricBucket.COUNT,
+                    )
+                }
+                SourceRef.Builtin(SourceType.MANUAL)
             }
         }
 

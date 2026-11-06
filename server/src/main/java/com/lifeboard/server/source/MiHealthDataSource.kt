@@ -5,6 +5,7 @@ import android.util.Log
 import com.lifeboard.core.model.MetricBucket
 import com.lifeboard.core.model.MetricRecord
 import com.lifeboard.core.model.SourceHealth
+import com.lifeboard.core.model.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.source.DataSource
 import com.lifeboard.core.util.Dates
@@ -29,7 +30,7 @@ import java.time.ZoneId
  */
 class MiHealthDataSource(private val context: Context) : DataSource {
 
-    override val sourceType: SourceType = SourceType.MI_HEALTH
+    override val source: SourceRef = SourceRef.Builtin(SourceType.MI_HEALTH)
 
     /** 云端接口，不走注入 */
     override val requiresInjection: Boolean = false
@@ -68,14 +69,14 @@ class MiHealthDataSource(private val context: Context) : DataSource {
         runCatching {
             val steps = collectSteps(start, end)
             if (steps != null) {
-                out += MetricRecord(SourceType.MI_HEALTH, date, MetricBucket.STEPS, steps)
+                out += MetricRecord(stepsRef, date, steps)
             }
         }.onFailure { Log.w(TAG, "collect steps failed", it) }
 
         runCatching {
             val sleep = collectSleepMinutes(start, end)
             if (sleep != null) {
-                out += MetricRecord(SourceType.MI_HEALTH, date, MetricBucket.SLEEP_MINUTES, sleep)
+                out += MetricRecord(sleepRef, date, sleep)
             }
         }.onFailure { Log.w(TAG, "collect sleep failed", it) }
 
@@ -86,7 +87,7 @@ class MiHealthDataSource(private val context: Context) : DataSource {
     override suspend fun health(): SourceHealth = withContext(Dispatchers.IO) {
         if (!MiHealthCredentialStore.isLoggedIn(context)) {
             return@withContext SourceHealth(
-                source = SourceType.MI_HEALTH,
+                source = healthRef,
                 healthy = false,
                 message = "未登录小米账号",
             )
@@ -98,11 +99,27 @@ class MiHealthDataSource(private val context: Context) : DataSource {
         }.getOrNull()
 
         if (points == null) {
-            SourceHealth(SourceType.MI_HEALTH, false, message = "云端接口不可用，可能需要重新登录")
+            SourceHealth(healthRef, false, message = "云端接口不可用，可能需要重新登录")
         } else {
-            SourceHealth(SourceType.MI_HEALTH, true, lastSuccessAt = now, message = "正常")
+            SourceHealth(healthRef, true, lastSuccessAt = now, message = "正常")
         }
     }
+
+    /**
+     * 本源的指标规格：步数与睡眠。
+     *
+     * 一个源两个量纲，落库时靠量纲区分（`metric` 主键含 bucket），
+     * 所以每个量纲各自持有一个 [SourceRef]，量纲由源自己带着走。
+     * metricKey 复用 [MetricBucket] 枚举名，与历史 `metric.bucket` 列取值一致，老数据不用迁移。
+     */
+    private val stepsRef: SourceRef =
+        SourceRef.Builtin(SourceType.MI_HEALTH, MetricBucket.STEPS)
+
+    private val sleepRef: SourceRef =
+        SourceRef.Builtin(SourceType.MI_HEALTH, MetricBucket.SLEEP_MINUTES)
+
+    /** 健康度用的源引用：小米健康是内置源，取默认量纲（步数）即可 */
+    private val healthRef: SourceRef = SourceRef.Builtin(SourceType.MI_HEALTH)
 
     /**
      * 当日步数。

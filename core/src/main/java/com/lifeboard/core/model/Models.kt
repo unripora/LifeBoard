@@ -119,13 +119,23 @@ data class DailyRecord(
 
 /**
  * 数据源采集到的原始指标，按 源 + 日期 + 分桶 聚合。
+ *
+ * 量纲不再单独存一份：它已经写在 [source] 里（[SourceRef.bucket]）。
+ * 历史上这里还有一个 `bucket` 字段，与 `source` 各存一份，
+ * 两者不一致时会出现「按源查得到、按量纲查不到」的错位，
+ * 而 `metric` 表的主键是 `(sourceType, date, bucket)`，落库时必须用同一个量纲。
+ *
+ * 一个源要产出多个量纲时（如小米健康同时给步数与睡眠），
+ * 由采集器为每个量纲各造一个 [SourceRef]，量纲随源一起确定。
  */
 data class MetricRecord(
-    val source: SourceType,
+    val source: SourceRef,
     val date: String,
-    val bucket: MetricBucket,
     val value: Double,
-)
+) {
+    /** 写入 `metric.bucket` 列的量纲名 */
+    val bucket: MetricBucket get() = source.bucket
+}
 
 /**
  * 任务的连续打卡状态。
@@ -140,11 +150,14 @@ data class StreakInfo(
 /**
  * 数据源健康度，用于面板提示断源降级。
  *
+ * [source] 用 [SourceRef] 而不是 [SourceType] 枚举：插件源是运行时才存在的，
+ * 不可能追加到编译期枚举里。落库时用 [SourceRef.key]，与 `metric.sourceType` 同一套编码。
+ *
  * @property lastSuccessAt 最后一次成功采集时间戳（毫秒），0 表示从未成功
  * @property message 失败原因或状态说明
  */
 data class SourceHealth(
-    val source: SourceType,
+    val source: SourceRef,
     val healthy: Boolean,
     val lastSuccessAt: Long = 0L,
     val message: String = "",

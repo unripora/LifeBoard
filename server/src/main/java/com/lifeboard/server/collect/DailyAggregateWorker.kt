@@ -13,14 +13,15 @@ import androidx.work.WorkInfo
 import androidx.work.WorkerParameters
 import com.lifeboard.core.ipc.LifeBoardContract
 import com.lifeboard.core.model.MetricRecord
+import com.lifeboard.core.model.SourceRef
+import com.lifeboard.core.model.SourceType
+import com.lifeboard.core.source.ScreenTimeSource
 import com.lifeboard.core.util.Dates
 import com.lifeboard.server.db.AppUsageEntity
 import com.lifeboard.server.db.LifeBoardDatabase
 import com.lifeboard.server.health.SourceHealthChecker
 import com.lifeboard.server.ipc.MetricWriter
-import com.lifeboard.server.mihealth.MiHealthCredentialStore
-import com.lifeboard.server.source.MiHealthDataSource
-import com.lifeboard.server.source.ScreenTimeDataSource
+import com.lifeboard.server.source.SourceProviderRegistry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
@@ -44,7 +45,6 @@ class DailyAggregateWorker(
 ) : CoroutineWorker(appContext, params) {
 
     override suspend fun doWork(): Result {
-        val source = ScreenTimeDataSource(applicationContext)
         val today = Dates.today()
         val yesterday = today.minusDays(1)
 
@@ -53,42 +53,58 @@ class DailyAggregateWorker(
         runCatching { SourceHealthChecker.persist(applicationContext) }
             .onFailure { Log.e(TAG, "persist source health failed", it) }
 
-        val granted = source.hasPermission()
-        if (!granted) {
-            Log.w(TAG, "usage access not granted, skip aggregate")
-            return Result.success()
+        // 实例化入口走注册表：Worker 里不出现任何具体采集器类名，
+        // 将来新增源（含插件）只需要在注册表登记，这里一行都不用改
+        val screenTime = SourceProviderRegistry
+            .create(applicationContext, SourceRef.Builtin(SourceType.SCREEN_TIME))
+            as? ScreenTimeSource
+        if (screenTime == null) {
+            Log.e(TAG, "screen time source not registered")
+            return Result.failure()
         }
 
         var ok = true
-        ok = collectInto(source, yesterday) && ok
-        ok = collectInto(source, today) && ok
+        if (screenTime.hasPermission()) {
+            ok = collectInto(screenTime, yesterday) && ok
+            ok = collectInto(screenTime, today) && ok
+        } else {
+            // 未授权只跳过屏幕时长本身，**不能提前 return**：
+            // 小米健康等其它源不依赖这个权限，提前返回会把它们一起停掉，
+            // 表现为「没开使用情况访问权，步数睡眠也全没了」。
+            Log.w(TAG, "usage access not granted, skip screen time only")
+        }
 
-        // 小米健康走云端接口，与屏幕时长互不影响：失败只影响自己，不拖累整体
-        collectMiHealth(today, yesterday)
+        // 其它主动源（含插件）由注册表派发，与屏幕时长互不影响：失败只影响自己，不拖累整体
+        collectRegistered(today, yesterday)
         return if (ok) Result.success() else Result.retry()
     }
 
     /**
-     * 采集小米健康的步数与睡眠。
+     * 跑一遍注册表里除屏幕时长之外的主动拉取源。
+     *
+     * 屏幕时长在上面单独处理，因为它还带分应用明细（[writeAppUsage]），
+     * 那份逻辑不属于通用采集契约，硬塞进注册表会让每个源都被迫实现它。
      *
      * 登录态缺失时直接跳过（用户还没配过账号，不是错误），
-     * 其它异常只记日志——它属于可选数据源，不该让整个聚合任务失败重试。
+     * 其它异常只记日志——这些都属于可选数据源，不该让整个聚合任务失败重试。
      */
-    private suspend fun collectMiHealth(today: LocalDate, yesterday: LocalDate) {
-        if (!MiHealthCredentialStore.isLoggedIn(applicationContext)) {
-            Log.i(TAG, "mi health not logged in, skip")
-            return
-        }
-        val source = MiHealthDataSource(applicationContext)
-        // 昨天的数据已定稿，今天的数据会随白天推进持续更新，两者都刷
-        listOf(yesterday, today).forEach { day ->
-            runCatching {
-                source.collect(day.toString()).forEach { writeMetric(it) }
-            }.onFailure { Log.w(TAG, "collect mi health failed for $day", it) }
-        }
+    private suspend fun collectRegistered(today: LocalDate, yesterday: LocalDate) {
+        SourceProviderRegistry.providers()
+            .filter { it.source.key != SourceRef.Builtin(SourceType.SCREEN_TIME).key }
+            .forEach { provider ->
+                val source = provider.factory(applicationContext)
+                // 昨天的数据已定稿，今天的数据会随白天推进持续更新，两者都刷
+                listOf(yesterday, today).forEach { day ->
+                    runCatching {
+                        source.collect(day.toString()).forEach { writeMetric(it) }
+                    }.onFailure {
+                        Log.w(TAG, "collect ${provider.source.key} failed for $day", it)
+                    }
+                }
+            }
     }
 
-    private suspend fun collectInto(source: ScreenTimeDataSource, day: LocalDate): Boolean {
+    private suspend fun collectInto(source: ScreenTimeSource, day: LocalDate): Boolean {
         val date = day.toString()
         val records = runCatching { source.collect(date) }.getOrElse {
             Log.e(TAG, "collect failed for $date", it)
@@ -107,7 +123,7 @@ class DailyAggregateWorker(
      * 分开采会出现「总分和明细加起来对不上」的困惑。
      * 用 (date, packageName) 做主键覆盖写，重复采集天然幂等。
      */
-    private suspend fun writeAppUsage(source: ScreenTimeDataSource, day: LocalDate) {
+    private suspend fun writeAppUsage(source: ScreenTimeSource, day: LocalDate) {
         runCatching {
             val context = applicationContext
             val perApp = source.queryPerAppMinutes(day)
@@ -142,7 +158,9 @@ class DailyAggregateWorker(
             applicationContext,
             LifeBoardContract.PATH_METRIC,
             ContentValues().apply {
-                put(LifeBoardContract.COL_SOURCE_TYPE, record.source.name)
+                // 落库键统一由 SourceRef 生成：内置源是枚举名、自建源 CUSTOM_{id}、插件源 PLUGIN_{id}:{metric}，
+                // 各处自行拼接是历史上数据对不上的根因
+                put(LifeBoardContract.COL_SOURCE_TYPE, record.source.key)
                 put(LifeBoardContract.COL_DATE, record.date)
                 put(LifeBoardContract.COL_BUCKET, record.bucket.name)
                 put(LifeBoardContract.COL_VALUE, record.value)

@@ -1,12 +1,14 @@
 ﻿package com.lifeboard.server.health
 
 import android.content.Context
+import com.lifeboard.core.model.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.server.collect.SettingsNavigator
 import com.lifeboard.server.db.LifeBoardDatabase
 import com.lifeboard.server.db.SourceHealthEntity
 import com.lifeboard.server.notice.NoticeListenerService
 import com.lifeboard.server.source.ScreenTimeDataSource
+import com.lifeboard.server.source.toRef
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -27,18 +29,21 @@ object SourceHealthChecker {
     enum class State { OK, NO_PERMISSION, NOT_IMPLEMENTED, RULE_ONLY }
 
     data class Entry(
-        val source: SourceType,
+        val source: SourceRef,
         val state: State,
         val message: String,
         /** 点击后可跳转的设置页；null 表示无可用跳转 */
         val actionKey: String?,
-        /** 自建源没有对应的 SourceType 枚举，这里存它的展示名 */
+        /** 自建源/插件源没有对应的 SourceType 枚举，这里存它的展示名 */
         val customName: String = "",
     ) {
         val healthy: Boolean get() = state == State.OK
 
         val displayName: String
             get() = customName.ifBlank { source.displayName }
+
+        /** 写进 `source_health.sourceType` 的键 */
+        val key: String get() = source.key
     }
 
     private const val ACTION_USAGE_ACCESS = "usage_access"
@@ -52,13 +57,13 @@ object SourceHealthChecker {
 
         return listOf(
             Entry(
-                source = SourceType.SCREEN_TIME,
+                source = SourceRef.Builtin(SourceType.SCREEN_TIME),
                 state = if (screenOk) State.OK else State.NO_PERMISSION,
                 message = if (screenOk) "已授权，可统计屏幕使用时长" else "未授予「使用情况访问权」",
                 actionKey = if (screenOk) null else ACTION_USAGE_ACCESS,
             ),
             Entry(
-                source = SourceType.FEISHU_ATTENDANCE,
+                source = SourceRef.Builtin(SourceType.FEISHU_ATTENDANCE),
                 state = if (noticeOk) State.OK else State.NO_PERMISSION,
                 message = if (noticeOk) {
                     "已授权，识别到打卡通知时计数"
@@ -68,7 +73,7 @@ object SourceHealthChecker {
                 actionKey = if (noticeOk) null else ACTION_NOTICE_LISTENER,
             ),
             Entry(
-                source = SourceType.DUOLINGO,
+                source = SourceRef.Builtin(SourceType.DUOLINGO),
                 state = if (noticeOk) State.OK else State.NO_PERMISSION,
                 message = if (noticeOk) {
                     "已授权，识别到目标达成通知时计数"
@@ -82,7 +87,7 @@ object SourceHealthChecker {
             notImplemented(SourceType.READEST, "需读取 Readest 本地存储，二期接入"),
             notImplemented(SourceType.QC_BOOK_LOG, "待提供数据表结构，二期接入"),
             Entry(
-                source = SourceType.MANUAL,
+                source = SourceRef.Builtin(SourceType.MANUAL),
                 state = State.OK,
                 message = "手动打卡，无需权限",
                 actionKey = null,
@@ -103,7 +108,9 @@ object SourceHealthChecker {
             }.getOrDefault(emptyList())
         }.map { entity ->
             Entry(
-                source = SourceType.MANUAL,
+                // 自建源没有枚举，用一个量纲已按实体还原的引用承载它的 key 与展示名；
+                // MANUAL 只是占位，实际 key 与名称都来自 customName 与引用本身
+                source = entity.toRef(),
                 state = State.RULE_ONLY,
                 message = "自建源，仅由采集规则命中计数",
                 actionKey = null,
@@ -120,7 +127,7 @@ object SourceHealthChecker {
     private fun miHealthEntry(context: Context): Entry {
         val loggedIn = com.lifeboard.server.mihealth.MiHealthCredentialStore.isLoggedIn(context)
         return Entry(
-            source = SourceType.MI_HEALTH,
+            source = SourceRef.Builtin(SourceType.MI_HEALTH),
             state = if (loggedIn) State.OK else State.NO_PERMISSION,
             message = if (loggedIn) {
                 "已登录，可读取步数与睡眠"
@@ -156,12 +163,13 @@ object SourceHealthChecker {
         val now = System.currentTimeMillis()
         val previous = dao.getAll().associateBy { it.sourceType }
         checkAll(context).forEach { entry ->
+            val key = entry.key
             dao.upsert(
                 SourceHealthEntity(
-                    sourceType = entry.source.name,
+                    sourceType = key,
                     healthy = entry.healthy,
                     // 保持上次成功时间：本次健康就刷新，否则沿用旧值
-                    lastSuccessAt = if (entry.healthy) now else (previous[entry.source.name]?.lastSuccessAt ?: 0L),
+                    lastSuccessAt = if (entry.healthy) now else (previous[key]?.lastSuccessAt ?: 0L),
                     message = entry.message,
                 ),
             )
@@ -169,7 +177,7 @@ object SourceHealthChecker {
     }
 
     private fun notImplemented(source: SourceType, message: String) = Entry(
-        source = source,
+        source = SourceRef.Builtin(source),
         state = State.NOT_IMPLEMENTED,
         message = message,
         actionKey = null,
