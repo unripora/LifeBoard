@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  androidTest 专用的 manifest。
+
+  这里只做一件事：移除从 :server 主 manifest 合并进来的 ContentProvider。
+
+  原因：测试 APK 的包名是 com.lifeboard.server.test，它同样声明
+  authority = com.lifeboard.provider。而设备上通常装着宿主 com.lifeboard.app，
+  也声明了同一个 authority。Android 不允许两个已安装包共用 authority，
+  安装测试包时直接报 INSTALL_FAILED_CONFLICTING_PROVIDER。
+
+  测试本身不通过 provider 跨进程访问数据（都是进程内直接调 DAO），
+  所以摘掉它不影响任何用例，比给测试包换一个 authority 更干净——
+  后者会让测试里的 authority 与生产代码的 LifeBoardContract.AUTHORITY 不一致，
+  将来真要用 provider 时容易踩坑。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application>
+        <provider
+            android:name="com.lifeboard.server.provider.LifeBoardProvider"
+            tools:node="remove" />
+    </application>
+
+</manifest>

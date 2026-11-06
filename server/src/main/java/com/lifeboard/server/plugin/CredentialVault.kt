@@ -68,8 +68,8 @@ object CredentialVault {
 
     /** 清除某插件名下全部凭据，返回删掉的槽位数量 */
     suspend fun clearPlugin(context: Context, pluginId: String): Int = withContext(Dispatchers.IO) {
-        val count = dao(context).slots(pluginId).size
-        dao(context).deleteByPlugin(pluginId)
+        // 直接取 DELETE 的影响行数，省掉先查一次 slots 只为数个数
+        val count = dao(context).deleteByPlugin(pluginId)
         Log.i(TAG, "cleared $count credentials for $pluginId")
         count
     }
