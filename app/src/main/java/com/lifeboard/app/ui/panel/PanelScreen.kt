@@ -15,7 +15,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -38,21 +37,31 @@ import com.lifeboard.app.ui.theme.GlassCard
 import com.lifeboard.app.ui.theme.GlassProgress
 import com.lifeboard.core.model.RemindLevel
 import com.lifeboard.core.util.Dates
+import com.lifeboard.server.dashboard.CardType
 import com.lifeboard.server.health.SourceHealthChecker
 import java.time.LocalDate
 
 /**
- * 首页仪表盘（M3.4）。
+ * 首页仪表盘。
  *
  * 从上到下的信息层次：今日总分 → 待办列表 → 本周趋势。
  * 总分放最上面，是因为它是这个应用唯一的"一眼结论"；
  * 任务行只展示判断所需的四项：名称、时段、当前/目标、连击。
+ *
+ * ## 卡片化（M6a）
+ *
+ * 四块内容各自包成一张卡片，由 [CardHost] 按类型分发。
+ * **卡片内部一行没改**，只是把原来内联的参数换成显式入参——
+ * 这样 M6b 加拖拽、增删、跨页签移动时，卡片的渲染逻辑不用再碰。
+ *
+ * 卡片不接收 ViewModel，只接收 state 切片和事件 lambda：
+ * 一是避免「同一个 ViewModel 在多个页签各存一份状态」，
+ * 二是让卡片在没有 ViewModel 的地方（比如预览、其他页签）也能渲染。
  */
 @Composable
 fun PanelScreen(
     onEditTask: (Long) -> Unit,
     onNewTask: () -> Unit,
-    onOpenMiHealthLogin: () -> Unit = {},
     /** 变化时重新判定数据源健康度（如刚完成小米账号登录） */
     refreshKey: Int = 0,
     vm: PanelViewModel = viewModel(),
@@ -64,6 +73,11 @@ fun PanelScreen(
         if (refreshKey > 0) vm.refreshHealth()
     }
 
+    // 默认布局的顺序：与 M6a 之前的内联顺序完全一致，保证升级后视觉无变化
+    val cards = remember {
+        listOf(CardType.SCORE, CardType.TODO, CardType.WEEK, CardType.SOURCE_HEALTH)
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -71,56 +85,22 @@ fun PanelScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        ScoreCard(state = state, onRefresh = { vm.reevaluate() })
-
-        GlassCard(modifier = Modifier.fillMaxWidth()) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("今日待办", style = MaterialTheme.typography.titleSmall)
-                Text(
-                    "${state.completedCount} / ${state.activeRows.size}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
-            if (state.rows.isEmpty()) {
-                Text(
-                    "还没有任务，先建一个吧",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            } else {
-                state.rows.forEach { row ->
-                    TaskItem(
-                        row = row,
-                        onMarkDone = { vm.markDone(row) },
-                        onEdit = { onEditTask(row.task.id) },
-                        onToggle = { vm.toggleEnabled(row) },
-                        onDelete = { pendingDelete = row },
-                    )
-                    HorizontalDivider()
-                }
-            }
-
-            Button(onClick = onNewTask) { Text("新建任务") }
-        }
-
-        WeekCard(scores = state.weekScores)
-
-        if (state.brokenSources.isNotEmpty()) {
-            SourceHealthCard(
-                entries = state.brokenSources,
-                onOpenSettings = {
-                    // 应用内动作（如小米健康登录）没有系统设置页，交给外层覆盖页
-                    if (!vm.openSourceSettings(it)) onOpenMiHealthLogin()
-                },
+        cards.forEach { type ->
+            CardHost(
+                type = type,
+                state = state,
+                onRefresh = { vm.reevaluate() },
+                onMarkDone = { vm.markDone(it) },
+                onEditTask = onEditTask,
+                onNewTask = onNewTask,
+                onToggle = { vm.toggleEnabled(it) },
+                onDelete = { pendingDelete = it },
+                // 只有系统权限类数据源会带 actionKey，宿主直接跳系统设置页
+                onOpenSourceSettings = { vm.openSourceSettings(it) },
             )
         }
 
+        // 提示文本不是卡片：它是一过性的状态说明，没有摆放/拖拽的意义
         if (state.message.isNotBlank()) {
             Text(
                 state.message,
@@ -145,6 +125,60 @@ fun PanelScreen(
                 TextButton(onClick = { pendingDelete = null }) { Text("取消") }
             },
         )
+    }
+}
+
+/**
+ * 卡片外壳：按类型分发到具体实现。
+ *
+ * M6a 阶段它**只做分发**，不加拖拽手柄、边框、内边距——
+ * 任何额外的东西都会改变现有间距，而这一阶段的验收标准是「看起来一模一样」。
+ * M6b 的编辑态（拖拽、删除按钮）从这里长出来。
+ *
+ * 卡片内部自行判断是否有内容：`SOURCE_HEALTH` 在没有断源时整张不渲染，
+ * 与改造前 `if (brokenSources.isNotEmpty())` 的效果一致。
+ */
+@Composable
+private fun CardHost(
+    type: CardType,
+    state: PanelUiState,
+    onRefresh: () -> Unit,
+    onMarkDone: (TaskRow) -> Unit,
+    onEditTask: (Long) -> Unit,
+    onNewTask: () -> Unit,
+    onToggle: (TaskRow) -> Unit,
+    onDelete: (TaskRow) -> Unit,
+    onOpenSourceSettings: (SourceHealthChecker.Entry) -> Unit,
+) {
+    when (type) {
+        CardType.SCORE -> ScoreCard(state = state, onRefresh = onRefresh)
+
+        CardType.TODO -> TodoCard(
+            rows = state.rows,
+            activeCount = state.activeRows.size,
+            completedCount = state.completedCount,
+            onMarkDone = onMarkDone,
+            onEdit = { onEditTask(it.task.id) },
+            onToggle = onToggle,
+            onDelete = onDelete,
+            onNewTask = onNewTask,
+        )
+
+        CardType.WEEK -> WeekCard(scores = state.weekScores)
+
+        CardType.SOURCE_HEALTH -> {
+            // 无断源时整张不渲染，保持与改造前一致
+            if (state.brokenSources.isNotEmpty()) {
+                SourceHealthCard(
+                    entries = state.brokenSources,
+                    onOpenSettings = onOpenSourceSettings,
+                )
+            }
+        }
+
+        // METRIC 卡在 M6b 实现。这里不给兜底渲染，
+        // 免得布局里残留一个空壳占位
+        CardType.METRIC -> Unit
     }
 }
 
@@ -182,6 +216,60 @@ private fun ScoreCard(state: PanelUiState, onRefresh: () -> Unit) {
         OutlinedButton(onClick = onRefresh, enabled = !state.loading) {
             Text(if (state.loading) "刷新中…" else "重新判定")
         }
+    }
+}
+
+/**
+ * 今日待办卡。
+ *
+ * 只接收列表与回调，不接 ViewModel：同一份数据可能被摆到多个页签，
+ * 各自持有一份状态会导致「这边勾完那边没变」。
+ */
+@Composable
+private fun TodoCard(
+    rows: List<TaskRow>,
+    activeCount: Int,
+    completedCount: Int,
+    onMarkDone: (TaskRow) -> Unit,
+    onEdit: (TaskRow) -> Unit,
+    onToggle: (TaskRow) -> Unit,
+    onDelete: (TaskRow) -> Unit,
+    onNewTask: () -> Unit,
+) {
+    GlassCard(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("今日待办", style = MaterialTheme.typography.titleSmall)
+            Text(
+                "$completedCount / $activeCount",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        if (rows.isEmpty()) {
+            Text(
+                "还没有任务，先建一个吧",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            rows.forEach { row ->
+                TaskItem(
+                    row = row,
+                    onMarkDone = { onMarkDone(row) },
+                    onEdit = { onEdit(row) },
+                    onToggle = { onToggle(row) },
+                    onDelete = { onDelete(row) },
+                )
+                HorizontalDivider()
+            }
+        }
+
+        Button(onClick = onNewTask) { Text("新建任务") }
     }
 }
 

@@ -14,6 +14,14 @@ android {
         // CredentialVault 依赖 Android Keystore / GCM / Room，JVM 单测无法覆盖，
         // 真机验证走 :server 的 connectedAndroidTest。
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // MigrationTestHelper 从 androidTest 的 assets 里读 schema，
+        // 需要把导出的 schema 目录显式挂进去
+        testInstrumentationRunnerArguments["room.schemaLocation"] =
+            "$projectDir/schemas".toString()
+    }
+
+    sourceSets {
+        getByName("androidTest").assets.srcDir("$projectDir/schemas")
     }
 
     buildTypes {
@@ -48,6 +56,8 @@ dependencies {
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.junit)
     androidTestImplementation(libs.androidx.test.runner)
+    // MigrationTestHelper：验证 10→11 建表且不清空老数据
+    androidTestImplementation(libs.androidx.room.testing)
 }
 
 /*

@@ -20,8 +20,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         CustomSourceEntity::class,
         AppUsageEntity::class,
         PluginCredentialEntity::class,
+        DashboardTabEntity::class,
+        DashboardCardEntity::class,
     ],
-    version = 10,
+    version = 11,
     exportSchema = true,
 )
 abstract class LifeBoardDatabase : RoomDatabase() {
@@ -36,6 +38,8 @@ abstract class LifeBoardDatabase : RoomDatabase() {
     abstract fun customSourceDao(): CustomSourceDao
     abstract fun appUsageDao(): AppUsageDao
     abstract fun pluginCredentialDao(): PluginCredentialDao
+    abstract fun dashboardTabDao(): DashboardTabDao
+    abstract fun dashboardCardDao(): DashboardCardDao
 
     companion object {
         const val NAME = "lifeboard.db"
@@ -134,6 +138,53 @@ abstract class LifeBoardDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v10 → v11：新增仪表盘布局两张表。
+         *
+         * 只是加表，不动已有结构。**必须显式迁移**：
+         * 落到 destructive fallback 会把任务、规则、凭据全部清空，
+         * 对用户来说是「升级后所有配置都没了」。
+         *
+         * 表建好之后是空的，内置页签与默认卡片由
+         * [com.lifeboard.server.dashboard.DashboardLayout] 在首次读取时写入，
+         * 不在迁移里插数据——迁移只改结构，不碰业务内容。
+         *
+         * 用 internal 而非 private：迁移测试要引用同一个实例，
+         * 复制一份到测试里就会「测的不是线上那段代码」。
+         */
+        internal val MIGRATION_10_11 = object : Migration(10, 11) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `dashboard_tab` (
+                        `tabId` TEXT NOT NULL,
+                        `name` TEXT NOT NULL,
+                        `order` INTEGER NOT NULL,
+                        `isBuiltin` INTEGER NOT NULL,
+                        PRIMARY KEY(`tabId`)
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `dashboard_card` (
+                        `cardId` TEXT NOT NULL,
+                        `type` TEXT NOT NULL,
+                        `sourceKey` TEXT,
+                        `metricKey` TEXT,
+                        `order` INTEGER NOT NULL,
+                        `tabId` TEXT NOT NULL,
+                        PRIMARY KEY(`cardId`)
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_dashboard_card_tabId` " +
+                        "ON `dashboard_card` (`tabId`)",
+                )
+            }
+        }
+
         @Volatile
         private var instance: LifeBoardDatabase? = null
 
@@ -149,6 +200,7 @@ abstract class LifeBoardDatabase : RoomDatabase() {
                     MIGRATION_7_8,
                     MIGRATION_8_9,
                     MIGRATION_9_10,
+                    MIGRATION_10_11,
                 )
                     .fallbackToDestructiveMigration()
                     .build().also { instance = it }
