@@ -49,3 +49,33 @@ dependencies {
     androidTestImplementation(libs.androidx.test.junit)
     androidTestImplementation(libs.androidx.test.runner)
 }
+
+/*
+ * 把 demo 插件的 APK 放进 androidTest 的 assets。
+ *
+ * 为什么走 assets 而不是 Gradle 直接依赖 :demo-plugin：
+ * 插件在运行期是被 DexClassLoader 从文件加载的，不是编译期依赖。
+ * 测试要验证的正是「拿到一个真实的 .ext 文件能不能装进插件目录并实例化」，
+ * 所以需要的是**文件**本身，而不是把它变成测试的 classpath 依赖——
+ * 后者会让契约类被测试进程的类加载器抢先加载，验证就失真了。
+ */
+val copyDemoPluginApk by tasks.registering(Copy::class) {
+    // 依赖 demo 插件的装配任务，保证 APK 已生成
+    dependsOn(":demo-plugin:assembleDebug")
+    from(project(":demo-plugin").layout.buildDirectory.dir("outputs/apk/debug")) {
+        include("*.apk")
+        // 加载器只认 .ext 后缀，这里直接改成插件包名
+        rename { "demo-plugin.ext" }
+    }
+    into(layout.projectDirectory.dir("src/androidTest/assets"))
+}
+
+// 资源合并任务在配置阶段结束时才注册，因此放到 afterEvaluate 里绑定，
+// 用 configureEach 保证即使任务稍后创建也能挂上依赖。
+afterEvaluate {
+    tasks.matching { it.name.startsWith("merge") && it.name.endsWith("AndroidTestAssets") }
+        .configureEach { dependsOn(copyDemoPluginApk) }
+    // 编译 androidTest 源码也要先有 assets，否则第一次跑测试时目录是空的
+    tasks.matching { it.name == "compileDebugAndroidTestKotlin" }
+        .configureEach { dependsOn(copyDemoPluginApk) }
+}

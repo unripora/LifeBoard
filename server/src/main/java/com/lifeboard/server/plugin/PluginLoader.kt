@@ -5,6 +5,8 @@ import android.util.Log
 import com.lifeboard.plugin.api.PluginApi
 import com.lifeboard.plugin.api.PluginMetrics
 import com.lifeboard.plugin.api.SourcePlugin
+import com.lifeboard.plugin.api.SourceRef
+import com.lifeboard.server.source.SourceProviderRegistry
 import dalvik.system.DexClassLoader
 import java.io.File
 
@@ -56,10 +58,19 @@ object PluginLoader {
     fun brokenPlugins(): List<BrokenPlugin> = broken.toList()
 
     /**
-     * 全量重新扫描。
+     * 全量重新扫描，并同步更新调度注册表。
      *
      * **整体替换而不是逐项增删**：调用方在并发读取（Worker 正在采集），
      * 先构建完整的新列表再一次性换上，读到的永远是某一时刻的完整集合。
+     *
+     * ## 为什么注册也放在这里
+     *
+     * 加载表和注册表必须描述同一批插件。之前两者由调用方分两步做，
+     * 中间存在一个窗口：`SourceHealthChecker` 读加载表、`DailyAggregateWorker`
+     * 读注册表，会看到不同的插件集合。把注册收进本方法，返回时两者必然一致。
+     *
+     * 同理，注册表的替换必须在本对象锁内完成，否则「加载表已换、注册表未换」
+     * 的窗口只是从调用方挪到了这里。
      *
      * @return 本次成功加载的插件
      */
@@ -79,13 +90,53 @@ object PluginLoader {
             }
         }
 
+        applyLoaded(newLoaded, newBroken)
+        return newLoaded
+    }
+
+    /**
+     * 用一组插件整体替换内部状态，并同步注册表。
+     *
+     * 抽出来是为了让 `scan` 与需要注入特定插件的测试走**同一条**状态更新路径：
+     * 若测试自己拼装状态，就绕过了「注册表与加载表在同一临界区替换」这条约束，
+     * 验证的就不是生产代码的行为。
+     */
+    internal fun applyLoaded(plugins: List<LoadedPlugin>, brokenList: List<BrokenPlugin>) {
         synchronized(this) {
             loaded.clear()
-            loaded += newLoaded
+            loaded += plugins
             broken.clear()
-            broken += newBroken
+            broken += brokenList
+            // 与加载表在同一临界区内更新，保证两者不出现短暂不一致
+            registerProviders(plugins)
         }
-        return newLoaded
+    }
+
+    /**
+     * 把插件指标注册成一个主动拉取源。
+     *
+     * 一个指标一个 Provider：插件内各量纲独立成败，
+     * 与内置源里小米健康的步数与睡眠各自一条健康记录一致。
+     *
+     * 空指标的插件不注册：它可能只提供登录管理，注册了也采不到数。
+     */
+    private fun registerProviders(plugins: List<LoadedPlugin>) {
+        val providers = plugins.flatMap { plugin ->
+            plugin.metrics.values.map { spec ->
+                SourceProviderRegistry.Provider(
+                    source = SourceRef.Plugin(
+                        pluginId = plugin.pluginId,
+                        metricKey = spec.metricKey,
+                        displayName = "${plugin.plugin.displayName}·${spec.displayName}",
+                        bucket = spec.bucket,
+                    ),
+                    // 工厂：每次采集新建，避免插件实例状态把不同日期的数据串起来
+                    factory = { ctx -> PluginDataSource(plugin, spec, ctx) },
+                )
+            }
+        }
+        SourceProviderRegistry.setPluginProviders(providers)
+        Log.i(TAG, "已注册插件源 ${providers.size} 个，来自 ${plugins.size} 个插件")
     }
 
     /** 按插件声明 id 找已加载的插件 */

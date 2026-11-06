@@ -21,8 +21,15 @@ class HostPluginContext(
 
     override val credentials: CredentialStore = VaultCredentialStore(pluginId, appContext)
 
-    override val filesDir: File = pluginDataDir(appContext, pluginId).also {
-        if (!it.exists()) it.mkdirs()
+    /**
+     * 目录在首次访问时才创建。
+     *
+     * 一次采集会依次调 `fetch` / `health` / `authState`，每次都新建本对象；
+     * 若在构造函数里做 [File.mkdirs]，就变成每次采集都查一遍目录存在性。
+     * 插件不碰 [filesDir] 时（演示插件就是这样）这一步完全是白费。
+     */
+    override val filesDir: File by lazy {
+        pluginDataDir(appContext, pluginId).also { if (!it.exists()) it.mkdirs() }
     }
 
     companion object {

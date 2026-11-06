@@ -21,3 +21,6 @@ docs/
 *.apk
 *.aab
 *.hprof
+
+# androidTest 用的插件包，由 copyDemoPluginApk 任务从 :demo-plugin 产物复制而来
+server/src/androidTest/assets/*.ext
