@@ -70,12 +70,28 @@ val copyDemoPluginApk by tasks.registering(Copy::class) {
     into(layout.projectDirectory.dir("src/androidTest/assets"))
 }
 
+/*
+ * 小米健康插件同样作为文件放进 assets。
+ *
+ * 它比 demo 更能证明契约可用：自带 OkHttp、多轮登录、双量纲，
+ * 而且契约类同样必须是 compileOnly（否则 instance is SourcePlugin 会失败）。
+ * 这里只验证「能装、能实例化、能声明指标」，真实登录与拉数需要账号，不进自动化。
+ */
+val copyMiHealthPluginApk by tasks.registering(Copy::class) {
+    dependsOn(":mihealth-plugin:assembleDebug")
+    from(project(":mihealth-plugin").layout.buildDirectory.dir("outputs/apk/debug")) {
+        include("*.apk")
+        rename { "mihealth-plugin.ext" }
+    }
+    into(layout.projectDirectory.dir("src/androidTest/assets"))
+}
+
 // 资源合并任务在配置阶段结束时才注册，因此放到 afterEvaluate 里绑定，
 // 用 configureEach 保证即使任务稍后创建也能挂上依赖。
 afterEvaluate {
     tasks.matching { it.name.startsWith("merge") && it.name.endsWith("AndroidTestAssets") }
-        .configureEach { dependsOn(copyDemoPluginApk) }
+        .configureEach { dependsOn(copyDemoPluginApk, copyMiHealthPluginApk) }
     // 编译 androidTest 源码也要先有 assets，否则第一次跑测试时目录是空的
     tasks.matching { it.name == "compileDebugAndroidTestKotlin" }
-        .configureEach { dependsOn(copyDemoPluginApk) }
+        .configureEach { dependsOn(copyDemoPluginApk, copyMiHealthPluginApk) }
 }

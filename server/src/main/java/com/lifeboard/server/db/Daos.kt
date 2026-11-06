@@ -69,6 +69,15 @@ interface MetricDao {
 
     @Upsert
     suspend fun upsert(metric: MetricEntity)
+
+    /**
+     * 删除某个数据源的全部指标。
+     *
+     * 用于某个源被移除后清理残留：那些行已经没有生产者，
+     * 留在表里会让面板出现一张永远不更新的卡片。
+     */
+    @Query("DELETE FROM metric WHERE sourceType = :sourceType")
+    suspend fun deleteBySource(sourceType: String): Int
 }
 
 @Dao
@@ -108,6 +117,10 @@ interface SourceHealthDao {
 
     @Upsert
     suspend fun upsert(health: SourceHealthEntity)
+
+    /** 删除某个源的健康度记录，与 [MetricDao.deleteBySource] 配套使用 */
+    @Query("DELETE FROM source_health WHERE sourceType = :sourceType")
+    suspend fun deleteBySource(sourceType: String): Int
 }
 
 @Dao

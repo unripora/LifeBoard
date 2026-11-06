@@ -1,6 +1,8 @@
 package com.lifeboard.server.plugin
 
 import android.content.Context
+import com.lifeboard.plugin.api.AuthState
+import com.lifeboard.plugin.api.LoginResult
 
 /**
  * 插件系统的对外入口：扫描、信任与撤销。
@@ -86,5 +88,57 @@ object PluginManager {
         val appContext = context.applicationContext
         PluginInstaller.remove(appContext, archiveName)
         refresh(appContext)
+    }
+
+    // ---- 登录 ----
+
+    /**
+     * 向插件发起一轮登录。
+     *
+     * 登录**流程**完全在插件里，宿主只做三件事：给它一个绑定了 pluginId 的上下文、
+     * 把用户填的值传进去、把结果原样交回 UI。
+     *
+     * 之所以要这个入口而不是让 UI 直接调插件：
+     * [HostPluginContext] 的构造需要收敛 `applicationContext`，且插件实例只能从
+     * [PluginLoader] 拿到手。UI 不应该知道这两件事。
+     *
+     * @param inputs 上一轮 [LoginResult.NeedInput] 要用户填的值
+     * @return 插件本轮结果；插件不存在或未信任时返回可展示的失败
+     */
+    suspend fun login(
+        context: Context,
+        pluginId: String,
+        inputs: Map<String, String> = emptyMap(),
+    ): LoginResult {
+        val appContext = context.applicationContext
+        val plugin = PluginLoader.find(pluginId)
+            ?: return LoginResult.Failure("插件未加载，请重新扫描")
+        if (!plugin.trusted) {
+            return LoginResult.Failure("插件已停止使用，请先信任再登录")
+        }
+
+        // 插件自己的异常不能打到 UI 上：契约要求它返回 Failure，
+        // 但第三方插件未必守规矩，这里兜一层并给出可读原因
+        return runCatching {
+            plugin.plugin.login(HostPluginContext(pluginId, appContext), inputs)
+        }.getOrElse { e ->
+            LoginResult.Failure("插件登录时出错：${e.message ?: e::class.simpleName}")
+        }
+    }
+
+    /** 查询插件当前登录态；失败按「未登录」处理，避免 UI 卡在没有状态 */
+    suspend fun authState(context: Context, pluginId: String): AuthState {
+        val appContext = context.applicationContext
+        val plugin = PluginLoader.find(pluginId) ?: return AuthState.LoggedOut
+        return runCatching {
+            plugin.plugin.authState(HostPluginContext(pluginId, appContext))
+        }.getOrElse { AuthState.LoggedOut }
+    }
+
+    /** 让插件清理自己名下的凭据 */
+    suspend fun logout(context: Context, pluginId: String) {
+        val appContext = context.applicationContext
+        val plugin = PluginLoader.find(pluginId) ?: return
+        runCatching { plugin.plugin.logout(HostPluginContext(pluginId, appContext)) }
     }
 }

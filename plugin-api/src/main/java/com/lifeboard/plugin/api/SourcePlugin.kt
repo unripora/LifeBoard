@@ -44,9 +44,19 @@ interface SourcePlugin {
     /**
      * 登录。流程完全由插件自己实现，凭据写进 [PluginContext.credentials]。
      *
-     * 失败要返回 [LoginResult.Failure] 而不是抛异常，[LoginResult.Failure.message] 会展示给用户。
+     * 支持多轮：返回 [LoginResult.NeedInput] 表示还差用户填东西，
+     * 调用方应展示表单并用用户填的值作为 [inputs] 再次调用本方法，
+     * 直到拿到 [LoginResult.Success] 或 [LoginResult.Failure]。
+     *
+     * 实现方注意：**不要假设 [inputs] 里有什么**。第一轮通常是空的，
+     * 第二轮开始会有调用方按需填的值；缺字段应返回新的 [LoginResult.NeedInput]，
+     * 而不是抛异常。
+     *
+     * 失败要返回 [LoginResult.Failure] 而不是抛异常，`message` 会展示给用户。
+     *
+     * @param inputs 上一轮 [LoginResult.NeedInput] 要求用户填的值，键是 [InputField.name]
      */
-    suspend fun login(context: PluginContext): LoginResult
+    suspend fun login(context: PluginContext, inputs: Map<String, String> = emptyMap()): LoginResult
 
     /** 登出：清理本插件名下凭据。宿主也会在用户清除凭据时调用 */
     suspend fun logout(context: PluginContext)
