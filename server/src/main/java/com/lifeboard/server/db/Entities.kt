@@ -257,3 +257,49 @@ data class AppUsageEntity(
     val minutes: Double,
     val label: String = "",
 )
+
+/**
+ * 仪表盘页签。
+ *
+ * 内置页签（面板/规则/趋势…）**也要**在这张表里出现，
+ * 否则「页签顺序」就有两个真相：代码里的枚举和这张表。
+ * 统一入库后，用户拖动内置页签也有地方记。
+ *
+ * @param tabId 稳定标识。内置页签用固定常量（如 `builtin_panel`），
+ *   用户新建的用 UUID。**不能用自增主键**：页签被卡片引用（卡片的 tabId），
+ *   自增 id 在重建布局时会漂移
+ * @param isBuiltin 内置页签不允许删除/改名，只能调顺序
+ */
+@Entity(tableName = "dashboard_tab")
+data class DashboardTabEntity(
+    @PrimaryKey val tabId: String,
+    val name: String,
+    val order: Int,
+    val isBuiltin: Boolean = false,
+)
+
+/**
+ * 仪表盘卡片。
+ *
+ * 只存「摆哪张、什么类型、绑哪个数据」，不存数据本身——
+ * 卡片内容永远从 metric / daily_record 实时读，避免两处不一致。
+ *
+ * @param cardId 实例 id。**同一类型可以有多张**（比如两个不同指标的卡），
+ *   所以不能用 type 做主键
+ * @param type 取 [com.lifeboard.server.dashboard.CardType] 的枚举名
+ * @param sourceKey 仅 METRIC 卡使用，绑定 SourceRef.key
+ * @param metricKey 仅 METRIC 卡使用，配合 MetricSpec 反查 bucket/单位/展示名
+ * @param tabId 所属页签，删除页签时级联清理
+ */
+@Entity(
+    tableName = "dashboard_card",
+    indices = [Index("tabId")],
+)
+data class DashboardCardEntity(
+    @PrimaryKey val cardId: String,
+    val type: String,
+    val sourceKey: String? = null,
+    val metricKey: String? = null,
+    val order: Int,
+    val tabId: String,
+)
