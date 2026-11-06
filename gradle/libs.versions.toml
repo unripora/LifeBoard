@@ -16,6 +16,8 @@ libxposedApi = "102.0.0"
 # 实机已验证 AutoAccounting 用这套 API 可在 system_server 正常加载
 legacyXposedApi = "82"
 junit = "4.13.2"
+androidxTestJunit = "1.2.1"
+androidxTestRunner = "1.6.2"
 okhttp = "4.12.0"
 
 [libraries]
@@ -46,6 +48,8 @@ kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 libxposed-api = { group = "io.github.libxposed", name = "api", version.ref = "libxposedApi" }
 legacy-xposed-api = { group = "de.robv.android.xposed", name = "api", version.ref = "legacyXposedApi" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
+androidx-test-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxTestJunit" }
+androidx-test-runner = { group = "androidx.test", name = "runner", version.ref = "androidxTestRunner" }
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 
 [plugins]
