@@ -2,9 +2,10 @@ package com.lifeboard.server.panel
 
 import android.content.Context
 import com.lifeboard.core.model.DailyRecord
-import com.lifeboard.core.model.MetricBucket
+import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.core.model.RemindLevel
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.core.model.builtinRef
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.model.StreakInfo
 import com.lifeboard.core.model.TaskConfig
@@ -164,7 +165,7 @@ class TaskRepository(private val context: Context) {
     }
 
     /** 兜底源：解析失败时用，语义是"只记录不采集" */
-    private val fallbackSource: SourceRef get() = SourceRef.Builtin(SourceType.MANUAL)
+    private val fallbackSource: SourceRef get() = builtinRef(SourceType.MANUAL)
 
     /** 批量解析，避免每个任务各查一次自建源表 */
     private suspend fun resolveSourceMap(keys: List<String>): Map<String, SourceRef> =

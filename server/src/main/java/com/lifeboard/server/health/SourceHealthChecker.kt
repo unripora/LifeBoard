@@ -1,7 +1,8 @@
-﻿package com.lifeboard.server.health
+package com.lifeboard.server.health
 
 import android.content.Context
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.core.model.builtinRef
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.server.collect.SettingsNavigator
 import com.lifeboard.server.db.LifeBoardDatabase
@@ -57,13 +58,13 @@ object SourceHealthChecker {
 
         return listOf(
             Entry(
-                source = SourceRef.Builtin(SourceType.SCREEN_TIME),
+                source = builtinRef(SourceType.SCREEN_TIME),
                 state = if (screenOk) State.OK else State.NO_PERMISSION,
                 message = if (screenOk) "已授权，可统计屏幕使用时长" else "未授予「使用情况访问权」",
                 actionKey = if (screenOk) null else ACTION_USAGE_ACCESS,
             ),
             Entry(
-                source = SourceRef.Builtin(SourceType.FEISHU_ATTENDANCE),
+                source = builtinRef(SourceType.FEISHU_ATTENDANCE),
                 state = if (noticeOk) State.OK else State.NO_PERMISSION,
                 message = if (noticeOk) {
                     "已授权，识别到打卡通知时计数"
@@ -73,7 +74,7 @@ object SourceHealthChecker {
                 actionKey = if (noticeOk) null else ACTION_NOTICE_LISTENER,
             ),
             Entry(
-                source = SourceRef.Builtin(SourceType.DUOLINGO),
+                source = builtinRef(SourceType.DUOLINGO),
                 state = if (noticeOk) State.OK else State.NO_PERMISSION,
                 message = if (noticeOk) {
                     "已授权，识别到目标达成通知时计数"
@@ -87,7 +88,7 @@ object SourceHealthChecker {
             notImplemented(SourceType.READEST, "需读取 Readest 本地存储，二期接入"),
             notImplemented(SourceType.QC_BOOK_LOG, "待提供数据表结构，二期接入"),
             Entry(
-                source = SourceRef.Builtin(SourceType.MANUAL),
+                source = builtinRef(SourceType.MANUAL),
                 state = State.OK,
                 message = "手动打卡，无需权限",
                 actionKey = null,
@@ -127,7 +128,7 @@ object SourceHealthChecker {
     private fun miHealthEntry(context: Context): Entry {
         val loggedIn = com.lifeboard.server.mihealth.MiHealthCredentialStore.isLoggedIn(context)
         return Entry(
-            source = SourceRef.Builtin(SourceType.MI_HEALTH),
+            source = builtinRef(SourceType.MI_HEALTH),
             state = if (loggedIn) State.OK else State.NO_PERMISSION,
             message = if (loggedIn) {
                 "已登录，可读取步数与睡眠"
@@ -177,7 +178,7 @@ object SourceHealthChecker {
     }
 
     private fun notImplemented(source: SourceType, message: String) = Entry(
-        source = SourceRef.Builtin(source),
+        source = builtinRef(source),
         state = State.NOT_IMPLEMENTED,
         message = message,
         actionKey = null,

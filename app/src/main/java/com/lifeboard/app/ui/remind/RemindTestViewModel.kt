@@ -3,9 +3,10 @@ package com.lifeboard.app.ui.remind
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.lifeboard.core.model.MetricBucket
+import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.core.model.RemindLevel
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.core.model.builtinRef
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.model.TaskConfig
 import com.lifeboard.core.util.Dates
@@ -154,9 +155,7 @@ class RemindTestViewModel(app: Application) : AndroidViewModel(app) {
 private fun TaskEntity.toUiTask(): TaskConfig = TaskConfig(
     id = id,
     title = title,
-    source = SourceRef.Builtin(
-        SourceType.entries.firstOrNull { it.name == sourceType } ?: SourceType.MANUAL,
-    ),
+    source = builtinRef(SourceType.fromKey(sourceType) ?: SourceType.MANUAL),
     metricBucket = MetricBucket.entries.firstOrNull { it.name == metricBucket }
         ?: MetricBucket.FLAG,
     threshold = threshold,

@@ -1,4 +1,4 @@
-package com.lifeboard.core.model
+package com.lifeboard.plugin.api
 
 /**
  * 数据源的统一引用。
@@ -8,11 +8,11 @@ package com.lifeboard.core.model
  * 一旦用户自建数据源，就会被静默降级成「手动打卡」——
  * 面板显示正常、数字永远是 0，且没有任何报错可查。
  *
- * 现在所有"按名字找数据源"的地方统一走 `SourceRegistry.resolve`，
- * 内置源、自定义源与插件源都能拿到正确的名称、量纲与单位。
- *
  * **key 的生成与解析必须全部经过本文件的伴生对象**，禁止在别处自行拼接：
  * 历史 bug 的根因就是各处各写一套拼接逻辑，改了一处漏了另一处。
+ *
+ * 本类型位于 `:plugin-api`：插件产出数据时需要构造 [Plugin] 分支并给出自己的 key，
+ * 而插件不能依赖宿主内部的 `:core`。
  */
 sealed interface SourceRef {
 
@@ -37,18 +37,20 @@ sealed interface SourceRef {
     /**
      * 内置源。
      *
-     * @param bucketOverride 指定本次引用的量纲；null 表示用该源的默认量纲。
-     *   一个内置源可以产出多个量纲（小米健康同时给步数与睡眠），
-     *   此时由采集器为每个量纲各造一个引用并显式指定量纲。
-     *   **落库键不受量纲影响**，仍是枚举名，历史数据零迁移。
+     * 这里不直接引用宿主内部的 `SourceType` 枚举：`SourceType` 带有目标包名等信息，
+     * 属于宿主与注入层的事，插件不需要也不应该看到。
+     * 内置源的身份就是它的 [key]（即枚举名），由宿主的 `SourceRegistry` 负责还原成 `SourceType`。
+     *
+     * @param key 内置源标识，等于 `SourceType` 枚举名，如 `SCREEN_TIME`
+     * @param bucket 本次引用的量纲。一个内置源可以产出多个量纲
+     *   （小米健康同时给步数与睡眠），此时由采集器为每个量纲各造一个引用并显式指定量纲。
+     *   **落库键 [key] 不受量纲影响**，仍是枚举名，历史数据零迁移。
      */
     data class Builtin(
-        val type: SourceType,
-        val bucketOverride: MetricBucket? = null,
+        override val key: String,
+        override val displayName: String,
+        override val bucket: MetricBucket,
     ) : SourceRef {
-        override val key: String get() = type.name
-        override val displayName: String get() = type.displayName
-        override val bucket: MetricBucket get() = bucketOverride ?: defaultBucket(type)
         override val unit: String get() = bucket.unit
         override val isCustom: Boolean get() = false
     }
@@ -67,11 +69,11 @@ sealed interface SourceRef {
     /**
      * 插件源。
      *
-     * 插件是运行时才装进来的，标识不可能追加到编译期枚举 [SourceType]，
+     * 插件是运行时才装进来的，标识不可能追加到宿主的编译期枚举，
      * 所以单独开一个分支，落库仍然只是一个字符串（见 [pluginKey]），表结构零改动。
      *
      * 同一个插件可以产出多个量纲（如小米健康的步数与睡眠），
-     * 它们靠 [metricKey] 区分，[bucket] 由插件声明的指标元数据给出，
+     * 它们靠 [metricKey] 区分，[bucket] 由插件声明的指标元数据（[MetricSpec]）给出，
      * 与 `metric` 表主键里的 `bucket` 列一一对应。
      *
      * @param pluginId 插件全局唯一标识，反向域名式，如 `dev.foo.mihealth`，不得含 `:`
@@ -90,23 +92,11 @@ sealed interface SourceRef {
     }
 
     companion object {
-        /** 内置源的默认量纲，与任务编辑页的可选量纲保持一致的思路 */
-        fun defaultBucket(type: SourceType): MetricBucket = when (type) {
-            SourceType.SCREEN_TIME -> MetricBucket.DURATION_MINUTES
-            SourceType.DUOLINGO -> MetricBucket.COUNT
-            SourceType.MI_HEALTH -> MetricBucket.STEPS
-            SourceType.LEGADO -> MetricBucket.DURATION_MINUTES
-            SourceType.READEST -> MetricBucket.DURATION_MINUTES
-            SourceType.QC_BOOK_LOG -> MetricBucket.DURATION_MINUTES
-            SourceType.FEISHU_ATTENDANCE -> MetricBucket.FLAG
-            SourceType.MANUAL -> MetricBucket.FLAG
-        }
-
         fun customKey(id: Long): String = "CUSTOM_$id"
 
         /** 从 `CUSTOM_12` 里取出 12，不是自建源返回 null */
         fun parseCustomId(key: String): Long? {
-            val suffix = key.removePrefix(PREFIX)
+            val suffix = key.removePrefix(CUSTOM_PREFIX)
             if (suffix == key) return null
             return suffix.toLongOrNull()
         }
@@ -150,7 +140,7 @@ sealed interface SourceRef {
         fun isValidPluginKeyPart(part: String): Boolean =
             part.isNotEmpty() && !part.contains(PLUGIN_SEPARATOR)
 
-        private const val PREFIX = "CUSTOM_"
+        private const val CUSTOM_PREFIX = "CUSTOM_"
         private const val PLUGIN_PREFIX = "PLUGIN_"
         private const val PLUGIN_SEPARATOR = ':'
     }

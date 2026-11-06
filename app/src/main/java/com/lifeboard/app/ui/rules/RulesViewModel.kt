@@ -3,8 +3,9 @@ package com.lifeboard.app.ui.rules
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.lifeboard.core.model.MetricBucket
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.plugin.api.MetricBucket
+import com.lifeboard.core.model.builtinRef
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.schedule.RepeatType
 import com.lifeboard.core.schedule.ScheduleRule
@@ -284,7 +285,7 @@ fun buildEditState(rule: CaptureRuleEntity, resolved: SourceRef?): RuleEditUiSta
 }
 
 /** 供外部构造空规则时使用的默认数据源 */
-val defaultRuleSource: SourceRef get() = SourceRef.Builtin(SourceType.FEISHU_ATTENDANCE)
+val defaultRuleSource: SourceRef get() = builtinRef(SourceType.FEISHU_ATTENDANCE)
 
 /** 关键词拆分复用匹配引擎的实现，避免两处规则不一致 */
 fun splitRuleKeywords(raw: String): List<String> = CaptureRuleMatcher.splitKeywords(raw)

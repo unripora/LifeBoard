@@ -1,5 +1,7 @@
 package com.lifeboard.core.model
 
+import com.lifeboard.plugin.api.MetricBucket
+import com.lifeboard.plugin.api.SourceRef
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -22,18 +24,18 @@ class SourceRefBaselineTest {
     @Test
     fun `内置源 key 等于枚举名`() {
         SourceType.entries.forEach { type ->
-            assertEquals(type.name, SourceRef.Builtin(type).key)
+            assertEquals(type.name, builtinRef(type).key)
         }
     }
 
     @Test
     fun `内置源 key 的关键取值固定`() {
         // 这几个是历史库里真实出现过的 sourceType 值，一个都不能变
-        assertEquals("SCREEN_TIME", SourceRef.Builtin(SourceType.SCREEN_TIME).key)
-        assertEquals("MI_HEALTH", SourceRef.Builtin(SourceType.MI_HEALTH).key)
-        assertEquals("FEISHU_ATTENDANCE", SourceRef.Builtin(SourceType.FEISHU_ATTENDANCE).key)
-        assertEquals("DUOLINGO", SourceRef.Builtin(SourceType.DUOLINGO).key)
-        assertEquals("MANUAL", SourceRef.Builtin(SourceType.MANUAL).key)
+        assertEquals("SCREEN_TIME", builtinRef(SourceType.SCREEN_TIME).key)
+        assertEquals("MI_HEALTH", builtinRef(SourceType.MI_HEALTH).key)
+        assertEquals("FEISHU_ATTENDANCE", builtinRef(SourceType.FEISHU_ATTENDANCE).key)
+        assertEquals("DUOLINGO", builtinRef(SourceType.DUOLINGO).key)
+        assertEquals("MANUAL", builtinRef(SourceType.MANUAL).key)
     }
 
     // ---------- 自建源 key = CUSTOM_{id}（历史写入值） ----------
@@ -67,11 +69,11 @@ class SourceRefBaselineTest {
 
     @Test
     fun `内置源默认量纲与历史一致`() {
-        assertEquals(MetricBucket.DURATION_MINUTES, SourceRef.defaultBucket(SourceType.SCREEN_TIME))
-        assertEquals(MetricBucket.STEPS, SourceRef.defaultBucket(SourceType.MI_HEALTH))
-        assertEquals(MetricBucket.COUNT, SourceRef.defaultBucket(SourceType.DUOLINGO))
-        assertEquals(MetricBucket.FLAG, SourceRef.defaultBucket(SourceType.FEISHU_ATTENDANCE))
-        assertEquals(MetricBucket.FLAG, SourceRef.defaultBucket(SourceType.MANUAL))
+        assertEquals(MetricBucket.DURATION_MINUTES, defaultBucketOf(SourceType.SCREEN_TIME))
+        assertEquals(MetricBucket.STEPS, defaultBucketOf(SourceType.MI_HEALTH))
+        assertEquals(MetricBucket.COUNT, defaultBucketOf(SourceType.DUOLINGO))
+        assertEquals(MetricBucket.FLAG, defaultBucketOf(SourceType.FEISHU_ATTENDANCE))
+        assertEquals(MetricBucket.FLAG, defaultBucketOf(SourceType.MANUAL))
     }
 
     @Test
