@@ -5,11 +5,11 @@ import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.os.Process
 import android.util.Log
-import com.lifeboard.core.model.MetricBucket
 import com.lifeboard.core.model.MetricRecord
 import com.lifeboard.core.model.SourceHealth
+import com.lifeboard.core.model.SourceRef
 import com.lifeboard.core.model.SourceType
-import com.lifeboard.core.source.DataSource
+import com.lifeboard.core.source.ScreenTimeSource
 import com.lifeboard.core.util.Dates
 import java.time.LocalDate
 
@@ -28,9 +28,9 @@ import java.time.LocalDate
  * 已知限制：汇总数据有延迟，当天正在使用的那一段可能还没计入，
  * 「今天」的数字会偏小，隔天之后才完全准确。
  */
-class ScreenTimeDataSource(private val context: Context) : DataSource {
+class ScreenTimeDataSource(private val context: Context) : ScreenTimeSource {
 
-    override val sourceType: SourceType = SourceType.SCREEN_TIME
+    override val source: SourceRef = SourceRef.Builtin(SourceType.SCREEN_TIME)
 
     override val requiresInjection: Boolean = false
 
@@ -43,7 +43,7 @@ class ScreenTimeDataSource(private val context: Context) : DataSource {
      * 注意：`AppOpsManager.OPSTR_GET_USAGE_STATS` 在部分 ROM 上即使未授权也会返回
      * MODE_DEFAULT，因此不能只看 AppOps，必须再判断查询结果是否为空才可靠。
      */
-    fun hasPermission(): Boolean {
+    override fun hasPermission(): Boolean {
         val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager ?: return false
         @Suppress("DEPRECATION")
         val mode = runCatching {
@@ -71,9 +71,8 @@ class ScreenTimeDataSource(private val context: Context) : DataSource {
         val totalMinutes = queryScreenMinutes(day)
         return listOf(
             MetricRecord(
-                source = SourceType.SCREEN_TIME,
+                source = SourceRef.Builtin(SourceType.SCREEN_TIME),
                 date = date,
-                bucket = MetricBucket.DURATION_MINUTES,
                 value = totalMinutes,
             ),
         )
@@ -82,7 +81,7 @@ class ScreenTimeDataSource(private val context: Context) : DataSource {
     override suspend fun health(): SourceHealth {
         val granted = hasPermission()
         return SourceHealth(
-            source = SourceType.SCREEN_TIME,
+            source = SourceRef.Builtin(SourceType.SCREEN_TIME),
             healthy = granted,
             lastSuccessAt = if (granted) System.currentTimeMillis() else 0L,
             message = if (granted) "" else "未授予「使用情况访问权」，无法统计屏幕时长",
@@ -133,7 +132,7 @@ class ScreenTimeDataSource(private val context: Context) : DataSource {
      * 直接取包名与前台时长即可，不需要自己配对了。
      * 面板暂未展示，留作「分应用明细」与误差校验用。
      */
-    fun queryPerAppMinutes(day: LocalDate): List<Pair<String, Double>> {
+    override fun queryPerAppMinutes(day: LocalDate): List<Pair<String, Double>> {
         val usm = usageStats ?: return emptyList()
         val begin = Dates.startOfDayMillis(day)
         val end = Dates.endOfDayMillis(day)
