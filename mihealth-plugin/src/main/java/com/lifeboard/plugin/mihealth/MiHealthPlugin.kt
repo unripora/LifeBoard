@@ -12,6 +12,8 @@ import com.lifeboard.plugin.api.PluginHealth
 import com.lifeboard.plugin.api.PluginMetric
 import com.lifeboard.plugin.api.SourcePlugin
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.time.LocalDate
@@ -87,51 +89,63 @@ class MiHealthPlugin : SourcePlugin {
      *
      * 中间态放在内存里的 [pending]：验证码与那次会话的 cookie 绑定，
      * 换会话取到的图必然对不上，所以必须把 OkHttp 会话跨轮次保留住。
+     *
+     * ## 为什么要串行
+     *
+     * [pendingLogin] 是「当前登录走到哪一步」的唯一真相。用户连点提交时，
+     * 两个协程可能同时读到 null 各自发起密码登录，后完成的那个把前一个的
+     * 会话覆盖掉——验证码图与 cookie 就对不上了。
+     * 宿主侧的 `busy` 只能减少连点，不能当并发保证，插件必须自己扛住。
+     *
+     * 用 [Mutex] 而不是 `synchronized`：本方法中间有网络挂起点，
+     * 前者挂起时释放线程，后者会一直占着。
      */
     override suspend fun login(
         context: PluginContext,
         inputs: Map<String, String>,
-    ): LoginResult = withContext(Dispatchers.IO) {
-        // 已有中间态：说明这是在回答上一轮的提问
-        val pending = pendingLogin
+    ): LoginResult = loginMutex.withLock {
+        withContext(Dispatchers.IO) {
+            // 已有中间态：说明这是在回答上一轮的提问
+            val pending = pendingLogin
 
-        if (pending == null) {
-            // 第一轮：要账号密码。调用方第一次调用通常不带 inputs，
-            // 这时先问，不该把空账号密码拿去请求
-            val account = inputs[SLOT_ACCOUNT]
-            val password = inputs[SLOT_PASSWORD]
-            if (account.isNullOrBlank() || password.isNullOrBlank()) {
-                return@withContext LoginResult.NeedInput(
-                    prompt = "请输入小米账号和密码",
-                    fields = listOf(
-                        InputField(SLOT_ACCOUNT, "小米账号"),
-                        InputField(SLOT_PASSWORD, "密码", secret = true),
-                    ),
+            if (pending == null) {
+                // 第一轮：要账号密码。调用方第一次调用通常不带 inputs，
+                // 这时先问，不该把空账号密码拿去请求
+                val account = inputs[SLOT_ACCOUNT]
+                val password = inputs[SLOT_PASSWORD]
+                if (account.isNullOrBlank() || password.isNullOrBlank()) {
+                    return@withContext LoginResult.NeedInput(
+                        prompt = "请输入小米账号和密码",
+                        fields = listOf(
+                            InputField(SLOT_ACCOUNT, "小米账号"),
+                            InputField(SLOT_PASSWORD, "密码", secret = true),
+                        ),
+                    )
+                }
+                startLogin(context, account, password)
+            } else when (pending.stage) {
+                Stage.CAPTCHA -> {
+                    val code = inputs[SLOT_CAPTCHA]
+                    if (code.isNullOrBlank()) {
+                        return@withContext needCaptcha(pending)
+                    }
+                    finish(auth.loginWithCaptcha(pending.captcha!!, code), context)
+                }
+
+                Stage.TWO_FACTOR -> {
+                    val code = inputs[SLOT_OTP]
+                    if (code.isNullOrBlank()) {
+                        return@withContext needOtp(pending)
+                    }
+                    finish(auth.complete2FA(pending.twoFactor!!, code), context)
+                }
+
+                Stage.PASSWORD -> startLogin(
+                    context,
+                    inputs[SLOT_ACCOUNT] ?: pending.account,
+                    inputs[SLOT_PASSWORD] ?: pending.password,
                 )
             }
-            startLogin(context, account, password)
-        } else when (pending.stage) {
-            Stage.CAPTCHA -> {
-                val code = inputs[SLOT_CAPTCHA]
-                if (code.isNullOrBlank()) {
-                    return@withContext needCaptcha(pending)
-                }
-                finish(auth.loginWithCaptcha(pending.captcha!!, code), context)
-            }
-
-            Stage.TWO_FACTOR -> {
-                val code = inputs[SLOT_OTP]
-                if (code.isNullOrBlank()) {
-                    return@withContext needOtp(pending)
-                }
-                finish(auth.complete2FA(pending.twoFactor!!, code), context)
-            }
-
-            Stage.PASSWORD -> startLogin(
-                context,
-                inputs[SLOT_ACCOUNT] ?: pending.account,
-                inputs[SLOT_PASSWORD] ?: pending.password,
-            )
         }
     }
 
@@ -196,7 +210,9 @@ class MiHealthPlugin : SourcePlugin {
         }
         return LoginResult.NeedInput(
             prompt = "需要输入图片验证码",
-            fields = listOf(InputField(SLOT_CAPTCHA, "验证码", secret = true)),
+            // 验证码不掩码：用户要照着图抄，掩码只会让他抄错。
+            // 掩码该留给密码这种长期秘密，一次性短码明文显示更安全也更省事
+            fields = listOf(InputField(SLOT_CAPTCHA, "验证码", secret = false)),
             captchaImage = image?.takeIf { it.isNotBlank() },
         )
     }
@@ -208,10 +224,14 @@ class MiHealthPlugin : SourcePlugin {
             } else {
                 "验证码已发送至 $hint"
             },
-            fields = listOf(InputField(SLOT_OTP, "验证码", secret = true, hint = "6 位数字")),
+            fields = listOf(InputField(SLOT_OTP, "验证码", secret = false, hint = "6 位数字")),
         )
 
     override suspend fun logout(context: PluginContext) = withContext(Dispatchers.IO) {
+        // 不取登录锁：登出是用户点了就要立刻生效的动作，
+        // 排在一次可能等半分钟的登录后面没有任何道理。
+        // 这里只把中间态置空，正在跑的那次 login 会自行结束并覆盖它，
+        // 但那次的结果也不会再被用户看到（表单已经关了）
         pendingLogin = null
         context.credentials.clear()
     }
@@ -416,6 +436,15 @@ class MiHealthPlugin : SourcePlugin {
     private enum class Stage { PASSWORD, CAPTCHA, TWO_FACTOR }
 
     private val auth = MiHealthAuth()
+
+    /**
+     * 登录串行锁。
+     *
+     * 登录是「读中间态 → 发请求 → 写中间态」的复合动作，中间有网络挂起点。
+     * 不串行的话，两次并发的 `login` 会各自基于同一份旧中间态发请求，
+     * 后完成的那次把先完成的结果覆盖掉。
+     */
+    private val loginMutex = Mutex()
 
     /** 当前登录流程的中间态；成功或失败后清空 */
     @Volatile
