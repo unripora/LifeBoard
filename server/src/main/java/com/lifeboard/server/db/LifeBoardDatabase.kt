@@ -19,8 +19,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         CaptureRuleEntity::class,
         CustomSourceEntity::class,
         AppUsageEntity::class,
+        PluginCredentialEntity::class,
     ],
-    version = 9,
+    version = 10,
     exportSchema = true,
 )
 abstract class LifeBoardDatabase : RoomDatabase() {
@@ -34,6 +35,7 @@ abstract class LifeBoardDatabase : RoomDatabase() {
     abstract fun captureRuleDao(): CaptureRuleDao
     abstract fun customSourceDao(): CustomSourceDao
     abstract fun appUsageDao(): AppUsageDao
+    abstract fun pluginCredentialDao(): PluginCredentialDao
 
     companion object {
         const val NAME = "lifeboard.db"
@@ -105,6 +107,33 @@ abstract class LifeBoardDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v9 → v10：新增插件凭据表。
+         *
+         * 只是加一张新表，不动已有结构。**必须显式迁移**：
+         * 凭据是有状态的数据，落到 destructive fallback 会静默清空，
+         * 表现为「用户昨天刚登录，升级后又要重登」且毫无报错。
+         */
+        private val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `plugin_credential` (
+                        `pluginId` TEXT NOT NULL,
+                        `slot` TEXT NOT NULL,
+                        `cipherText` TEXT NOT NULL,
+                        `updatedAt` INTEGER NOT NULL,
+                        PRIMARY KEY(`pluginId`, `slot`)
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_plugin_credential_pluginId` " +
+                        "ON `plugin_credential` (`pluginId`)",
+                )
+            }
+        }
+
         @Volatile
         private var instance: LifeBoardDatabase? = null
 
@@ -114,9 +143,13 @@ abstract class LifeBoardDatabase : RoomDatabase() {
                     context.applicationContext,
                     LifeBoardDatabase::class.java,
                     NAME,
-                    // 侧载自用，库里只有几天内的采集数据，结构变更时直接重建
-                    // 比手写迁移省事；等实机验收通过后再补正式迁移
-                ).addMigrations(MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)
+                ).addMigrations(
+                    MIGRATION_5_6,
+                    MIGRATION_6_7,
+                    MIGRATION_7_8,
+                    MIGRATION_8_9,
+                    MIGRATION_9_10,
+                )
                     .fallbackToDestructiveMigration()
                     .build().also { instance = it }
             }
