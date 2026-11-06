@@ -261,8 +261,10 @@ class PluginHealthAndTrustTest {
             override val apiVersion: Int = com.lifeboard.plugin.api.PluginApi.VERSION
             override val credentialSpec: CredentialSpec = CredentialSpec(emptyList())
             override val metrics: List<MetricSpec> = metrics
-            override suspend fun login(context: PluginContext): LoginResult =
-                LoginResult.Failure("不支持登录")
+            override suspend fun login(
+                context: PluginContext,
+                inputs: Map<String, String>,
+            ): LoginResult = LoginResult.Failure("不支持登录")
             override suspend fun logout(context: PluginContext) = Unit
             override suspend fun authState(context: PluginContext): AuthState =
                 AuthState.LoggedIn("测试账号")

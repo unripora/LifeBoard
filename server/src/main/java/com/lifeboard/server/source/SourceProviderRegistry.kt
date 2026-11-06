@@ -37,10 +37,13 @@ object SourceProviderRegistry {
      *
      * 这里**只登记不实例化**：工厂函数在整个进程生命周期内有效，
      * 但真正的对象在每次采集时才创建。
+     *
+     * 小米健康**不在**这里：它已经迁成 `.ext` 插件（M5），
+     * 由 [pluginProviders] 提供。保留内置实现会造成同一份数据两个生产者，
+     * 双写覆盖且双倍维护——所以是替换，不是并存。
      */
     private val builtin: List<Provider> = listOf(
         Provider(builtinRef(SourceType.SCREEN_TIME)) { ScreenTimeDataSource(it) },
-        Provider(builtinRef(SourceType.MI_HEALTH)) { MiHealthDataSource(it) },
     )
 
     /**

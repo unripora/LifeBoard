@@ -27,3 +27,5 @@ include(":server")
 include(":plugin-api")
 // 最小可用插件，用于验证加载链路；不参与宿主打包
 include(":demo-plugin")
+// 首个真实插件：小米健康。自带 OkHttp 等实现依赖，验证契约能表达真实登录/续期/分页
+include(":mihealth-plugin")

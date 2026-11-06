@@ -9,8 +9,14 @@ package com.lifeboard.plugin.api
  */
 object PluginApi {
 
-    /** 当前契约版本。**改任何契约签名都必须递增它** */
-    const val VERSION: Int = 1
+    /**
+     * 当前契约版本。**改任何契约签名都必须递增它**
+     *
+     * 2：`SourcePlugin.login` 增加 `inputs` 参数，`LoginResult` 增加 `NeedInput`
+     * （小米健康的验证码/二次验证必须有地方表达）。旧插件会因版本不符被拒绝加载，
+     * 并提示重新安装——起步阶段没有存量插件生态，这比让它们带着旧签名跑更安全。
+     */
+    const val VERSION: Int = 2
 }
 
 /**

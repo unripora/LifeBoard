@@ -2,6 +2,7 @@ package com.lifeboard.app.ui.plugin
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,6 +14,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
@@ -26,6 +28,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -152,6 +157,15 @@ fun PluginScreen(modifier: Modifier = Modifier) {
         OverwriteDialog(pending, onConfirm = vm::confirmOverwrite, onCancel = vm::cancelOverwrite)
     }
 
+    state.login?.let { login ->
+        LoginDialog(
+            login = login,
+            onValueChange = vm::updateLoginValue,
+            onSubmit = vm::submitLoginForm,
+            onCancel = vm::cancelLogin,
+        )
+    }
+
     confirmAction?.let { action ->
         ConfirmDialog(
             action = action,
@@ -214,7 +228,24 @@ private fun InstalledCard(
         }
         SignatureBlock(row.signatureHashes)
 
+        if (row.needsLogin) {
+            Text(
+                row.loginText.ifBlank { "未登录" },
+                style = MaterialTheme.typography.labelSmall,
+                color = if (row.needsLoginAction) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+        }
+
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (row.needsLoginAction) {
+                OutlinedButton(onClick = { vm.startLogin(row) }) { Text("登录") }
+            } else if (row.needsLogin) {
+                OutlinedButton(onClick = { vm.logout(row) }) { Text("登出") }
+            }
             OutlinedButton(onClick = { vm.revokeTrust(row) }) { Text("停止使用") }
             OutlinedButton(onClick = { onConfirm(ConfirmAction.ClearCredentials(row)) }) { Text("清除凭据") }
             OutlinedButton(onClick = { onConfirm(ConfirmAction.Uninstall(row)) }) { Text("卸载") }
@@ -333,4 +364,103 @@ private fun OverwriteDialog(
         confirmButton = { TextButton(onClick = onConfirm) { Text("覆盖安装") } },
         dismissButton = { TextButton(onClick = onCancel) { Text("取消") } },
     )
+}
+
+/**
+ * 通用登录表单。
+ *
+ * 字段完全由插件给出，宿主不知道「账号」和「验证码」有什么区别，
+ * 只按 [com.lifeboard.plugin.api.InputField.secret] 决定要不要掩码。
+ * 这样小米健康能登录，别的插件换了字段也不用改这里。
+ */
+@Composable
+private fun LoginDialog(
+    login: LoginUi,
+    onValueChange: (String, String) -> Unit,
+    onSubmit: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = { if (!login.busy) onCancel() },
+        title = { Text("登录 ${login.displayName}") },
+        text = {
+            Column {
+                Text(login.prompt, style = MaterialTheme.typography.labelSmall)
+
+                // 验证码图必须显示在输入框上方：用户要先看图才能填
+                login.captchaImage?.let { image ->
+                    AsyncImageFromDataUri(image)
+                }
+
+                login.error?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+
+                login.fields.forEach { field ->
+                    OutlinedTextField(
+                        value = login.values[field.name].orEmpty(),
+                        onValueChange = { onValueChange(field.name, it) },
+                        label = { Text(field.displayName) },
+                        placeholder = field.hint.takeIf { it.isNotBlank() }?.let { { Text(it) } },
+                        // 密码和验证码都要掩码：屏幕上明文显示等于泄露
+                        visualTransformation = if (field.secret) {
+                            PasswordVisualTransformation()
+                        } else {
+                            VisualTransformation.None
+                        },
+                        singleLine = true,
+                        enabled = !login.busy,
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onSubmit, enabled = !login.busy) {
+                Text(if (login.busy) "登录中…" else "确定")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onCancel, enabled = !login.busy) { Text("取消") }
+        },
+    )
+}
+
+/**
+ * 显示 `data:image/...;base64,...` 形式的图片。
+ *
+ * 插件给的是数据 URI 而不是文件或 URL：验证码与那次登录会话绑定，
+ * 落成文件反而要管清理。直接解码成 Bitmap 最省事。
+ */
+@Composable
+private fun AsyncImageFromDataUri(dataUri: String) {
+    val bitmap = remember(dataUri) {
+        runCatching {
+            val comma = dataUri.indexOf(',')
+            if (comma < 0) return@runCatching null
+            val bytes = android.util.Base64.decode(
+                dataUri.substring(comma + 1),
+                android.util.Base64.DEFAULT,
+            )
+            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        }.getOrNull()
+    }
+
+    if (bitmap != null) {
+        Image(
+            bitmap = bitmap.asImageBitmap(),
+            contentDescription = "验证码",
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        )
+    } else {
+        Text(
+            "验证码图片加载失败，请取消后重试",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.error,
+        )
+    }
 }

@@ -23,7 +23,10 @@ import java.time.ZoneId
  * | 项目数据 | `data/get_project_data_by_time` | 睡眠节律环等 |
  *
  * 拿不到的项一律留 null，由界面决定是否显示——不能因为某项空就让整页变白。
- * 只做**展示用**汇总，不落库；参与任务判定的量纲走 [MiHealthDataSource]。
+ * 只做**展示用**汇总，不落库。
+ *
+ * 注意：参与任务判定与落库的步数/睡眠已由 `mihealth-plugin` 提供（M5 起），
+ * 本类不再参与采集，只服务旧登录页的概览展示。
  */
 data class MiHealthOverview(
     // ---- 今日活动 ----

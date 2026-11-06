@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  小米健康插件不提供 Activity / Service / 权限：它是被宿主 DexClassLoader
+  加载的代码包，不是要独立运行的应用。
+
+  manifest 的作用只有两个：让构建产出带包名与签名的 APK；
+  通过 uses-feature 声明「这是给 LifeBoard 写的插件」。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature
+        android:name="${pluginFeature}"
+        android:required="true" />
+
+</manifest>

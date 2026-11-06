@@ -31,7 +31,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.lifeboard.app.ui.debug.IpcDebugScreen
-import com.lifeboard.app.ui.mihealth.MiHealthLoginScreen
 import com.lifeboard.app.ui.notice.NoticeDebugScreen
 import com.lifeboard.app.ui.panel.PanelScreen
 import com.lifeboard.app.ui.panel.TaskEditScreen
@@ -44,6 +43,7 @@ import com.lifeboard.app.ui.settings.SettingsScreen
 import com.lifeboard.app.ui.theme.GlassBackground
 import com.lifeboard.app.ui.theme.LifeBoardTheme
 import com.lifeboard.server.collect.DailyAggregateWorker
+import com.lifeboard.server.mihealth.MiHealthMigration
 import com.lifeboard.server.plugin.PluginManager
 import com.lifeboard.server.remind.RemindScheduler
 
@@ -73,6 +73,15 @@ class MainActivity : ComponentActivity() {
         // 失败不影响启动——插件是可选能力，坏了也不能让应用起不来。
         Thread {
             runCatching { PluginManager.refresh(applicationContext) }
+            // 小米健康在 M5 从内置源改成了 .ext 插件。
+            // 内置实现产出过的历史行已经没有生产者，留着会让面板出现
+            // 一张点开永远不更新的卡片，所以一次性清掉，之后靠标记不再执行。
+            // runBlocking 是安全的：这里是独立后台线程，不会阻塞 UI
+            runCatching {
+                kotlinx.coroutines.runBlocking {
+                    MiHealthMigration.cleanupLegacyRows(applicationContext)
+                }
+            }
         }.start()
         // 闹钟在进程被杀或跨天后会失效，每次打开应用都重排一次
         runCatching { RemindScheduler.rescheduleAll(this) }
@@ -114,10 +123,8 @@ private fun MainScaffold(appearance: AppearanceState) {
     var editingTaskId by remember { mutableStateOf<Long?>(null) }
     // 每次打开编辑页自增，作为 Compose key 强制重建编辑器，避免复用上次状态
     var editorSession by remember { mutableIntStateOf(0) }
-    // 小米账号登录页同样作为覆盖层，不与编辑页叠加
-    var showMiHealthLogin by remember { mutableStateOf(false) }
 
-    /** 小米登录页关闭后自增，用于让面板重新判定数据源健康度 */
+    /** 面板上「重新判定数据源健康度」的触发键 */
     var healthRefreshKey by remember { mutableIntStateOf(0) }
     val tabs = Tab.entries
 
@@ -172,7 +179,9 @@ private fun MainScaffold(appearance: AppearanceState) {
                             editorSession++
                             editingTaskId = NEW_TASK_ID
                         },
-                        onOpenMiHealthLogin = { showMiHealthLogin = true },
+                        // 小米健康已迁成插件，登录入口自然落在插件页：
+                        // 宿主不再维护它专用的登录表单，避免两套登录流程同时存在
+                        onOpenMiHealthLogin = { selected = tabs.indexOf(Tab.PLUGIN) },
                         refreshKey = healthRefreshKey,
                     )
                     Tab.RULES -> RulesScreen()
@@ -183,7 +192,7 @@ private fun MainScaffold(appearance: AppearanceState) {
                     Tab.DEBUG -> IpcDebugScreen()
                     Tab.SETTINGS -> SettingsScreen(
                         appearance = appearance,
-                        onOpenMiHealthLogin = { showMiHealthLogin = true },
+                        onOpenMiHealthLogin = { selected = tabs.indexOf(Tab.PLUGIN) },
                     )
                 }
             }
@@ -202,20 +211,6 @@ private fun MainScaffold(appearance: AppearanceState) {
                         onDone = { editingTaskId = null },
                     )
                 }
-            }
-        }
-
-        if (showMiHealthLogin) {
-            // 同样是第二层覆盖页，带自己的返回处理
-            GlassBackground {
-                MiHealthLoginScreen(
-                    onDone = {
-                        showMiHealthLogin = false
-                        // 登录可能刚完成，面板上的数据源状态需要重新判定，
-                        // 否则会一直显示「未登录小米账号」
-                        healthRefreshKey++
-                    },
-                )
             }
         }
     }
