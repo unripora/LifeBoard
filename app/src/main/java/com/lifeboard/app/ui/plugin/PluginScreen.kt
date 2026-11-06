@@ -23,6 +23,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -35,6 +36,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.lifeboard.app.ui.theme.GlassCard
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * 插件页。
@@ -435,28 +438,39 @@ private fun LoginDialog(
  *
  * 插件给的是数据 URI 而不是文件或 URL：验证码与那次登录会话绑定，
  * 落成文件反而要管清理。直接解码成 Bitmap 最省事。
+ *
+ * 解码放后台线程：虽然验证码只有几 KB，但解码是插件的输入，
+ * 不该假设它一定小——大 Base64 在 UI 线程解会卡住整个弹窗。
  */
 @Composable
 private fun AsyncImageFromDataUri(dataUri: String) {
-    val bitmap = remember(dataUri) {
-        runCatching {
-            val comma = dataUri.indexOf(',')
-            if (comma < 0) return@runCatching null
-            val bytes = android.util.Base64.decode(
-                dataUri.substring(comma + 1),
-                android.util.Base64.DEFAULT,
-            )
-            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        }.getOrNull()
+    // null 表示还在解码，false 表示解码失败，true 表示解码成功
+    var decoded by remember(dataUri) { mutableStateOf<Boolean?>(null) }
+    val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, dataUri) {
+        val result = withContext(Dispatchers.Default) {
+            runCatching {
+                val comma = dataUri.indexOf(',')
+                if (comma < 0) return@withContext null
+                val bytes = android.util.Base64.decode(
+                    dataUri.substring(comma + 1),
+                    android.util.Base64.DEFAULT,
+                )
+                android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            }.getOrNull()
+        }
+        decoded = result != null
+        value = result
     }
 
-    if (bitmap != null) {
+    val image = bitmap
+    if (image != null) {
         Image(
-            bitmap = bitmap.asImageBitmap(),
+            bitmap = image.asImageBitmap(),
             contentDescription = "验证码",
             modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
         )
-    } else {
+    } else if (decoded == false) {
+        // 只有确认解码失败才提示：还在解码时提示会在每次重组时闪一下
         Text(
             "验证码图片加载失败，请取消后重试",
             style = MaterialTheme.typography.labelSmall,

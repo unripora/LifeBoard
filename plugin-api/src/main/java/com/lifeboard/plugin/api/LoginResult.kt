@@ -56,7 +56,9 @@ sealed class LoginResult {
  * 或者以 `otp` 之类的一次性名字出现（这类值插件只在该次登录中使用，不落盘）。
  * 宿主据此判断是否要用掩码显示、要不要提示「会被保存」。
  *
- * @property secret 是否按敏感内容显示（掩码）。密码、验证码都应设 true
+ * @property secret 是否按敏感内容显示（掩码）。
+ *   只有**长期秘密**（密码、访问令牌）应设 true；验证码这类一次性短码
+ *   要用户照着图或短信抄，掩码只会增加输错率，应保持 false。
  */
 data class InputField(
     val name: String,
