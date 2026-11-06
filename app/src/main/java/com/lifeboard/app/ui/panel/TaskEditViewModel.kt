@@ -3,9 +3,11 @@ package com.lifeboard.app.ui.panel
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.lifeboard.core.model.MetricBucket
+import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.core.model.RemindLevel
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.core.model.builtinRef
+import com.lifeboard.core.model.toSourceTypeOrNull
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.model.TaskConfig
 import com.lifeboard.core.model.TimeSource
@@ -46,7 +48,7 @@ private val SOURCE_BUCKETS: Map<SourceType, List<MetricBucket>> = mapOf(
 data class TaskEditUiState(
     val id: Long = 0L,
     val title: String = "",
-    val source: SourceRef = SourceRef.Builtin(SourceType.SCREEN_TIME),
+    val source: SourceRef = builtinRef(SourceType.SCREEN_TIME),
     val metricBucket: MetricBucket = MetricBucket.DURATION_MINUTES,
     val threshold: String = "30",
     val weight: String = "1",
@@ -99,7 +101,8 @@ data class TaskEditUiState(
 
     /** 当前数据源支持的分桶 */
     val availableBuckets: List<MetricBucket>
-        get() = (source as? SourceRef.Builtin)?.let { SOURCE_BUCKETS[it.type] } ?: listOf(MetricBucket.FLAG)
+        get() = (source as? SourceRef.Builtin)?.toSourceTypeOrNull()?.let { SOURCE_BUCKETS[it] }
+            ?: listOf(MetricBucket.FLAG)
 
     val unit: String get() = metricBucket.unit
 
@@ -294,7 +297,8 @@ class TaskEditViewModel(app: Application) : AndroidViewModel(app) {
     fun setSource(value: SourceRef) {
         val current = _state.value
         // 分桶必须跟着数据源走，切源后原分桶多半不适用
-        val buckets = (value as? SourceRef.Builtin)?.let { SOURCE_BUCKETS[it.type] } ?: listOf(MetricBucket.FLAG)
+        val buckets = (value as? SourceRef.Builtin)?.toSourceTypeOrNull()
+            ?.let { SOURCE_BUCKETS[it] } ?: listOf(MetricBucket.FLAG)
         val bucket = if (buckets.contains(current.metricBucket)) current.metricBucket else buckets.first()
         _state.value = current.copy(source = value, metricBucket = bucket, error = "")
     }

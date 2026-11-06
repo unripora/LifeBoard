@@ -2,7 +2,7 @@ package com.lifeboard.core.source
 
 import com.lifeboard.core.model.MetricRecord
 import com.lifeboard.core.model.SourceHealth
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.plugin.api.SourceRef
 import java.time.LocalDate
 
 /**

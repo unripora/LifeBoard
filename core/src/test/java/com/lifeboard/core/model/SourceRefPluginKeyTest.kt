@@ -1,5 +1,7 @@
 package com.lifeboard.core.model
 
+import com.lifeboard.plugin.api.MetricBucket
+import com.lifeboard.plugin.api.SourceRef
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -99,7 +101,7 @@ class SourceRefPluginKeyTest {
 
     @Test
     fun `插件键与内置源和自建源互不冲突`() {
-        val builtinKeys = SourceType.entries.map { SourceRef.Builtin(it).key }
+        val builtinKeys = SourceType.entries.map { builtinRef(it).key }
         val customKey = SourceRef.Custom(1L, "自建", MetricBucket.COUNT).key
         val pluginKey = SourceRef.pluginKey("dev.foo", "steps")
 

@@ -2,10 +2,11 @@ package com.lifeboard.server.source
 
 import android.content.Context
 import android.util.Log
-import com.lifeboard.core.model.MetricBucket
+import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.core.model.MetricRecord
 import com.lifeboard.core.model.SourceHealth
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.core.model.builtinRef
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.source.DataSource
 import com.lifeboard.core.util.Dates
@@ -30,7 +31,7 @@ import java.time.ZoneId
  */
 class MiHealthDataSource(private val context: Context) : DataSource {
 
-    override val source: SourceRef = SourceRef.Builtin(SourceType.MI_HEALTH)
+    override val source: SourceRef = builtinRef(SourceType.MI_HEALTH)
 
     /** 云端接口，不走注入 */
     override val requiresInjection: Boolean = false
@@ -113,13 +114,13 @@ class MiHealthDataSource(private val context: Context) : DataSource {
      * metricKey 复用 [MetricBucket] 枚举名，与历史 `metric.bucket` 列取值一致，老数据不用迁移。
      */
     private val stepsRef: SourceRef =
-        SourceRef.Builtin(SourceType.MI_HEALTH, MetricBucket.STEPS)
+        builtinRef(SourceType.MI_HEALTH, MetricBucket.STEPS)
 
     private val sleepRef: SourceRef =
-        SourceRef.Builtin(SourceType.MI_HEALTH, MetricBucket.SLEEP_MINUTES)
+        builtinRef(SourceType.MI_HEALTH, MetricBucket.SLEEP_MINUTES)
 
     /** 健康度用的源引用：小米健康是内置源，取默认量纲（步数）即可 */
-    private val healthRef: SourceRef = SourceRef.Builtin(SourceType.MI_HEALTH)
+    private val healthRef: SourceRef = builtinRef(SourceType.MI_HEALTH)
 
     /**
      * 当日步数。

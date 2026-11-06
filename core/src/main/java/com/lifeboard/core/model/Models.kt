@@ -1,6 +1,8 @@
 package com.lifeboard.core.model
 
 import com.lifeboard.core.schedule.ScheduleRule
+import com.lifeboard.plugin.api.MetricBucket
+import com.lifeboard.plugin.api.SourceRef
 
 /**
  * 提醒档位。三级提醒的核心枚举，由用户为每个任务单独配置。

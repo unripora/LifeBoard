@@ -31,8 +31,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.lifeboard.app.ui.theme.GlassCard
-import com.lifeboard.core.model.MetricBucket
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.plugin.api.MetricBucket
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.schedule.TimeWindow
 
 /**

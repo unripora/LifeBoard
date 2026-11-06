@@ -30,6 +30,8 @@ android {
 }
 
 dependencies {
+    // 契约模块：SourceRef / MetricBucket / MetricSpec 等插件可见类型的唯一出处
+    api(project(":plugin-api"))
     implementation(libs.androidx.core.ktx)
     implementation(libs.kotlinx.coroutines.android)
     // LSPosed libxposed API 仅编译期使用，运行时由框架提供

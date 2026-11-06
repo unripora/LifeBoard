@@ -13,7 +13,8 @@ import androidx.work.WorkInfo
 import androidx.work.WorkerParameters
 import com.lifeboard.core.ipc.LifeBoardContract
 import com.lifeboard.core.model.MetricRecord
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.core.model.builtinRef
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.source.ScreenTimeSource
 import com.lifeboard.core.util.Dates
@@ -56,7 +57,7 @@ class DailyAggregateWorker(
         // 实例化入口走注册表：Worker 里不出现任何具体采集器类名，
         // 将来新增源（含插件）只需要在注册表登记，这里一行都不用改
         val screenTime = SourceProviderRegistry
-            .create(applicationContext, SourceRef.Builtin(SourceType.SCREEN_TIME))
+            .create(applicationContext, builtinRef(SourceType.SCREEN_TIME))
             as? ScreenTimeSource
         if (screenTime == null) {
             Log.e(TAG, "screen time source not registered")
@@ -90,7 +91,7 @@ class DailyAggregateWorker(
      */
     private suspend fun collectRegistered(today: LocalDate, yesterday: LocalDate) {
         SourceProviderRegistry.providers()
-            .filter { it.source.key != SourceRef.Builtin(SourceType.SCREEN_TIME).key }
+            .filter { it.source.key != builtinRef(SourceType.SCREEN_TIME).key }
             .forEach { provider ->
                 val source = provider.factory(applicationContext)
                 // 昨天的数据已定稿，今天的数据会随白天推进持续更新，两者都刷

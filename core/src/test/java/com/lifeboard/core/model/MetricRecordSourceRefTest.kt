@@ -1,5 +1,8 @@
 package com.lifeboard.core.model
 
+import com.lifeboard.plugin.api.MetricBucket
+import com.lifeboard.plugin.api.MetricSpec
+import com.lifeboard.plugin.api.SourceRef
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -16,7 +19,7 @@ class MetricRecordSourceRefTest {
 
     @Test
     fun `量纲取自 source 而不是单独存一份`() {
-        val ref = SourceRef.Builtin(SourceType.SCREEN_TIME)
+        val ref = builtinRef(SourceType.SCREEN_TIME)
         val record = MetricRecord(source = ref, date = "2026-11-05", value = 128.0)
         assertEquals(MetricBucket.DURATION_MINUTES, record.bucket)
     }
@@ -24,12 +27,12 @@ class MetricRecordSourceRefTest {
     @Test
     fun `小米健康同源双量纲可以共存`() {
         val steps = MetricRecord(
-            source = SourceRef.Builtin(SourceType.MI_HEALTH, MetricBucket.STEPS),
+            source = builtinRef(SourceType.MI_HEALTH, MetricBucket.STEPS),
             date = "2026-11-05",
             value = 8432.0,
         )
         val sleep = MetricRecord(
-            source = SourceRef.Builtin(SourceType.MI_HEALTH, MetricBucket.SLEEP_MINUTES),
+            source = builtinRef(SourceType.MI_HEALTH, MetricBucket.SLEEP_MINUTES),
             date = "2026-11-05",
             value = 421.0,
         )
@@ -43,15 +46,15 @@ class MetricRecordSourceRefTest {
     @Test
     fun `未指定量纲时内置源用默认量纲`() {
         // 小米健康的默认量纲是步数，与改造前 SourceRef.defaultBucket 的行为一致
-        val ref = SourceRef.Builtin(SourceType.MI_HEALTH)
+        val ref = builtinRef(SourceType.MI_HEALTH)
         assertEquals(MetricBucket.STEPS, ref.bucket)
     }
 
     @Test
     fun `内置源指定量纲不改变落库键`() {
         // 这条是"表零迁移"的防线：两个量纲都必须写成同一个 sourceType
-        val steps = SourceRef.Builtin(SourceType.MI_HEALTH, MetricBucket.STEPS)
-        val sleep = SourceRef.Builtin(SourceType.MI_HEALTH, MetricBucket.SLEEP_MINUTES)
+        val steps = builtinRef(SourceType.MI_HEALTH, MetricBucket.STEPS)
+        val sleep = builtinRef(SourceType.MI_HEALTH, MetricBucket.SLEEP_MINUTES)
         assertEquals("MI_HEALTH", steps.key)
         assertEquals("MI_HEALTH", sleep.key)
     }
@@ -75,7 +78,7 @@ class MetricRecordSourceRefTest {
     @Test
     fun `健康度用 SourceRef 承载源标识`() {
         val health = SourceHealth(
-            source = SourceRef.Builtin(SourceType.SCREEN_TIME),
+            source = builtinRef(SourceType.SCREEN_TIME),
             healthy = false,
             message = "未授予「使用情况访问权」",
         )

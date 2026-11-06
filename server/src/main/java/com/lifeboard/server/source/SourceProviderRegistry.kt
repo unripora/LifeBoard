@@ -4,7 +4,8 @@ import android.content.Context
 import android.util.Log
 import com.lifeboard.core.model.MetricRecord
 import com.lifeboard.core.model.SourceHealth
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.core.model.builtinRef
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.source.DataSource
 
@@ -38,8 +39,8 @@ object SourceProviderRegistry {
      * 但真正的对象在每次采集时才创建。
      */
     private val builtin: List<Provider> = listOf(
-        Provider(SourceRef.Builtin(SourceType.SCREEN_TIME)) { ScreenTimeDataSource(it) },
-        Provider(SourceRef.Builtin(SourceType.MI_HEALTH)) { MiHealthDataSource(it) },
+        Provider(builtinRef(SourceType.SCREEN_TIME)) { ScreenTimeDataSource(it) },
+        Provider(builtinRef(SourceType.MI_HEALTH)) { MiHealthDataSource(it) },
     )
 
     /**

@@ -52,9 +52,10 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.lifeboard.app.ui.rules.AppIcon
-import com.lifeboard.core.model.MetricBucket
+import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.core.model.RemindLevel
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.core.model.builtinRef
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.model.TimeSource
 
@@ -404,7 +405,7 @@ private fun DataSourceSection(
         // 这里按「实际选中项」渲染，不能用占位值比较：否则没关联规则时
         // 列表里会伪装成「手动打卡已选」，用户会以为自己选的是手动打卡
         ChipRow(
-            options = SourceType.entries.map { SourceRef.Builtin(it) },
+            options = SourceType.entries.map { builtinRef(it) },
             selected = if (chosen == null) state.source else null,
             label = { it.displayName },
             onSelect = {

@@ -42,7 +42,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.lifeboard.app.ui.theme.GlassCard
 import com.lifeboard.app.ui.theme.GlassPill
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.server.collect.SettingsNavigator
 import com.lifeboard.server.db.CaptureRuleEntity
 import com.lifeboard.server.notice.ScreenCaptureAccessibilityService
