@@ -1,10 +1,12 @@
 package com.lifeboard.server.source
 
 import android.content.Context
-import com.lifeboard.core.model.MetricBucket
-import com.lifeboard.core.model.MetricSpec
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.plugin.api.MetricBucket
+import com.lifeboard.plugin.api.MetricSpec
+import com.lifeboard.core.model.builtinRef
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
+import com.lifeboard.core.model.toSourceTypeOrNull
 import com.lifeboard.server.db.CustomSourceEntity
 import com.lifeboard.server.db.LifeBoardDatabase
 import kotlinx.coroutines.Dispatchers
@@ -24,12 +26,13 @@ object SourceRegistry {
 
     /** 内置源列表（不含 MANUAL，MANUAL 只在兜底时出现） */
     val builtinSources: List<SourceRef.Builtin> =
-        SourceType.entries.map { SourceRef.Builtin(it) }
+        SourceType.entries.map { builtinRef(it) }
 
     /** 规则/任务可以选择的数据源：内置去掉屏幕时长与手动，再并上自建源 */
     suspend fun selectable(context: Context): List<SourceRef> = withContext(Dispatchers.IO) {
         val builtin = builtinSources.filter {
-            it.type != SourceType.SCREEN_TIME && it.type != SourceType.MANUAL
+            val type = it.toSourceTypeOrNull()
+            type != SourceType.SCREEN_TIME && type != SourceType.MANUAL
         }
         builtin + customSources(context)
     }
@@ -65,7 +68,7 @@ object SourceRegistry {
 
         // 旧数据里可能存着已经被删掉的自建源，或历史上写死过的未知键，
         // 统一回落到手动打卡：至少语义是"只记录、不采集"，不会假装有数据。
-        SourceRef.Builtin(SourceType.MANUAL)
+        builtinRef(SourceType.MANUAL)
     }
 
     /**
@@ -79,8 +82,7 @@ object SourceRegistry {
             val customs = LifeBoardDatabase.get(context).customSourceDao().getAll()
                 .associateBy { SourceRef.customKey(it.id) }
             keys.distinct().associateWith { key ->
-                SourceType.entries.firstOrNull { it.name == key }
-                    ?.let { return@associateWith SourceRef.Builtin(it) }
+                SourceType.fromKey(key)?.let { return@associateWith builtinRef(it) }
                 customs[key]?.toRef()?.let { return@associateWith it }
                 SourceRef.parsePluginKey(key)?.let { (pluginId, metricKey) ->
                     return@associateWith SourceRef.Plugin(
@@ -90,7 +92,7 @@ object SourceRegistry {
                         bucket = MetricSpec.bucketOf(metricKey) ?: MetricBucket.COUNT,
                     )
                 }
-                SourceRef.Builtin(SourceType.MANUAL)
+                builtinRef(SourceType.MANUAL)
             }
         }
 
@@ -106,7 +108,7 @@ object SourceRegistry {
      * 自建源需要查库，走 suspend 版本；这里返回 null 时调用方保持原值即可。
      */
     fun resolveSyncOrNull(context: Context, key: String): SourceRef? =
-        SourceType.entries.firstOrNull { it.name == key }?.let { SourceRef.Builtin(it) }
+        SourceType.fromKey(key)?.let { builtinRef(it) }
 }
 
 /** 自建源实体 → 领域引用 */

@@ -7,7 +7,8 @@ import android.os.Process
 import android.util.Log
 import com.lifeboard.core.model.MetricRecord
 import com.lifeboard.core.model.SourceHealth
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.core.model.builtinRef
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.source.ScreenTimeSource
 import com.lifeboard.core.util.Dates
@@ -30,7 +31,7 @@ import java.time.LocalDate
  */
 class ScreenTimeDataSource(private val context: Context) : ScreenTimeSource {
 
-    override val source: SourceRef = SourceRef.Builtin(SourceType.SCREEN_TIME)
+    override val source: SourceRef = builtinRef(SourceType.SCREEN_TIME)
 
     override val requiresInjection: Boolean = false
 
@@ -71,7 +72,7 @@ class ScreenTimeDataSource(private val context: Context) : ScreenTimeSource {
         val totalMinutes = queryScreenMinutes(day)
         return listOf(
             MetricRecord(
-                source = SourceRef.Builtin(SourceType.SCREEN_TIME),
+                source = builtinRef(SourceType.SCREEN_TIME),
                 date = date,
                 value = totalMinutes,
             ),
@@ -81,7 +82,7 @@ class ScreenTimeDataSource(private val context: Context) : ScreenTimeSource {
     override suspend fun health(): SourceHealth {
         val granted = hasPermission()
         return SourceHealth(
-            source = SourceRef.Builtin(SourceType.SCREEN_TIME),
+            source = builtinRef(SourceType.SCREEN_TIME),
             healthy = granted,
             lastSuccessAt = if (granted) System.currentTimeMillis() else 0L,
             message = if (granted) "" else "未授予「使用情况访问权」，无法统计屏幕时长",

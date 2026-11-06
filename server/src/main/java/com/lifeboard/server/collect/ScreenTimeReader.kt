@@ -1,7 +1,7 @@
 package com.lifeboard.server.collect
 
 import android.content.Context
-import com.lifeboard.core.model.MetricBucket
+import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.util.Dates
 import com.lifeboard.server.db.AppUsageEntity

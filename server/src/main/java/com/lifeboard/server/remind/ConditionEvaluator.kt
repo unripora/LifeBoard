@@ -2,9 +2,10 @@ package com.lifeboard.server.remind
 
 import android.content.Context
 import com.lifeboard.core.model.DailyRecord
-import com.lifeboard.core.model.MetricBucket
+import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.core.model.RemindLevel
-import com.lifeboard.core.model.SourceRef
+import com.lifeboard.core.model.builtinRef
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.model.TaskConfig
 import com.lifeboard.core.util.Dates
@@ -82,7 +83,7 @@ class ConditionEvaluator(private val context: Context) {
         val tasks = withContext(Dispatchers.IO) {
             val rows = db.taskDao().getEnabled()
             val sources = SourceRegistry.resolveAll(context, rows.map { it.sourceType })
-            rows.map { it.toConfigWithRule(context, sources[it.sourceType] ?: SourceRef.Builtin(SourceType.MANUAL)) }
+            rows.map { it.toConfigWithRule(context, sources[it.sourceType] ?: builtinRef(SourceType.MANUAL)) }
         }
         return tasks.map { evaluate(it, date, persist) }
     }

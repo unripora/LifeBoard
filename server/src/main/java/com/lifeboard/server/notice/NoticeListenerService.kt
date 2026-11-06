@@ -7,7 +7,7 @@ import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
-import com.lifeboard.core.model.MetricBucket
+import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.core.util.Dates
 import com.lifeboard.server.db.LifeBoardDatabase
 import com.lifeboard.server.db.MetricEntity

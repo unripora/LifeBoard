@@ -23,3 +23,5 @@ dependencyResolutionManagement {
 include(":app")
 include(":core")
 include(":server")
+// 宿主与第三方插件共用的契约，必须保持零依赖
+include(":plugin-api")

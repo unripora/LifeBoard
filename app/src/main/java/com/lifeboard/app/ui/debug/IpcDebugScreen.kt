@@ -25,7 +25,7 @@ import androidx.compose.ui.unit.dp
 import com.lifeboard.core.ipc.JsonlFallbackQueue
 import com.lifeboard.core.ipc.LifeBoardContract
 import com.lifeboard.core.ipc.PendingWrite
-import com.lifeboard.core.model.MetricBucket
+import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.core.util.Dates
 import com.lifeboard.server.ipc.MetricWriter
