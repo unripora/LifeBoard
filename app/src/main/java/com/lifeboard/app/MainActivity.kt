@@ -1,6 +1,7 @@
 package com.lifeboard.app
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -28,6 +29,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.lifeboard.app.ui.debug.IpcDebugScreen
@@ -43,6 +45,9 @@ import com.lifeboard.app.ui.settings.SettingsScreen
 import com.lifeboard.app.ui.theme.GlassBackground
 import com.lifeboard.app.ui.theme.LifeBoardTheme
 import com.lifeboard.server.collect.DailyAggregateWorker
+import com.lifeboard.server.dashboard.BuiltinTabs
+import com.lifeboard.server.dashboard.DashboardLayout
+import com.lifeboard.server.dashboard.TabKind
 import com.lifeboard.server.mihealth.MiHealthMigration
 import com.lifeboard.server.plugin.PluginManager
 import com.lifeboard.server.remind.RemindScheduler
@@ -80,6 +85,9 @@ class MainActivity : ComponentActivity() {
             runCatching {
                 kotlinx.coroutines.runBlocking {
                     MiHealthMigration.cleanupLegacyRows(applicationContext)
+                    // M6a：首次启动写入内置页签与默认卡片。
+                    // 幂等，已存在则直接返回，不会覆盖用户的调整
+                    DashboardLayout.ensureInitialized(applicationContext)
                 }
             }
         }.start()
@@ -104,21 +112,36 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class Tab(val label: String) {
-    PANEL("面板"),
-    RULES("规则"),
-    TREND("趋势"),
-    REMIND("提醒"),
-    NOTICE("通知源"),
-    PLUGIN("插件"),
-    DEBUG("自检"),
-    SETTINGS("设置"),
-}
+/**
+ * 一个页签。
+ *
+ * `route` 是分发的唯一依据：内置页签走代码里的固定页面，
+ * 用户页签（M6b）统一走卡片容器。用字符串 route 而不是枚举，
+ * 是因为用户页签没有对应枚举值；`TabKind` 则在类型上把两者分开，
+ * 避免靠「名字碰巧不重复」来区分。
+ *
+ * @param tabId 持久化用的稳定标识，重启后据此恢复选中的页签
+ */
+private data class TabItem(
+    val tabId: String,
+    val label: String,
+    val route: String,
+    val kind: TabKind,
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MainScaffold(appearance: AppearanceState) {
-    var selected by remember { mutableIntStateOf(0) }
+    val context = LocalContext.current
+    // 选中态存 tabId 而不是下标：页签顺序可被用户调整，
+    // 用下标会在「在最后一个页签时新增一个页签」之类的场景跳到别的页面
+    var selectedTabId by remember {
+        mutableStateOf(
+            context.getSharedPreferences(PREFS_UI, Context.MODE_PRIVATE)
+                .getString(KEY_SELECTED_TAB, BuiltinTabs.TAB_ID_PANEL)
+                ?: BuiltinTabs.TAB_ID_PANEL,
+        )
+    }
     // 0 表示不在编辑页；非 0 为编辑中的任务 id；NEW_TASK_ID 表示新建
     var editingTaskId by remember { mutableStateOf<Long?>(null) }
     // 每次打开编辑页自增，作为 Compose key 强制重建编辑器，避免复用上次状态
@@ -126,7 +149,23 @@ private fun MainScaffold(appearance: AppearanceState) {
 
     /** 面板上「重新判定数据源健康度」的触发键 */
     var healthRefreshKey by remember { mutableIntStateOf(0) }
-    val tabs = Tab.entries
+
+    val tabs = remember {
+        BuiltinTabs.ALL.map {
+            TabItem(tabId = it.tabId, label = it.defaultName, route = it.route, kind = TabKind.BUILTIN)
+        }
+    }
+
+    fun selectTab(tabId: String) {
+        selectedTabId = tabId
+        context.getSharedPreferences(PREFS_UI, Context.MODE_PRIVATE)
+            .edit().putString(KEY_SELECTED_TAB, tabId).apply()
+    }
+
+    // 存的 tabId 可能已经不存在（页签被删、或来自降级后的旧版本），
+    // 一律回退到面板，否则会停在一个空白页
+    val selectedIndex = tabs.indexOfFirst { it.tabId == selectedTabId }.takeIf { it >= 0 } ?: 0
+    val current = tabs[selectedIndex]
 
     // 玻璃主题下的页面底色：官方 background + 一层淡主色渐变，内容面板以半透明叠在其上
     GlassBackground {
@@ -152,14 +191,14 @@ private fun MainScaffold(appearance: AppearanceState) {
                 // 8 个页签在窄屏上放不下，必须可横向滚动：
                 // 用 TabRow 会等分压缩，标签被截成两三个字就看不出是什么了
                 ScrollableTabRow(
-                    selectedTabIndex = selected,
+                    selectedTabIndex = selectedIndex,
                     containerColor = Color.Transparent,
                     edgePadding = 8.dp,
                 ) {
-                    tabs.forEachIndexed { index, tab ->
+                    tabs.forEach { tab ->
                         Tab(
-                            selected = selected == index,
-                            onClick = { selected = index },
+                            selected = current.tabId == tab.tabId,
+                            onClick = { selectTab(tab.tabId) },
                             text = {
                                 Text(
                                     tab.label,
@@ -169,8 +208,11 @@ private fun MainScaffold(appearance: AppearanceState) {
                         )
                     }
                 }
-                when (tabs[selected]) {
-                    Tab.PANEL -> PanelScreen(
+                // 按 route 分发而不是穷尽枚举：用户页签没有枚举值，
+                // 而且删掉内置页签（M6b）后也必须有个去处，
+                // 所以 else 兜底回面板，不能留空屏
+                when (current.route) {
+                    BuiltinTabs.ROUTE_PANEL -> PanelScreen(
                         onEditTask = {
                             editorSession++
                             editingTaskId = it
@@ -179,20 +221,27 @@ private fun MainScaffold(appearance: AppearanceState) {
                             editorSession++
                             editingTaskId = NEW_TASK_ID
                         },
-                        // 小米健康已迁成插件，登录入口自然落在插件页：
-                        // 宿主不再维护它专用的登录表单，避免两套登录流程同时存在
-                        onOpenMiHealthLogin = { selected = tabs.indexOf(Tab.PLUGIN) },
                         refreshKey = healthRefreshKey,
                     )
-                    Tab.RULES -> RulesScreen()
-                    Tab.TREND -> TrendScreen()
-                    Tab.REMIND -> RemindTestScreen()
-                    Tab.NOTICE -> NoticeDebugScreen()
-                    Tab.PLUGIN -> PluginScreen()
-                    Tab.DEBUG -> IpcDebugScreen()
-                    Tab.SETTINGS -> SettingsScreen(
+                    BuiltinTabs.ROUTE_RULES -> RulesScreen()
+                    BuiltinTabs.ROUTE_TREND -> TrendScreen()
+                    BuiltinTabs.ROUTE_REMIND -> RemindTestScreen()
+                    BuiltinTabs.ROUTE_NOTICE -> NoticeDebugScreen()
+                    BuiltinTabs.ROUTE_PLUGIN -> PluginScreen()
+                    BuiltinTabs.ROUTE_DEBUG -> IpcDebugScreen()
+                    BuiltinTabs.ROUTE_SETTINGS -> SettingsScreen(
                         appearance = appearance,
-                        onOpenMiHealthLogin = { selected = tabs.indexOf(Tab.PLUGIN) },
+                    )
+                    else -> PanelScreen(
+                        onEditTask = {
+                            editorSession++
+                            editingTaskId = it
+                        },
+                        onNewTask = {
+                            editorSession++
+                            editingTaskId = NEW_TASK_ID
+                        },
+                        refreshKey = healthRefreshKey,
                     )
                 }
             }
@@ -218,3 +267,7 @@ private fun MainScaffold(appearance: AppearanceState) {
 
 /** 新建任务的哨兵 id，与"编辑已有任务"区分 */
 private const val NEW_TASK_ID = 0L
+
+/** 界面层偏好（当前选中页签等），与专题设置分开存 */
+private const val PREFS_UI = "lifeboard_ui"
+private const val KEY_SELECTED_TAB = "selected_tab_id"

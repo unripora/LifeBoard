@@ -214,6 +214,70 @@ interface AppUsageDao {
 }
 
 @Dao
+interface DashboardTabDao {
+
+    /** 全部页签，按用户排定的顺序 */
+    @Query("SELECT * FROM dashboard_tab ORDER BY `order` ASC")
+    fun observeAll(): Flow<List<DashboardTabEntity>>
+
+    @Query("SELECT * FROM dashboard_tab ORDER BY `order` ASC")
+    suspend fun getAll(): List<DashboardTabEntity>
+
+    @Query("SELECT * FROM dashboard_tab WHERE tabId = :tabId")
+    suspend fun getById(tabId: String): DashboardTabEntity?
+
+    @Query("SELECT COUNT(*) FROM dashboard_tab")
+    suspend fun count(): Int
+
+    @Upsert
+    suspend fun upsert(tab: DashboardTabEntity)
+
+    @Upsert
+    suspend fun upsertAll(tabs: List<DashboardTabEntity>)
+
+    @Query("DELETE FROM dashboard_tab WHERE tabId = :tabId")
+    suspend fun deleteById(tabId: String)
+
+    @Query("UPDATE dashboard_tab SET name = :name WHERE tabId = :tabId")
+    suspend fun rename(tabId: String, name: String)
+
+    @Query("UPDATE dashboard_tab SET `order` = :order WHERE tabId = :tabId")
+    suspend fun setOrder(tabId: String, order: Int)
+}
+
+@Dao
+interface DashboardCardDao {
+
+    @Query("SELECT * FROM dashboard_card WHERE tabId = :tabId ORDER BY `order` ASC")
+    fun observeByTab(tabId: String): Flow<List<DashboardCardEntity>>
+
+    @Query("SELECT * FROM dashboard_card WHERE tabId = :tabId ORDER BY `order` ASC")
+    suspend fun getByTab(tabId: String): List<DashboardCardEntity>
+
+    @Query("SELECT COUNT(*) FROM dashboard_card")
+    suspend fun count(): Int
+
+    @Upsert
+    suspend fun upsert(card: DashboardCardEntity)
+
+    @Upsert
+    suspend fun upsertAll(cards: List<DashboardCardEntity>)
+
+    @Query("DELETE FROM dashboard_card WHERE cardId = :cardId")
+    suspend fun deleteById(cardId: String)
+
+    /** 删除页签时级联清理它的卡片，否则会留下指向不存在页签的孤儿行 */
+    @Query("DELETE FROM dashboard_card WHERE tabId = :tabId")
+    suspend fun deleteByTab(tabId: String): Int
+
+    @Query("UPDATE dashboard_card SET `order` = :order WHERE cardId = :cardId")
+    suspend fun setOrder(cardId: String, order: Int)
+
+    @Query("UPDATE dashboard_card SET tabId = :tabId WHERE cardId = :cardId")
+    suspend fun moveToTab(cardId: String, tabId: String)
+}
+
+@Dao
 interface PluginCredentialDao {
 
     /** 取某插件某个槽位的密文；没有返回 null */
