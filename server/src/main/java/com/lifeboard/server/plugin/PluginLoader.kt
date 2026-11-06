@@ -36,6 +36,17 @@ object PluginLoader {
     private val broken = mutableListOf<BrokenPlugin>()
 
     /**
+     * 已安装但用户尚未信任（或未签名）的插件。
+     *
+     * 之前这里是静默跳过：`scan` 遇到 [LoadResult.Skipped] 什么都不记。
+     * 结果是用户通过文件选择器装进来的 `.ext` **在界面上完全消失**——
+     * 既不在已加载列表，也不在失败列表，用户会以为安装没成功。
+     *
+     * 因此单独记一份，供「待处理」列表展示包名与签名，让用户决定是否信任。
+     */
+    private val pending = mutableListOf<PendingPlugin>()
+
+    /**
      * 一个加载失败的插件。
      *
      * 失败也要留在列表里：用户明明放了 `.ext` 却找不到入口，比看到「加载失败：契约版本不匹配」
@@ -51,11 +62,33 @@ object PluginLoader {
         val reason: String,
     )
 
+    /**
+     * 一个已落盘、但还不能用的插件。
+     *
+     * 与 [BrokenPlugin] 的区别在「用户还能做什么」：
+     * - [BrokenPlugin] 是包本身有问题，用户只能重新下载
+     * - 本类是包没问题、只差用户一个决定（信任），或签名缺失无法给信任入口
+     *
+     * @property identity 信任身份（包名 + 签名集合）。无签名时为空，UI 不显示信任按钮
+     * @property unsigned 是否无签名。无签名不是「等信任」，而是**根本不能信任**
+     */
+    data class PendingPlugin(
+        val archiveName: String,
+        val packageName: String,
+        val versionName: String,
+        val identity: PluginIdentity?,
+        val unsigned: Boolean,
+        val reason: String,
+    )
+
     /** 当前可用的插件。返回副本，避免调用方持有内部列表 */
     fun loadedPlugins(): List<LoadedPlugin> = loaded.toList()
 
     /** 当前加载失败的插件 */
     fun brokenPlugins(): List<BrokenPlugin> = broken.toList()
+
+    /** 已安装但尚未被信任的插件，供 UI 提供信任入口 */
+    fun pendingPlugins(): List<PendingPlugin> = synchronized(this) { pending.toList() }
 
     /**
      * 全量重新扫描，并同步更新调度注册表。
@@ -80,17 +113,34 @@ object PluginLoader {
 
         val newLoaded = mutableListOf<LoadedPlugin>()
         val newBroken = mutableListOf<BrokenPlugin>()
+        val newPending = mutableListOf<PendingPlugin>()
 
         PluginInstaller.listArchives(appContext).forEach { archive ->
             when (val result = loadOne(appContext, archive, trustState)) {
-                is LoadResult.Success -> newLoaded += result.plugin
+                is LoadResult.Success -> {
+                    // 同一个 id 被两个包声明时，落库 key 会撞在一起：
+                    // 后加载的指标覆盖先加载的，面板上看不出是哪来的数据。
+                    // 拒绝后来者，而不是让两者互相污染。
+                    val duplicated = newLoaded.firstOrNull { it.pluginId == result.plugin.pluginId }
+                    if (duplicated != null) {
+                        newBroken += BrokenPlugin(
+                            archiveName = result.plugin.archiveName,
+                            packageName = result.plugin.archive.packageName,
+                            reason = "插件 id \"${result.plugin.pluginId}\" 已被 " +
+                                "${duplicated.archiveName} 占用，两个包不能声明同一个 id",
+                        )
+                    } else {
+                        newLoaded += result.plugin
+                    }
+                }
                 is LoadResult.Failure -> newBroken += result.broken
-                // 未信任的插件不加载，也不报错：UI 单独列「待信任」，用户点信任后才生效
-                LoadResult.Skipped -> Unit
+                // 未信任/未签名不加载，但**要记下来**：
+                // 只静默跳过的话，用户装完插件在界面上什么都看不到，以为装失败了
+                is LoadResult.Skipped -> newPending += result.pending
             }
         }
 
-        applyLoaded(newLoaded, newBroken)
+        applyLoaded(newLoaded, newBroken, newPending)
         return newLoaded
     }
 
@@ -101,12 +151,18 @@ object PluginLoader {
      * 若测试自己拼装状态，就绕过了「注册表与加载表在同一临界区替换」这条约束，
      * 验证的就不是生产代码的行为。
      */
-    internal fun applyLoaded(plugins: List<LoadedPlugin>, brokenList: List<BrokenPlugin>) {
+    internal fun applyLoaded(
+        plugins: List<LoadedPlugin>,
+        brokenList: List<BrokenPlugin>,
+        pendingList: List<PendingPlugin> = emptyList(),
+    ) {
         synchronized(this) {
             loaded.clear()
             loaded += plugins
             broken.clear()
             broken += brokenList
+            pending.clear()
+            pending += pendingList
             // 与加载表在同一临界区内更新，保证两者不出现短暂不一致
             registerProviders(plugins)
         }
@@ -158,8 +214,8 @@ object PluginLoader {
     private sealed class LoadResult {
         data class Success(val plugin: LoadedPlugin) : LoadResult()
         data class Failure(val broken: BrokenPlugin) : LoadResult()
-        /** 未信任，静默跳过 */
-        data object Skipped : LoadResult()
+        /** 不加载，但要让用户看到并（可能）给信任入口 */
+        data class Skipped(val pending: PendingPlugin) : LoadResult()
     }
 
     private fun loadOne(
@@ -172,7 +228,26 @@ object PluginLoader {
 
         return when (val verdict = PluginTrust.evaluate(info, trustState)) {
             // 未信任与无签名都不加载。区别在于前者 UI 提供信任入口，后者没有
-            is TrustVerdict.Untrusted, TrustVerdict.Unsigned -> LoadResult.Skipped
+            TrustVerdict.Unsigned -> LoadResult.Skipped(
+                PendingPlugin(
+                    archiveName = archive.name,
+                    packageName = info.packageName,
+                    versionName = info.versionName,
+                    identity = null,
+                    unsigned = true,
+                    reason = "插件包没有签名，无法建立信任，不能安装使用",
+                ),
+            )
+            is TrustVerdict.Untrusted -> LoadResult.Skipped(
+                PendingPlugin(
+                    archiveName = archive.name,
+                    packageName = info.packageName,
+                    versionName = info.versionName,
+                    identity = verdict.identity,
+                    unsigned = false,
+                    reason = "尚未信任，确认来源后才会加载",
+                ),
+            )
             is TrustVerdict.Rejected -> fail(archive, info.packageName, verdict.reason)
             TrustVerdict.Trusted -> instantiate(context, archive, info)
         }
@@ -241,7 +316,7 @@ object PluginLoader {
     }
 
     /** 从 APK 里的 properties 文件读入口类名 */
-    private fun readEntryClass(archive: File): String? = runCatching {
+    internal fun readEntryClass(archive: File): String? = runCatching {
         java.util.zip.ZipFile(archive).use { zip ->
             val entry = zip.getEntry("META-INF/lifeboard-plugin.properties") ?: return@use null
             val props = java.util.Properties()

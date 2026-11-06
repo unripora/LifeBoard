@@ -58,4 +58,33 @@ object PluginManager {
 
     /** 加载失败的插件及原因，供 UI 展示 */
     fun broken(): List<PluginLoader.BrokenPlugin> = PluginLoader.brokenPlugins()
+
+    /** 已安装但尚未信任/无签名的插件，供 UI 展示信任入口 */
+    fun pending(): List<PluginLoader.PendingPlugin> = PluginLoader.pendingPlugins()
+
+    /**
+     * 卸载插件：删包 + 清除安装记录 + 撤销信任 + 重新扫描。
+     *
+     * **不自动清凭据和插件私有数据**：用户可能只是想换版本重装，
+     * 账号和缓存没了就得重新登录。要清什么由调用方显式决定。
+     */
+    fun uninstall(context: Context, pluginId: String) {
+        val appContext = context.applicationContext
+        val plugin = PluginLoader.find(pluginId) ?: return
+        PluginInstaller.remove(appContext, plugin.archiveName)
+        PluginTrustStore.revokePackage(appContext, plugin.archive.packageName)
+        PluginTrustStore.forgetInstalled(appContext, plugin.archive.packageName)
+        refresh(appContext)
+    }
+
+    /**
+     * 卸载一个尚未信任的包。
+     *
+     * 它没被加载过，拿不到 [LoadedPlugin]，只能靠文件名删。
+     */
+    fun uninstallPending(context: Context, archiveName: String) {
+        val appContext = context.applicationContext
+        PluginInstaller.remove(appContext, archiveName)
+        refresh(appContext)
+    }
 }

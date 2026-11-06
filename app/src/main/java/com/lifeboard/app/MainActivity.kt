@@ -14,8 +14,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -28,6 +28,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.lifeboard.app.ui.debug.IpcDebugScreen
 import com.lifeboard.app.ui.mihealth.MiHealthLoginScreen
@@ -35,6 +36,7 @@ import com.lifeboard.app.ui.notice.NoticeDebugScreen
 import com.lifeboard.app.ui.panel.PanelScreen
 import com.lifeboard.app.ui.panel.TaskEditScreen
 import com.lifeboard.app.ui.panel.TrendScreen
+import com.lifeboard.app.ui.plugin.PluginScreen
 import com.lifeboard.app.ui.remind.RemindTestScreen
 import com.lifeboard.app.ui.rules.RulesScreen
 import com.lifeboard.app.ui.settings.AppearanceState
@@ -99,6 +101,7 @@ private enum class Tab(val label: String) {
     TREND("趋势"),
     REMIND("提醒"),
     NOTICE("通知源"),
+    PLUGIN("插件"),
     DEBUG("自检"),
     SETTINGS("设置"),
 }
@@ -139,9 +142,12 @@ private fun MainScaffold(appearance: AppearanceState) {
                     .fillMaxSize()
                     .padding(padding),
             ) {
-                TabRow(
+                // 8 个页签在窄屏上放不下，必须可横向滚动：
+                // 用 TabRow 会等分压缩，标签被截成两三个字就看不出是什么了
+                ScrollableTabRow(
                     selectedTabIndex = selected,
                     containerColor = Color.Transparent,
+                    edgePadding = 8.dp,
                 ) {
                     tabs.forEachIndexed { index, tab ->
                         Tab(
@@ -173,6 +179,7 @@ private fun MainScaffold(appearance: AppearanceState) {
                     Tab.TREND -> TrendScreen()
                     Tab.REMIND -> RemindTestScreen()
                     Tab.NOTICE -> NoticeDebugScreen()
+                    Tab.PLUGIN -> PluginScreen()
                     Tab.DEBUG -> IpcDebugScreen()
                     Tab.SETTINGS -> SettingsScreen(
                         appearance = appearance,
