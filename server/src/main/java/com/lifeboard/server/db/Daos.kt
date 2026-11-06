@@ -214,9 +214,9 @@ interface PluginCredentialDao {
     @Upsert
     suspend fun upsert(row: PluginCredentialEntity)
 
-    /** 清空某个插件名下全部凭据 */
+    /** 清空某个插件名下全部凭据，返回删除的行数 */
     @Query("DELETE FROM plugin_credential WHERE pluginId = :pluginId")
-    suspend fun deleteByPlugin(pluginId: String)
+    suspend fun deleteByPlugin(pluginId: String): Int
 
     /** 删除单个槽位 */
     @Query("DELETE FROM plugin_credential WHERE pluginId = :pluginId AND slot = :slot")

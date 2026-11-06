@@ -1,14 +1,17 @@
 package com.lifeboard.server.health
 
 import android.content.Context
+import android.util.Log
 import com.lifeboard.core.model.builtinRef
 import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.server.collect.SettingsNavigator
 import com.lifeboard.server.db.LifeBoardDatabase
+import com.lifeboard.server.db.SourceHealthDao
 import com.lifeboard.server.db.SourceHealthEntity
 import com.lifeboard.server.notice.NoticeListenerService
+import com.lifeboard.server.plugin.PluginDataSource
 import com.lifeboard.server.plugin.PluginLoader
 import com.lifeboard.server.source.ScreenTimeDataSource
 import com.lifeboard.server.source.toRef
@@ -48,6 +51,8 @@ object SourceHealthChecker {
         /** 写进 `source_health.sourceType` 的键 */
         val key: String get() = source.key
     }
+
+    private const val TAG = "LifeBoardSourceHealth"
 
     private const val ACTION_USAGE_ACCESS = "usage_access"
     private const val ACTION_NOTICE_LISTENER = "notice_listener"
@@ -117,9 +122,10 @@ object SourceHealthChecker {
                 if (!plugin.trusted) {
                     Entry(ref, State.NOT_IMPLEMENTED, "信任已撤销，已停止调度", actionKey = null)
                 } else {
-                    // 运行期健康度要 suspend 调用，这里是同步上下文，只给静态结论；
-                    // 真实采集结果由聚合任务写进 source_health 表
-                    Entry(ref, State.OK, "插件源，由插件提供数据", actionKey = null)
+                    // 这里只给静态结论：插件没撤销信任就算「可尝试采集」。
+                    // 真实健康度（登录过期、接口变更）由 persistPluginHealth 调插件的
+                    // suspend health() 后写进 source_health 表，面板以表里的为准。
+                    Entry(ref, State.OK, "插件源，健康度见最近一次采集结果", actionKey = null)
                 }
             }
         }
@@ -216,6 +222,52 @@ object SourceHealthChecker {
                     message = entry.message,
                 ),
             )
+        }
+        // 插件健康度只能在这里取：它要调插件的 suspend `health()`，
+        // 而 checkAll 是同步的权限快照，塞不进去
+        persistPluginHealth(context, dao, now, previous)
+    }
+
+    /**
+     * 单独写插件源的健康度。
+     *
+     * 为什么不并进 [checkAll]：`checkAll` 是同步的「权限是否齐全」快照，几微秒完成；
+     * 而插件的 `health()` 可能要发网络请求，一慢就会拖住整个列表。
+     * 这里在 suspend 上下文里逐个问插件，结果写进同一张 `source_health` 表，
+     * 面板照常读表，不需要额外的 UI 逻辑。
+     *
+     * 单个插件抛异常不影响其他插件，也不影响整次持久化。
+     */
+    private suspend fun persistPluginHealth(
+        context: Context,
+        dao: SourceHealthDao,
+        now: Long,
+        previous: Map<String, SourceHealthEntity>,
+    ) {
+        PluginLoader.loadedPlugins().flatMap { plugin ->
+            plugin.metrics.values.map { spec ->
+                PluginDataSource(plugin, spec, context)
+            }
+        }.forEach { source ->
+            val health = runCatching { source.health() }.getOrElse { error ->
+                Log.w(TAG, "plugin health failed: ${source.source.key}", error)
+                return@forEach
+            }
+            val key = health.source.key
+            runCatching {
+                dao.upsert(
+                    SourceHealthEntity(
+                        sourceType = key,
+                        healthy = health.healthy,
+                        lastSuccessAt = if (health.healthy) {
+                            now
+                        } else {
+                            previous[key]?.lastSuccessAt ?: 0L
+                        },
+                        message = health.message,
+                    ),
+                )
+            }.onFailure { Log.w(TAG, "persist plugin health failed: $key", it) }
         }
     }
 

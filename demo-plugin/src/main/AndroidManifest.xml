@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  demo 插件不提供任何 Activity、Service 或权限：
+
+  它是被宿主用 DexClassLoader 加载的代码包，不是要安装运行的应用。
+  声明组件只会让人误以为需要「打开」它，也会让系统在安装时索取不必要的权限。
+  保留 manifest 只是为了能构建出带签名与包名的 APK。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      插件能力声明。加载器据此识别这是给 LifeBoard 写的包。
+      用 uses-feature 而不是自定义 permission：feature 不涉及任何权限授予，
+      纯粹是能力声明，也不会在安装时向用户索取东西。
+    -->
+    <uses-feature
+        android:name="${pluginFeature}"
+        android:required="true" />
+
+</manifest>

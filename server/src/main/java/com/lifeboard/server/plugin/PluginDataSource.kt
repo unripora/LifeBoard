@@ -44,11 +44,22 @@ class PluginDataSource(
 
     override val requiresInjection: Boolean = false
 
+    /**
+     * 本次采集内复用的插件上下文。
+     *
+     * `collect` 会紧接着调 `health`，而 `health` 内部又要读 `authState`，
+     * 一次采集至少要用到三次。缓存在本实例上即可：适配器本身就是每次采集新建的，
+     * 不会把状态带到下一次采集。
+     */
+    private val pluginContext: HostPluginContext by lazy {
+        HostPluginContext(plugin.pluginId, appContext)
+    }
+
     override suspend fun collect(date: String): List<MetricRecord> {
         if (!plugin.trusted) return emptyList()
 
         val produced = runCatching {
-            plugin.plugin.fetch(pluginContext(), date)
+            plugin.plugin.fetch(pluginContext, date)
         }.getOrElse { error ->
             log("fetch 失败", error)
             return emptyList()
@@ -76,7 +87,7 @@ class PluginDataSource(
             )
         }
 
-        return runCatching { plugin.plugin.health(pluginContext()) }
+        return runCatching { plugin.plugin.health(pluginContext) }
             .getOrElse { error ->
                 log("health 失败", error)
                 PluginHealth.Broken("健康检查异常：${error.message ?: error.javaClass.simpleName}")
@@ -91,7 +102,7 @@ class PluginDataSource(
      * 实际下次采集大概率就自动恢复了。
      */
     private suspend fun PluginHealth.toSourceHealth(): SourceHealth {
-        val auth = runCatching { plugin.plugin.authState(pluginContext()) }
+        val auth = runCatching { plugin.plugin.authState(pluginContext) }
             .getOrElse { AuthState.LoggedOut }
 
         return when (this) {
@@ -112,8 +123,6 @@ class PluginDataSource(
             }
         }
     }
-
-    private fun pluginContext() = HostPluginContext(plugin.pluginId, appContext)
 
     private fun log(message: String, error: Throwable? = null) {
         android.util.Log.w(

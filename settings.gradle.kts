@@ -25,3 +25,5 @@ include(":core")
 include(":server")
 // 宿主与第三方插件共用的契约，必须保持零依赖
 include(":plugin-api")
+// 最小可用插件，用于验证加载链路；不参与宿主打包
+include(":demo-plugin")
