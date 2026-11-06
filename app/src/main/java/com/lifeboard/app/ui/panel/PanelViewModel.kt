@@ -160,10 +160,9 @@ class PanelViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 打开某个断源对应的设置页；应用内页面返回 false，由界面层接管 */
+    /** 打开某个断源对应的设置页 */
     fun openSourceSettings(entry: SourceHealthChecker.Entry): Boolean {
         val key = entry.actionKey ?: return true
-        if (SourceHealthChecker.isInAppAction(key)) return false
         SourceHealthChecker.openSettings(getApplication(), key)
         return true
     }

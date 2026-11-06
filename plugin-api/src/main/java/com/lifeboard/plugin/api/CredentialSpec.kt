@@ -20,11 +20,14 @@ data class CredentialSpec(
      * @property name 槽位名，与 [CredentialStore] 里使用的 slot 一致
      * @property displayName 展示名，如「访问令牌」
      * @property required 是否必需；为 false 表示可留空（如可选的双因子令牌）
+     * @property secret 是否按敏感内容显示。密码框需要掩码，
+     *   否则用户在满屏可见的输入框里打密码，旁边有人就能看走
      */
     data class Slot(
         val name: String,
         val displayName: String,
         val required: Boolean = true,
+        val secret: Boolean = false,
     )
 
     companion object {

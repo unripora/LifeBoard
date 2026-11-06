@@ -5,6 +5,7 @@ import com.lifeboard.plugin.api.CredentialSpec
 import com.lifeboard.plugin.api.LoginResult
 import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.plugin.api.MetricSpec
+import com.lifeboard.plugin.api.PluginApi
 import com.lifeboard.plugin.api.PluginContext
 import com.lifeboard.plugin.api.PluginHealth
 import com.lifeboard.plugin.api.PluginMetric
@@ -32,7 +33,13 @@ class DemoPlugin : SourcePlugin {
 
     override val displayName: String = "演示插件"
 
-    override val apiVersion: Int = 1
+    /**
+     * 跟随契约版本常量，不写死数字。
+     *
+     * 写死过 1，M5 把契约升到 2 之后这个演示插件立刻被加载器正确拒绝，
+     * 6 个真机用例一起变红——问题不在加载器，而在这里没跟上版本。
+     */
+    override val apiVersion: Int = PluginApi.VERSION
 
     /** demo 不需要登录，因此不声明任何凭据槽位 */
     override val credentialSpec: CredentialSpec = CredentialSpec(slots = emptyList())
@@ -50,7 +57,10 @@ class DemoPlugin : SourcePlugin {
         ),
     )
 
-    override suspend fun login(context: PluginContext): LoginResult =
+    override suspend fun login(
+        context: PluginContext,
+        inputs: Map<String, String>,
+    ): LoginResult =
         LoginResult.Failure("演示插件无需登录")
 
     override suspend fun logout(context: PluginContext) = Unit

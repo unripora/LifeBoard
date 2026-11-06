@@ -4,6 +4,9 @@ import android.app.Application
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.lifeboard.plugin.api.AuthState
+import com.lifeboard.plugin.api.InputField
+import com.lifeboard.plugin.api.LoginResult
 import com.lifeboard.server.db.LifeBoardDatabase
 import com.lifeboard.server.plugin.CredentialVault
 import com.lifeboard.server.plugin.LoadedPlugin
@@ -33,6 +36,12 @@ data class PluginRow(
     val healthy: Boolean?,
     val healthMessage: String,
     val signatureHashes: List<String>,
+    /** 插件是否需要登录才能出数（有凭据槽位就认为需要） */
+    val needsLogin: Boolean = false,
+    /** 登录态文案，如「已登录：138****1234」；未登录时为空 */
+    val loginText: String = "",
+    /** 是否需要用户去登录（未登录或已过期） */
+    val needsLoginAction: Boolean = false,
 )
 
 /** 待信任 / 无签名，用户在这里做决定 */
@@ -74,8 +83,31 @@ data class PluginUiState(
     val broken: List<BrokenRow> = emptyList(),
     /** 有值表示要弹信任确认框 */
     val pendingInstall: PendingInstall? = null,
+    /** 有值表示正在登录，UI 应展示插件要求填的表单 */
+    val login: LoginUi? = null,
     /** 一次性提示，展示后由 UI 调 [PluginViewModel.consumeMessage] 清掉 */
     val message: String? = null,
+)
+
+/**
+ * 插件登录进行中的状态。
+ *
+ * [fields] 由插件给出，宿主不知道这些字段是什么含义——可能是账号密码，
+ * 也可能是验证码。UI 只负责按 [InputField.secret] 决定要不要掩码。
+ *
+ * @property busy 上一轮提交还在进行，此时禁用「提交」按钮
+ * @property error 上一轮的失败原因，显示在表单上方
+ */
+data class LoginUi(
+    val pluginId: String,
+    val displayName: String,
+    val prompt: String,
+    val fields: List<com.lifeboard.plugin.api.InputField>,
+    val captchaImage: String? = null,
+    val busy: Boolean = false,
+    val error: String? = null,
+    /** 用户在表单里已经输入的值，键是字段名 */
+    val values: Map<String, String> = emptyMap(),
 )
 
 /**
@@ -115,7 +147,7 @@ class PluginViewModel(app: Application) : AndroidViewModel(app) {
             .associateBy { it.sourceType }
 
         val installed = PluginManager.loaded().map { plugin ->
-            toRow(plugin, healthBySource)
+            toRow(ctx, plugin, healthBySource)
         }
 
         val pending = PluginManager.pending().map {
@@ -136,7 +168,8 @@ class PluginViewModel(app: Application) : AndroidViewModel(app) {
         return Triple(installed, pending, broken)
     }
 
-    private fun toRow(
+    private suspend fun toRow(
+        ctx: Application,
         plugin: LoadedPlugin,
         health: Map<String, com.lifeboard.server.db.SourceHealthEntity>,
     ): PluginRow {
@@ -150,6 +183,16 @@ class PluginViewModel(app: Application) : AndroidViewModel(app) {
         }
         val message = records.firstOrNull { !it.healthy }?.message.orEmpty()
 
+        // 有凭据槽位就认为需要登录。为空说明插件不需要账号，
+        // 此时不该在界面上给它一个点了没用的登录按钮
+        val needsLogin = plugin.plugin.credentialSpec.slots.isNotEmpty()
+        val auth = if (needsLogin && plugin.trusted) {
+            runCatching { PluginManager.authState(ctx, plugin.pluginId) }
+                .getOrElse { AuthState.LoggedOut }
+        } else {
+            null
+        }
+
         return PluginRow(
             pluginId = plugin.pluginId,
             displayName = plugin.plugin.displayName,
@@ -161,7 +204,20 @@ class PluginViewModel(app: Application) : AndroidViewModel(app) {
             healthy = healthy,
             healthMessage = message,
             signatureHashes = plugin.archive.signatureHashes.sorted(),
+            needsLogin = needsLogin,
+            loginText = authText(auth),
+            needsLoginAction = needsLogin && (auth == null ||
+                auth is AuthState.LoggedOut ||
+                auth is AuthState.Expired),
         )
+    }
+
+    private fun authText(auth: AuthState?): String = when (auth) {
+        null -> ""
+        is AuthState.LoggedIn ->
+            auth.accountName?.let { "已登录：$it" } ?: "已登录"
+        is AuthState.Expired -> auth.message ?: "登录已过期"
+        AuthState.LoggedOut -> "未登录"
     }
 
     /**
@@ -280,5 +336,102 @@ class PluginViewModel(app: Application) : AndroidViewModel(app) {
 
     fun consumeMessage() {
         _state.value = _state.value.copy(message = null)
+    }
+
+    // ---- 登录 ----
+
+    /**
+     * 开始登录一个插件。
+     *
+     * 宿主不知道这个插件要什么字段，所以先空手问一轮：插件会返回
+     * [LoginResult.NeedInput] 告诉我们「要填什么」，也可能是直接成功（凭据还在）。
+     */
+    fun startLogin(row: PluginRow) {
+        submitLogin(row.pluginId, row.displayName, emptyMap())
+    }
+
+    /** 用户改了表单里某个字段的值 */
+    fun updateLoginValue(name: String, value: String) {
+        val current = _state.value.login ?: return
+        _state.value = _state.value.copy(
+            login = current.copy(values = current.values + (name to value), error = null),
+        )
+    }
+
+    /** 提交当前表单 */
+    fun submitLoginForm() {
+        val current = _state.value.login ?: return
+        submitLogin(current.pluginId, current.displayName, current.values)
+    }
+
+    fun cancelLogin() {
+        _state.value = _state.value.copy(login = null)
+    }
+
+    /**
+     * 发起一轮登录，并处理插件返回的三种结果。
+     *
+     * [inputs] 为空表示这是第一轮，插件应该告诉我们它要什么字段。
+     */
+    private fun submitLogin(
+        pluginId: String,
+        displayName: String,
+        inputs: Map<String, String>,
+    ) {
+        viewModelScope.launch {
+            // 已有表单时先标记 busy：登录要发网络请求，不能让人连点提交
+            _state.value.login?.let { current ->
+                _state.value = _state.value.copy(login = current.copy(busy = true, error = null))
+            }
+
+            val ctx = getApplication<Application>()
+            val result = withContext(Dispatchers.IO) {
+                PluginManager.login(ctx, pluginId, inputs)
+            }
+
+            when (result) {
+                is LoginResult.Success -> {
+                    _state.value = _state.value.copy(login = null, message = "$displayName 登录成功")
+                    refresh()
+                }
+
+                is LoginResult.NeedInput -> {
+                    // 保留用户已填的值：验证码这轮要重填，但账号密码不该让他再输一遍
+                    val kept = _state.value.login?.values.orEmpty()
+                        .filterKeys { name -> result.fields.any { it.name == name } }
+                    _state.value = _state.value.copy(
+                        login = LoginUi(
+                            pluginId = pluginId,
+                            displayName = displayName,
+                            prompt = result.prompt,
+                            fields = result.fields,
+                            captchaImage = result.captchaImage,
+                            values = kept,
+                        ),
+                    )
+                }
+
+                is LoginResult.Failure -> {
+                    val form = _state.value.login
+                    _state.value = if (form == null) {
+                        // 第一轮就失败：此时没有表单可显示错误，只能走提示条，
+                        // 否则用户点了登录却什么都看不到
+                        _state.value.copy(message = "$displayName 登录失败：${result.message}")
+                    } else {
+                        _state.value.copy(login = form.copy(busy = false, error = result.message))
+                    }
+                }
+            }
+        }
+    }
+
+    /** 登出：让插件清掉自己名下的凭据 */
+    fun logout(row: PluginRow) {
+        viewModelScope.launch {
+            val ctx = getApplication<Application>()
+            withContext(Dispatchers.IO) { PluginManager.logout(ctx, row.pluginId) }
+            _state.value = _state.value.copy(message = "已退出 ${row.displayName}")
+            refresh()
+        }
     }
 }

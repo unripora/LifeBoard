@@ -148,15 +148,17 @@ class PluginLoaderEndToEndTest {
     }
 
     @Test
-    fun pluginWithWrongApiVersion_isRejected() {
-        // 契约版本不匹配必须拒绝并说明，不做多代并存
+    fun pluginDeclaresCurrentApiVersion() {
+        // 插件声明的契约版本必须与宿主一致，否则会被加载器拒绝。
+        // demo 插件已改为跟随 PluginApi.VERSION，这里守住这条约定：
+        // 写死数字的插件在契约升级时会静默失效（M5 就把 6 个用例一起弄红过）
         installDemoArchive()
         val archive = File(PluginInstaller.pluginsDir(context), demoArchive)
         val info = PluginInstaller.readArchiveInfo(context, archive)!!
         PluginTrustStore.trust(context, info.identity)
 
-        // demo 插件本身 apiVersion = 1，与宿主一致，此处只验证正常路径能加载
         val loaded = PluginLoader.scan(context)
+        assertEquals(1, loaded.size)
         assertEquals(com.lifeboard.plugin.api.PluginApi.VERSION, loaded.first().plugin.apiVersion)
     }
 }
