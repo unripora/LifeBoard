@@ -42,6 +42,7 @@ import com.lifeboard.app.ui.settings.SettingsScreen
 import com.lifeboard.app.ui.theme.GlassBackground
 import com.lifeboard.app.ui.theme.LifeBoardTheme
 import com.lifeboard.server.collect.DailyAggregateWorker
+import com.lifeboard.server.plugin.PluginManager
 import com.lifeboard.server.remind.RemindScheduler
 
 /**
@@ -65,6 +66,12 @@ class MainActivity : ComponentActivity() {
         ensureNotificationPermission()
         // 进入应用即确保每日聚合任务已注册，避免首次安装后忘记调度
         DailyAggregateWorker.schedule(this)
+        // 扫描已安装的 .ext 插件并注册进采集注册表。
+        // 放在主线程之外：读 APK 元数据与实例化 dex 都有 IO，不能卡启动。
+        // 失败不影响启动——插件是可选能力，坏了也不能让应用起不来。
+        Thread {
+            runCatching { PluginManager.refresh(applicationContext) }
+        }.start()
         // 闹钟在进程被杀或跨天后会失效，每次打开应用都重排一次
         runCatching { RemindScheduler.rescheduleAll(this) }
         setContent {

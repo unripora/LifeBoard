@@ -2,12 +2,14 @@ package com.lifeboard.server.health
 
 import android.content.Context
 import com.lifeboard.core.model.builtinRef
+import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
 import com.lifeboard.server.collect.SettingsNavigator
 import com.lifeboard.server.db.LifeBoardDatabase
 import com.lifeboard.server.db.SourceHealthEntity
 import com.lifeboard.server.notice.NoticeListenerService
+import com.lifeboard.server.plugin.PluginLoader
 import com.lifeboard.server.source.ScreenTimeDataSource
 import com.lifeboard.server.source.toRef
 import kotlinx.coroutines.Dispatchers
@@ -93,7 +95,47 @@ object SourceHealthChecker {
                 message = "手动打卡，无需权限",
                 actionKey = null,
             ),
-        ) + customEntries(context)
+        ) + customEntries(context) + pluginEntries(context)
+    }
+
+    /**
+     * 插件源单独成组。
+     *
+     * 与内置源的区别在于「不健康的原因」完全由插件决定（登录过期、接口变了、契约不匹配），
+     * 宿主不猜，直接展示插件返回的 message。加载失败的插件以 BROKEN 呈现，
+     * 让用户看得到「为什么装了这个插件却用不了」。
+     */
+    private fun pluginEntries(context: Context): List<Entry> {
+        val loaded = PluginLoader.loadedPlugins().flatMap { plugin ->
+            plugin.metrics.values.map { spec ->
+                val ref = SourceRef.Plugin(
+                    pluginId = plugin.pluginId,
+                    metricKey = spec.metricKey,
+                    displayName = "${plugin.plugin.displayName}·${spec.displayName}",
+                    bucket = spec.bucket,
+                )
+                if (!plugin.trusted) {
+                    Entry(ref, State.NOT_IMPLEMENTED, "信任已撤销，已停止调度", actionKey = null)
+                } else {
+                    // 运行期健康度要 suspend 调用，这里是同步上下文，只给静态结论；
+                    // 真实采集结果由聚合任务写进 source_health 表
+                    Entry(ref, State.OK, "插件源，由插件提供数据", actionKey = null)
+                }
+            }
+        }
+        val broken = PluginLoader.brokenPlugins().map { broken ->
+            Entry(
+                source = SourceRef.Builtin(
+                    key = "PLUGIN_BROKEN_${broken.archiveName}",
+                    displayName = broken.archiveName,
+                    bucket = MetricBucket.FLAG,
+                ),
+                state = State.NOT_IMPLEMENTED,
+                message = "插件加载失败：${broken.reason}",
+                actionKey = null,
+            )
+        }
+        return loaded + broken
     }
 
     /**
