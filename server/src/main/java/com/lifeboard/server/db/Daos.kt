@@ -199,3 +199,27 @@ interface AppUsageDao {
     @Query("DELETE FROM app_usage WHERE date < :keepFrom")
     suspend fun trimBefore(keepFrom: String)
 }
+
+@Dao
+interface PluginCredentialDao {
+
+    /** 取某插件某个槽位的密文；没有返回 null */
+    @Query("SELECT cipherText FROM plugin_credential WHERE pluginId = :pluginId AND slot = :slot")
+    suspend fun get(pluginId: String, slot: String): String?
+
+    /** 某插件名下全部槽位名，用于「清除前告知会影响哪些项」 */
+    @Query("SELECT slot FROM plugin_credential WHERE pluginId = :pluginId ORDER BY slot ASC")
+    suspend fun slots(pluginId: String): List<String>
+
+    @Upsert
+    suspend fun upsert(row: PluginCredentialEntity)
+
+    /** 清空某个插件名下全部凭据 */
+    @Query("DELETE FROM plugin_credential WHERE pluginId = :pluginId")
+    suspend fun deleteByPlugin(pluginId: String)
+
+    /** 删除单个槽位 */
+    @Query("DELETE FROM plugin_credential WHERE pluginId = :pluginId AND slot = :slot")
+    suspend fun deleteSlot(pluginId: String, slot: String)
+}
+
