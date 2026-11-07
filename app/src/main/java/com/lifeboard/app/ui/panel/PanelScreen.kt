@@ -29,6 +29,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -38,9 +39,15 @@ import com.lifeboard.app.ui.theme.GlassCard
 import com.lifeboard.app.ui.theme.GlassProgress
 import com.lifeboard.core.model.RemindLevel
 import com.lifeboard.core.util.Dates
+import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.server.dashboard.CardType
 import com.lifeboard.server.dashboard.DashboardCards
 import com.lifeboard.server.health.SourceHealthChecker
+import com.lifeboard.server.metric.MetricCandidate
+import com.lifeboard.server.metric.MetricQueryService
+import com.lifeboard.server.metric.MetricReading
+import com.lifeboard.server.metric.MetricResult
+import com.lifeboard.server.metric.candidates
 import java.time.LocalDate
 
 /**
@@ -84,11 +91,22 @@ fun PanelScreen(
         .collectAsStateWithLifecycle(initialValue = emptyList())
     val cards = dashVm.cardsFor(tabId, dashState.ready, storedCards)
 
+    // 指标卡的读数不在卡片列表里：列表来自 dashboard_tab/card，读数来自 metric 表，
+    // 两者的刷新时机不同。这里在卡片列表变化或采集刷新时拉一次
+    val metricStates by vm.metricStates.collectAsStateWithLifecycle()
+    LaunchedEffect(tabId, storedCards, refreshKey) {
+        vm.loadMetrics(tabId, storedCards)
+    }
+
     // 编辑态：显示每张卡的操作按钮与底部「添加卡片」。
     // 不做默认常驻的拖拽手柄——这个页面天天用，常驻的编辑控件会把
     // 卡片间距撑开，视觉上和改造前就不再一致了（M6a 的验收标准）
     var editing by remember(tabId) { mutableStateOf(false) }
     var adding by remember(tabId) { mutableStateOf(false) }
+
+    // 指标卡的第二层选择（先选源，再选指标）。与 adding 分开：
+    // 第一层关掉之后再开这一层，两个弹窗不会同时存在
+    var pickingMetric by remember(tabId) { mutableStateOf(false) }
 
     // 「已存在类型」按卡片行本身算，而不是按上面渲染用的 CardType：
     // 加卡片的判重必须和库里的 (tabId, type) 唯一索引看同一份事实
@@ -142,6 +160,8 @@ fun PanelScreen(
                 CardHost(
                     type = type,
                     state = state,
+                    metricReading = storedCards.getOrNull(index)
+                        ?.let { row -> metricStates.firstOrNull { it.cardId == row.cardId } },
                     onRefresh = { vm.reevaluate() },
                     onMarkDone = { vm.markDone(it) },
                     onEditTask = onEditTask,
@@ -177,10 +197,28 @@ fun PanelScreen(
             candidates = addable,
             onDismiss = { adding = false },
             onPick = { type ->
-                dashVm.addCard(tabId, type) { ok ->
-                    // 失败（撞唯一索引或被策略挡下）时把弹窗留在原地：
-                    // 关掉再让用户重开一遍，等于什么都没说
-                    if (ok) adding = false
+                if (type == CardType.METRIC) {
+                    // 指标卡还要选源与指标，交给下一层弹窗。
+                    // 先把当前弹窗关掉，否则两层叠在一起，返回键的退栈顺序会很怪
+                    adding = false
+                    pickingMetric = true
+                } else {
+                    dashVm.addCard(tabId, type) { ok ->
+                        // 失败（撞唯一索引或被策略挡下）时把弹窗留在原地：
+                        // 关掉再让用户重开一遍，等于什么都没说
+                        if (ok) adding = false
+                    }
+                }
+            },
+        )
+    }
+
+    if (pickingMetric) {
+        MetricSourcePickerDialog(
+            onDismiss = { pickingMetric = false },
+            onPick = { sourceKey, metricKey ->
+                dashVm.addCard(tabId, CardType.METRIC, sourceKey, metricKey) { ok ->
+                    if (ok) pickingMetric = false
                 }
             },
         )
@@ -218,6 +256,7 @@ fun PanelScreen(
 private fun CardHost(
     type: CardType,
     state: PanelUiState,
+    metricReading: MetricCardState?,
     onRefresh: () -> Unit,
     onMarkDone: (TaskRow) -> Unit,
     onEditTask: (Long) -> Unit,
@@ -252,10 +291,171 @@ private fun CardHost(
             }
         }
 
-        // METRIC 卡在 M6b 实现。这里不给兜底渲染，
-        // 免得布局里残留一个空壳占位
-        CardType.METRIC -> Unit
+        CardType.METRIC -> MetricCard(reading = metricReading)
     }
+}
+
+/**
+ * 指标卡（M6b2b）。
+ *
+ * 三种状态分开显示，因为它们的下一步动作完全不同：
+ * - 有值：显示数字，非当天的值标出日期（「这是前天的」和「这是今天的」不是一回事）
+ * - 没有数据：空状态 + 一句为什么，让用户知道该等等还是该去查源
+ * - 源不见了：明确说出来，并提示这张卡需要重新绑定
+ *   （这张卡绑的自建源被删了、插件被卸了——不是「还没采集到」）
+ */
+@Composable
+private fun MetricCard(reading: MetricCardState?) {
+    GlassCard(modifier = Modifier.fillMaxWidth()) {
+        when (val result = reading?.result) {
+            null -> {
+                // 读数还没回来。用与卡片同高的一行占位，避免列表在读数到达时跳一下
+                Text("指标", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    "正在读取…",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            is MetricResult.Value -> {
+                val value = result.reading
+                Text(value.title, style = MaterialTheme.typography.titleSmall)
+                Text(
+                    formatMetricValue(value),
+                    style = MaterialTheme.typography.headlineMedium,
+                )
+                // 今天没数据时显示的是最近一次的值，必须标出来，
+                // 否则用户会把昨天的步数当成今天的
+                if (value.date != Dates.todayString()) {
+                    Text(
+                        "最近一次：${value.date}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
+            MetricResult.NoData -> {
+                Text("指标", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    "还没有数据。采集完成后这里会自动更新。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            MetricResult.SourceUnavailable -> {
+                Text("指标", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    "这个数据源已经不存在了。移除这张卡后重新添加即可。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 指标值的展示文本。
+ *
+ * FLAG 量纲显示成「完成 / 未完成」而不是 1 / 0：后者只有写代码的人看得懂。
+ * 其余量纲复用 `PanelViewModel.formatValue` 的数字规整（整数值不拖小数点）。
+ */
+private fun formatMetricValue(reading: MetricReading): String =
+    if (reading.bucket == MetricBucket.FLAG) {
+        if (reading.value > 0.0) "完成" else "未完成"
+    } else {
+        PanelViewModel.formatValue(reading.value, reading.unit)
+    }
+
+/**
+ * 指标卡的数据源 + 指标选择器（M6b2b）。
+ *
+ * 源和指标分两屏：内置源与自建源各只有一个指标，第一屏直接落到指标上会显得多余；
+ * 而插件源将来可能有多个。所以「选了源之后 if 只有一项就立刻选完，否则展开选指标」——
+ * 现在所有源都只有一项，实际是点源即完成，但结构上不挡住插件源以后的动作。
+ */
+@Composable
+private fun MetricSourcePickerDialog(
+    onDismiss: () -> Unit,
+    onPick: (sourceKey: String, metricKey: String?) -> Unit,
+) {
+    val context = LocalContext.current
+    var candidates by remember { mutableStateOf<List<MetricCandidate>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var expanded by remember { mutableStateOf<MetricCandidate?>(null) }
+
+    LaunchedEffect(Unit) {
+        candidates = MetricQueryService.candidates(context)
+        loading = false
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (expanded == null) "选择数据源" else "选择指标") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                when {
+                    loading -> Text(
+                        "正在读取数据源…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+
+                    // 没有任何可读的源。最常见的是还没配好任何数据源，
+                    // 这时说「去设置里添加」比显示一个空列表有用
+                    candidates.isEmpty() -> Text(
+                        "还没有可以读取的数据源。先到数据源设置里添加一个，再回来加指标卡。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+
+                    // 第二屏：这个源的指标。现在只会有一项
+                    expanded != null -> expanded!!.metrics.forEach { option ->
+                        TextButton(
+                            onClick = { onPick(expanded!!.sourceKey, option.metricKey) },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("${expanded!!.displayName} · ${option.label}") }
+                    }
+
+                    else -> candidates.forEach { candidate ->
+                        TextButton(
+                            onClick = {
+                                if (candidate.metrics.size == 1) {
+                                    val only = candidate.metrics.first()
+                                    onPick(candidate.sourceKey, only.metricKey)
+                                } else {
+                                    expanded = candidate
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                if (candidate.metrics.size == 1) {
+                                    "${candidate.displayName} · ${candidate.metrics.first().label}"
+                                } else {
+                                    candidate.displayName
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            // 第二屏要能退回第一屏，否则选错源只能整个关掉重来
+            if (expanded != null) {
+                TextButton(onClick = { expanded = null }) { Text("返回") }
+            } else {
+                TextButton(onClick = onDismiss) { Text("取消") }
+            }
+        },
+    )
 }
 
 /**

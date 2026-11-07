@@ -30,23 +30,24 @@ class DashboardCardsTest {
         )
 
     @Test
-    fun metricCardIsNotOfferableYet() {
-        // METRIC 卡必须先绑定数据源与指标，M6b2b 才做选择流程。
-        // 提前把它列出来，用户点下去只会得到一张永远空着的卡
-        assertFalse(CardType.METRIC in DashboardCards.OFFERABLE)
+    fun metricCardIsOfferableButLast() {
+        // M6b2b 起指标卡可以加。排在最后：它不是「选了就完」的选项，
+        // 还要再选一次数据源与指标
+        assertTrue(CardType.METRIC in DashboardCards.OFFERABLE)
+        assertEquals(CardType.METRIC, DashboardCards.OFFERABLE.last())
     }
 
     @Test
-    fun offerableCoversDefaultLayout() {
-        // 默认布局里的四种卡都必须是可添加的，否则「删掉再加回来」走不通
-        assertEquals(DashboardLayout.DEFAULT_CARDS.toSet(), DashboardCards.OFFERABLE.toSet())
+    fun offerableStartsWithDefaultLayout() {
+        // 默认布局里的四种卡必须都能加回来，否则「删掉再加」走不通
+        assertTrue(DashboardCards.OFFERABLE.containsAll(DashboardLayout.DEFAULT_CARDS))
     }
 
     @Test
     fun addableExcludesAlreadyPresent() {
         val existing = listOf(CardType.SCORE, CardType.WEEK)
         assertEquals(
-            listOf(CardType.TODO, CardType.SOURCE_HEALTH),
+            listOf(CardType.TODO, CardType.SOURCE_HEALTH, CardType.METRIC),
             DashboardCards.addableTo(existing),
         )
     }
