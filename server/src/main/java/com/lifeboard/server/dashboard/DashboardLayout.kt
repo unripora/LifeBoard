@@ -23,8 +23,13 @@ import com.lifeboard.server.db.LifeBoardDatabase
  */
 object DashboardLayout {
 
-    /** 默认布局：与 M6 之前 `PanelScreen` 的显示顺序逐项对应 */
-    private val DEFAULT_CARDS = listOf(
+    /**
+     * 默认布局：与 M6 之前 `PanelScreen` 的显示顺序逐项对应。
+     *
+     * 对外可见是因为界面在数据库就绪前要先用它顶一帧；
+     * 两边共用同一份清单，才不会出现「首帧用的顺序和落库后的顺序对不上」。
+     */
+    val DEFAULT_CARDS = listOf(
         CardType.SCORE,
         CardType.TODO,
         CardType.WEEK,
