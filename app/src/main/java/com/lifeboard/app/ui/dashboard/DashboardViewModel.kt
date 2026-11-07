@@ -177,19 +177,32 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
      * 往页签末尾加一张卡。
      *
      * 三道检查都在这里做，而不是只靠界面把按钮禁掉：
-     * 1. 只有面板可以放卡（其余内置页签是整页，加了也显示不出来）
-     * 2. 类型必须在可选清单里（METRIC 卡要绑定数据源，等 M6b2b）
+     * 1. 只有卡片页签可以放卡（内置整页放不了，加了也显示不出来）
+     * 2. 类型必须在可选清单里
      * 3. 该页签还没有同类型的卡
      *
      * 第 3 条与库里的 (tabId, type) 唯一索引重复，但不是多余的：
      * 这里读一次再写，两次点击各跑一次仍然可能都通过读检查；
-     * 索引会在写的时候把后一次挡住，走 [DashboardCardInsert.FAILED_DUPLICATE] 分支。
+     * 索引会在写的时候把后一次挡住，返回 false。
+     *
+     * @param sourceKey 指标卡绑定的数据源；其他类型必须留空（它们读固定位置的数据）。
+     *   留空时指标卡会显示「数据源已不存在」，所以界面必须传
+     * @param metricKey 指标卡绑定的具体指标；内置源与自建源留空，
+     *   让 [com.lifeboard.server.metric.MetricQueryService] 自己从源推出量纲
      */
-    fun addCard(tabId: String, type: CardType, onAdded: (Boolean) -> Unit = {}) {
+    fun addCard(
+        tabId: String,
+        type: CardType,
+        sourceKey: String? = null,
+        metricKey: String? = null,
+        onAdded: (Boolean) -> Unit = {},
+    ) {
         viewModelScope.launch {
             val ok = withContext(Dispatchers.IO) {
                 if (!DashboardCards.isCardTab(tabId)) return@withContext false
                 if (type !in DashboardCards.OFFERABLE) return@withContext false
+                // 指标卡没有源就是一张永远显示「源不存在」的卡，不如不加
+                if (type == CardType.METRIC && sourceKey.isNullOrBlank()) return@withContext false
                 val existing = db.dashboardCardDao().getByTab(tabId)
                 if (existing.any { DashboardCards.parseType(it.type) == type }) return@withContext false
                 val card = DashboardCardEntity(
@@ -197,6 +210,9 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
                     // 所以拼上类型名把冲突概率压到足够低，真撞上了由唯一索引挡住
                     cardId = "card_${System.currentTimeMillis()}_${type.name.lowercase()}",
                     type = type.name,
+                    // 非指标卡不存绑定：留着会让「这张卡绑了什么」这种问题在无关的卡上也有答案
+                    sourceKey = sourceKey.takeIf { type == CardType.METRIC },
+                    metricKey = metricKey.takeIf { type == CardType.METRIC },
                     order = (existing.maxOfOrNull { it.order } ?: -1) + 1,
                     tabId = tabId,
                 )

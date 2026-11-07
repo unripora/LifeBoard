@@ -67,6 +67,28 @@ interface MetricDao {
     @Query("SELECT * FROM metric WHERE date BETWEEN :from AND :to ORDER BY date ASC")
     suspend fun getRange(from: String, to: String): List<MetricEntity>
 
+    /**
+     * 某个源某个量纲在最近 [days] 天里**有数据的**最晚一天，没有返回 null。
+     *
+     * 指标卡要往前找「最近一次」的值（今天还没采集到 vs 今天真的是 0 是两回事），
+     * 而这个查找必须在 SQL 里做：逐天把日期字符串减一天，跨月与夏令时都会出错。
+     *
+     * 按 bucket 而不是整个源过滤是必要的：小米健康一个源同时有步数与睡眠，
+     * 前天采到了步数、昨天只采到睡眠，读「睡眠」卡不该拿到前天的日期。
+     *
+     * @param from 窗口起点（含），由调用方按本地日历算好
+     */
+    @Query(
+        "SELECT MAX(date) FROM metric " +
+            "WHERE sourceType = :source AND bucket = :bucket AND date BETWEEN :from AND :today",
+    )
+    suspend fun latestDateWithBucket(
+        source: String,
+        bucket: String,
+        from: String,
+        today: String,
+    ): String?
+
     @Upsert
     suspend fun upsert(metric: MetricEntity)
 
@@ -288,12 +310,6 @@ interface DashboardCardDao {
 
     @Query("UPDATE dashboard_card SET tabId = :tabId WHERE cardId = :cardId")
     suspend fun moveToTab(cardId: String, tabId: String)
-}
-
-/** 仪表盘卡片的可增删类型。见 [DashboardCardDao.insert] 的说明 */
-object DashboardCardInsert {
-    /** 页签已存在同类型的卡，被唯一索引挡住 */
-    const val FAILED_DUPLICATE = -1L
 }
 
 @Dao

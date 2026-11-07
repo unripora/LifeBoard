@@ -9,7 +9,12 @@ import com.lifeboard.core.model.StreakInfo
 import com.lifeboard.core.model.TaskConfig
 import com.lifeboard.core.util.Dates
 import com.lifeboard.server.health.SourceHealthChecker
+import com.lifeboard.server.db.DashboardCardEntity
 import com.lifeboard.server.db.LifeBoardDatabase
+import com.lifeboard.server.metric.MetricQueryService
+import com.lifeboard.server.metric.MetricResult
+import com.lifeboard.server.metric.readCard
+import com.lifeboard.server.dashboard.CardType
 import com.lifeboard.server.notice.toRuleSchedule
 import com.lifeboard.server.panel.TaskRepository
 import kotlinx.coroutines.Dispatchers
@@ -44,6 +49,20 @@ data class TaskRow(
     val currentStreak: Int get() = streak?.currentStreak ?: 0
     val bestStreak: Int get() = streak?.bestStreak ?: 0
 }
+
+/**
+ * 面板上的一张指标卡的读数（M6b2b）。
+ *
+ * 卡片列表本身来自 `DashboardViewModel`，这里只负责「每张卡读出来是多少」。
+ * 两者分开是因为读数的时机完全不同：列表在布局变化时变，读数在采集完成后变。
+ *
+ * @property tabId 这张卡在哪个页签里，用来把同一页签的卡一次读完
+ */
+data class MetricCardState(
+    val cardId: String,
+    val tabId: String,
+    val result: MetricResult,
+)
 
 /**
  * 首页仪表盘状态。
@@ -87,6 +106,13 @@ class PanelViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 规则 id → 生效摘要，任务行据此显示「规则：每日 · 09:00–09:30」 */
     private val _ruleSummaries = MutableStateFlow<Map<Long, String>>(emptyMap())
+
+    /**
+     * 指标卡的读数。独立于 [state]：读一张卡要解析数据源、可能还要查插件注册表，
+     * 塞进那个 8 路 combine 会让整页每次都跟着重算，而面板平时压根没有指标卡。
+     */
+    private val _metricStates = MutableStateFlow<List<MetricCardState>>(emptyList())
+    val metricStates: StateFlow<List<MetricCardState>> = _metricStates.asStateFlow()
 
     private val today get() = Dates.todayString()
 
@@ -229,6 +255,39 @@ class PanelViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun reloadWeek() {
         viewModelScope.launch { reloadWeekSuspend() }
+    }
+
+    /**
+     * 读一遍某个页签里的指标卡。
+     *
+     * 由界面在卡片列表变化或 [refreshKey] 变化时调用，不自己挂观察：
+     * `metric` 表没有暴露 Flow（采集是批量 upsert，逐行 emit 会把主线程刷爆），
+     * 拉取式读一次反而更可控。
+     *
+     * 读失败（源被删、插件卸了）不抛到这里，`MetricQueryService` 会折成
+     * [MetricResult.SourceUnavailable]，卡片自己显示该说的话。
+     */
+    fun loadMetrics(tabId: String, cards: List<DashboardCardEntity>) {
+        val metricCards = cards.filter { it.type == CardType.METRIC.name }
+        if (metricCards.isEmpty()) {
+            _metricStates.value = _metricStates.value.filterNot { it.tabId == tabId }
+            return
+        }
+        viewModelScope.launch {
+            val today = Dates.todayString()
+            val states = withContext(Dispatchers.IO) {
+                metricCards.map { card ->
+                    MetricCardState(
+                        cardId = card.cardId,
+                        tabId = tabId,
+                        result = MetricQueryService.readCard(getApplication(), card, today),
+                    )
+                }
+            }
+            // 只替换本页签的部分：别的页签的读数还留在列表里，
+            // 切回去时不用再等一次采集
+            _metricStates.value = _metricStates.value.filterNot { it.tabId == tabId } + states
+        }
     }
 
     /**
