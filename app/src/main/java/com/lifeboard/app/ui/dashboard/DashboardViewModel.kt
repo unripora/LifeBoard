@@ -251,16 +251,50 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
     fun moveCard(tabId: String, cardId: String, delta: Int) {
         if (delta == 0) return
         viewModelScope.launch(Dispatchers.IO) {
-            val cards = db.dashboardCardDao().getByTab(tabId).toMutableList()
+            val cards = db.dashboardCardDao().getByTab(tabId)
             val from = cards.indexOfFirst { it.cardId == cardId }
             if (from < 0) return@launch
-            val target = (from + delta).coerceIn(0, cards.lastIndex)
-            if (from == target) return@launch
-            cards.add(target, cards.removeAt(from))
-            db.withTransaction {
-                cards.forEachIndexed { index, card ->
-                    if (card.order != index) db.dashboardCardDao().setOrder(card.cardId, index)
-                }
+            reorder(tabId, from, (from + delta).coerceIn(0, cards.lastIndex))
+        }
+    }
+
+    /**
+     * 把卡片挪到页签内的第 [to] 个位置。拖拽松手时用这个。
+     *
+     * 与 [moveCardToTab] 差一个词但做的事完全不同：那个是跨页签、改 tabId，
+     * 这个是同页签内改顺序。名字接近是因为两件事在用户眼里都是「移动卡片」。
+     *
+     * [to] 会按当前卡片数夹紧：拖拽过程中列表可能刚好被别人改了
+     * （比如另一处删了一张卡），越界的下标不该让整条操作静默失败。
+     */
+    fun moveCardTo(tabId: String, cardId: String, to: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val cards = db.dashboardCardDao().getByTab(tabId)
+            val from = cards.indexOfFirst { it.cardId == cardId }
+            if (from < 0) return@launch
+            reorder(tabId, from, to)
+        }
+    }
+
+    /**
+     * 页签内把第 [from] 张卡挪到第 [to] 个位置，然后把整页的 order 重写成 0..n-1。
+     *
+     * 每次都重新读一次库里最新的顺序、按 cardId 定位，而不是相信界面传来的下标：
+     * 拖拽从按下到松手之间可能过了好几百毫秒，期间别的入口（按钮排序、
+     * 另一个页签的操作）都可能改过库。按 id 找位置，改完的顺序才是对的。
+     *
+     * 重写而不是只改这两行：order 只要出现重复或空洞，
+     * 「上移 / 下移」就会表现成点了没反应。
+     */
+    private suspend fun reorder(tabId: String, from: Int, to: Int) {
+        val cards = db.dashboardCardDao().getByTab(tabId).toMutableList()
+        if (from !in cards.indices) return
+        val target = to.coerceIn(0, cards.lastIndex)
+        if (from == target) return
+        cards.add(target, cards.removeAt(from))
+        db.withTransaction {
+            cards.forEachIndexed { index, card ->
+                if (card.order != index) db.dashboardCardDao().setOrder(card.cardId, index)
             }
         }
     }

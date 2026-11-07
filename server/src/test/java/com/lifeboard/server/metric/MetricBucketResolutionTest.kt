@@ -1,7 +1,9 @@
 package com.lifeboard.server.metric
 
+import com.lifeboard.core.model.SourceType
 import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.plugin.api.MetricSpec
+import com.lifeboard.plugin.api.SourceRef
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
@@ -63,5 +65,41 @@ class MetricBucketResolutionTest {
         MetricBucket.entries.forEach { bucket ->
             assertEquals(true, bucketLabelOf(bucket).isNotBlank())
         }
+    }
+
+    @Test
+    fun pluginCandidateResolvesSourceKeyPerMetric() {
+        // 一个插件声明两个指标时，选哪个指标就该存哪个指标的 sourceKey。
+        // 存错的结果是「卡上写着睡眠、显示的是步数」——而且不报任何错
+        val steps = MetricOption(metricKey = "steps", label = "步数", unit = "步")
+        val sleep = MetricOption(metricKey = "sleep", label = "睡眠", unit = "分钟")
+        // 候选上带的 sourceKey 是占位（用第一个指标拼的），选谁由 sourceKeyFor 决定
+        val candidate = MetricCandidate(
+            sourceKey = SourceRef.pluginKey("dev.foo.mihealth", "steps"),
+            displayName = "小米健康",
+            metrics = listOf(steps, sleep),
+        )
+
+        assertEquals(
+            SourceRef.pluginKey("dev.foo.mihealth", "sleep"),
+            candidate.sourceKeyFor(sleep),
+        )
+        assertEquals(
+            SourceRef.pluginKey("dev.foo.mihealth", "steps"),
+            candidate.sourceKeyFor(steps),
+        )
+    }
+
+    @Test
+    fun builtinCandidateIgnoresMetricKeyForSourceKey() {
+        // 内置源的 key 与指标无关：它就是数据源枚举名，
+        // 拼上 metricKey 会得到一个解析不出来的键
+        val option = MetricOption(metricKey = null, label = "步数", unit = "步")
+        val candidate = MetricCandidate(
+            sourceKey = SourceType.MI_HEALTH.name,
+            displayName = "小米健康",
+            metrics = listOf(option),
+        )
+        assertEquals(SourceType.MI_HEALTH.name, candidate.sourceKeyFor(option))
     }
 }

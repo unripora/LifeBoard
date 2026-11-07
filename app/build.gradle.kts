@@ -17,6 +17,18 @@ android {
         versionName = "0.1.0"
     }
 
+    // 内测分发用的签名：复用 AGP 自带的 debug 证书，这样 release 包也能直接安装，
+    // 且与 debug 包的签名一致——同一个设备上换装不需要先卸载。
+    //
+    // 请注意这不是生产签名。密钥库在 ~/.android/debug.keystore，口令公开为 android，
+    // 任何人拿到它都能签出「同签名」的包。等项目要正式发布时必须换成自己的密钥库，
+    // 并去掉这里的 signingConfigs.release。
+    signingConfigs {
+        create("release") {
+            initWith(getByName("debug"))
+        }
+    }
+
     // LSPosed 加载 Legacy 模块入口时走 LspModuleClassLoader（ByteBufferDexClassLoader），
     // 加载的是 APK 内全部 dex，入口类在哪个 classesN.dex 都能正常加载。
     // 详见 docs/postmortem_lsposed_injection.md：曾误判"入口必须在 classes.dex"，
@@ -27,6 +39,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
