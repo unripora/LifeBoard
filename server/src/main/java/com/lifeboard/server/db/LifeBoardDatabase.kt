@@ -24,7 +24,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         DashboardTabEntity::class,
         DashboardCardEntity::class,
     ],
-    version = 11,
+    version = 12,
     exportSchema = true,
 )
 abstract class LifeBoardDatabase : RoomDatabase() {
@@ -186,6 +186,63 @@ abstract class LifeBoardDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v11 → v12：给 dashboard_card 加「页签外键」与「同页签同类型唯一」两条约束。
+         *
+         * ## 为什么是新版而不是改 MIGRATION_10_11
+         *
+         * v11 已经发布（M6b1 随版本出门），它的建表语句不能再改：
+         * 已经升到 11 的用户不会再跑一次 10→11。约束只能靠新迁移补。
+         *
+         * ## SQLite 不能 ALTER 加约束，只能重建表
+         *
+         * 走标准的「建新表 → 搬数据 → 删旧表 → 改名 → 重建索引」。
+         * 搬数据时用 `INSERT OR IGNORE`、并且加了 `WHERE tabId IN (SELECT tabId FROM dashboard_tab)`
+         * 过滤：老库里如果已经存在孤儿卡（页签被删而卡片没清干净），
+         * 直接搬会被外键拒绝，整个迁移失败、应用起不来。宁可丢掉那条脏数据——
+         * 它本来也永远不会被显示出来。
+         *
+         * 唯一索引同理：万一老库里已有重复行，`OR IGNORE` 只保留先读到的那条。
+         */
+        internal val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `dashboard_card_new` (
+                        `cardId` TEXT NOT NULL,
+                        `type` TEXT NOT NULL,
+                        `sourceKey` TEXT,
+                        `metricKey` TEXT,
+                        `order` INTEGER NOT NULL,
+                        `tabId` TEXT NOT NULL,
+                        PRIMARY KEY(`cardId`),
+                        FOREIGN KEY(`tabId`) REFERENCES `dashboard_tab`(`tabId`)
+                            ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    INSERT OR IGNORE INTO `dashboard_card_new`
+                        (`cardId`, `type`, `sourceKey`, `metricKey`, `order`, `tabId`)
+                    SELECT `cardId`, `type`, `sourceKey`, `metricKey`, `order`, `tabId`
+                    FROM `dashboard_card`
+                    WHERE `tabId` IN (SELECT `tabId` FROM `dashboard_tab`)
+                    """.trimIndent(),
+                )
+                db.execSQL("DROP TABLE `dashboard_card`")
+                db.execSQL("ALTER TABLE `dashboard_card_new` RENAME TO `dashboard_card`")
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_dashboard_card_tabId` " +
+                        "ON `dashboard_card` (`tabId`)",
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_dashboard_card_tabId_type` " +
+                        "ON `dashboard_card` (`tabId`, `type`)",
+                )
+            }
+        }
+
         @Volatile
         private var instance: LifeBoardDatabase? = null
 
@@ -202,6 +259,7 @@ abstract class LifeBoardDatabase : RoomDatabase() {
                     MIGRATION_8_9,
                     MIGRATION_9_10,
                     MIGRATION_10_11,
+                    MIGRATION_11_12,
                 )
                     .fallbackToDestructiveMigration()
                     .build().also { instance = it }

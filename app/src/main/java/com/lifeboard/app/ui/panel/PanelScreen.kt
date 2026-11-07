@@ -39,6 +39,7 @@ import com.lifeboard.app.ui.theme.GlassProgress
 import com.lifeboard.core.model.RemindLevel
 import com.lifeboard.core.util.Dates
 import com.lifeboard.server.dashboard.CardType
+import com.lifeboard.server.dashboard.DashboardCards
 import com.lifeboard.server.health.SourceHealthChecker
 import java.time.LocalDate
 
@@ -83,6 +84,19 @@ fun PanelScreen(
         .collectAsStateWithLifecycle(initialValue = emptyList())
     val cards = dashVm.cardsFor(tabId, dashState.ready, storedCards)
 
+    // 编辑态：显示每张卡的操作按钮与底部「添加卡片」。
+    // 不做默认常驻的拖拽手柄——这个页面天天用，常驻的编辑控件会把
+    // 卡片间距撑开，视觉上和改造前就不再一致了（M6a 的验收标准）
+    var editing by remember(tabId) { mutableStateOf(false) }
+    var adding by remember(tabId) { mutableStateOf(false) }
+
+    // 「已存在类型」按卡片行本身算，而不是按上面渲染用的 CardType：
+    // 加卡片的判重必须和库里的 (tabId, type) 唯一索引看同一份事实
+    val existingTypes = remember(storedCards) {
+        storedCards.mapNotNull { DashboardCards.parseType(it.type) }
+    }
+    val addable = DashboardCards.addableTo(existingTypes)
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -90,29 +104,62 @@ fun PanelScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End,
+        ) {
+            TextButton(onClick = { editing = !editing }) {
+                Text(if (editing) "完成" else "调整卡片")
+            }
+        }
+
         if (cards.isEmpty()) {
-            // 只有确实读完了才显示空态：未就绪时上面已经用默认卡片兜住。
-            // 文案只陈述现状，不提「添加卡片」——那一步还没做，
-            // 写了按钮却没有入口，用户只会以为界面坏了
-            Text(
-                "这是一个空页签。后续版本会支持在这里添加和移动卡片。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            // 只有确实读完了才显示空态：未就绪时上面已经用默认卡片兜住
+            EmptyTabHint(
+                onAdd = { adding = true },
+                // 用户页签才有「添加卡片」；面板被清空时同样可以加回去
+                canAdd = DashboardCards.isCardTab(tabId) && addable.isNotEmpty(),
             )
         }
-        cards.forEach { type ->
-            CardHost(
-                type = type,
-                state = state,
-                onRefresh = { vm.reevaluate() },
-                onMarkDone = { vm.markDone(it) },
-                onEditTask = onEditTask,
-                onNewTask = onNewTask,
-                onToggle = { vm.toggleEnabled(it) },
-                onDelete = { pendingDelete = it },
-                // 只有系统权限类数据源会带 actionKey，宿主直接跳系统设置页
-                onOpenSourceSettings = { vm.openSourceSettings(it) },
-            )
+
+        cards.forEachIndexed { index, type ->
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (editing) {
+                    // 卡片 id 从库里按顺序取：渲染列表和卡片行是同一个 order 排序的，
+                    // 所以下标能对上。对不上（库里有一条认不出的类型）时不给操作按钮，
+                    // 免得「上移」动到的是另一张卡
+                    val row = storedCards.getOrNull(index)
+                    CardEditBar(
+                        title = DashboardCards.labelOf(type),
+                        canMoveUp = index > 0,
+                        canMoveDown = index < cards.lastIndex,
+                        onMoveUp = { row?.let { dashVm.moveCard(tabId, it.cardId, -1) } },
+                        onMoveDown = { row?.let { dashVm.moveCard(tabId, it.cardId, 1) } },
+                        onDelete = { row?.let { dashVm.deleteCard(tabId, it.cardId) } },
+                        enabled = row != null,
+                    )
+                }
+                CardHost(
+                    type = type,
+                    state = state,
+                    onRefresh = { vm.reevaluate() },
+                    onMarkDone = { vm.markDone(it) },
+                    onEditTask = onEditTask,
+                    onNewTask = onNewTask,
+                    onToggle = { vm.toggleEnabled(it) },
+                    onDelete = { pendingDelete = it },
+                    // 只有系统权限类数据源会带 actionKey，宿主直接跳系统设置页
+                    onOpenSourceSettings = { vm.openSourceSettings(it) },
+                )
+            }
+        }
+
+        // 编辑态才出现：没有任何卡可加时整块不显示，避免一个点不动的按钮
+        if (editing && DashboardCards.isCardTab(tabId) && addable.isNotEmpty()) {
+            OutlinedButton(
+                onClick = { adding = true },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("添加卡片") }
         }
 
         // 提示文本不是卡片：它是一过性的状态说明，没有摆放/拖拽的意义
@@ -123,6 +170,20 @@ fun PanelScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+    }
+
+    if (adding) {
+        AddCardDialog(
+            candidates = addable,
+            onDismiss = { adding = false },
+            onPick = { type ->
+                dashVm.addCard(tabId, type) { ok ->
+                    // 失败（撞唯一索引或被策略挡下）时把弹窗留在原地：
+                    // 关掉再让用户重开一遍，等于什么都没说
+                    if (ok) adding = false
+                }
+            },
+        )
     }
 
     pendingDelete?.let { row ->
@@ -195,6 +256,110 @@ private fun CardHost(
         // 免得布局里残留一个空壳占位
         CardType.METRIC -> Unit
     }
+}
+
+/**
+ * 空页签的提示与入口（M6b2a）。
+ *
+ * 之前这里只有一句「后续版本会支持添加卡片」，那是个死胡同：
+ * 用户新建页签之后看到的就是它，而下一步该做什么页面没说。
+ * 现在直接给按钮，点开就是加卡选择器。
+ *
+ * @param canAdd 可选卡片已经全在这个页签上了，或者这个页签根本不能放卡
+ */
+@Composable
+private fun EmptyTabHint(onAdd: () -> Unit, canAdd: Boolean) {
+    GlassCard(modifier = Modifier.fillMaxWidth()) {
+        Text("这个页签还没有卡片", style = MaterialTheme.typography.titleSmall)
+        Text(
+            if (canAdd) {
+                "可以从下面挑一张卡片放进来。"
+            } else {
+                "已有的卡片都放上了。"
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (canAdd) {
+            Button(onClick = onAdd) { Text("添加卡片") }
+        }
+    }
+}
+
+/**
+ * 编辑态下压在每张卡上方的一条操作栏。
+ *
+ * 放在卡片外面而不是塞进 `GlassCard` 里：卡片内部的排版是 M6a 定死的，
+ * 掺进编辑控件会让它在非编辑态也跟着变高，视觉上就不再和改造前一致。
+ * 用「上移 / 下移」而不是拖拽：拖拽要做到能用（判定区、滚动冲突、边缘吸附）
+ * 是 6.8 的独立任务，按钮是它之前唯一不会误导人的排序手段。
+ */
+@Composable
+private fun CardEditBar(
+    title: String,
+    canMoveUp: Boolean,
+    canMoveDown: Boolean,
+    onMoveUp: () -> Unit,
+    onMoveDown: () -> Unit,
+    onDelete: () -> Unit,
+    enabled: Boolean,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Text(
+            title,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f),
+        )
+        TextButton(onClick = onMoveUp, enabled = enabled && canMoveUp) { Text("上移") }
+        TextButton(onClick = onMoveDown, enabled = enabled && canMoveDown) { Text("下移") }
+        if (enabled) {
+            TextButton(onClick = onDelete) { Text("移除") }
+        }
+    }
+}
+
+/**
+ * 加卡选择器。
+ *
+ * 只列 [DashboardCards.OFFERABLE] 里的一类东西，不做二级分类：
+ * 现在一共四个选项，加一层「数据源 → 指标」的树反而让人多点两下。
+ * METRIC 卡要选的源和指标是 M6b2b 的事，那之后这里会多一个分支。
+ */
+@Composable
+private fun AddCardDialog(
+    candidates: List<CardType>,
+    onDismiss: () -> Unit,
+    onPick: (CardType) -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("添加卡片") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                if (candidates.isEmpty()) {
+                    Text(
+                        "没有可添加的卡片了。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                candidates.forEach { type ->
+                    TextButton(
+                        onClick = { onPick(type) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text(DashboardCards.labelOf(type)) }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
 }
 
 /**

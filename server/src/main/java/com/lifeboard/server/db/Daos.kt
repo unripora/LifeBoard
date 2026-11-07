@@ -263,6 +263,19 @@ interface DashboardCardDao {
     @Upsert
     suspend fun upsertAll(cards: List<DashboardCardEntity>)
 
+    /**
+     * 插入一张卡，被约束挡住时返回行 id ≤ 0。
+     *
+     * 为什么不用 @Upsert：upsert 的语义是「主键冲突就覆盖」，
+     * 而卡片 id 是调用方新造的，重复插入只会悄悄覆盖一张已有的卡。
+     * 用 `IGNORE` 让唯一索引冲突变成「什么都没发生」（返回 -1），调用方据此知道自己撞上了约束。
+     *
+     * 注意 `onConflict = IGNORE` 对**外键冲突不生效**：插进不存在的页签会直接抛
+     * `SQLiteConstraintException`，调用方仍需 catch。
+     */
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insert(card: DashboardCardEntity): Long
+
     @Query("DELETE FROM dashboard_card WHERE cardId = :cardId")
     suspend fun deleteById(cardId: String)
 
@@ -275,6 +288,12 @@ interface DashboardCardDao {
 
     @Query("UPDATE dashboard_card SET tabId = :tabId WHERE cardId = :cardId")
     suspend fun moveToTab(cardId: String, tabId: String)
+}
+
+/** 仪表盘卡片的可增删类型。见 [DashboardCardDao.insert] 的说明 */
+object DashboardCardInsert {
+    /** 页签已存在同类型的卡，被唯一索引挡住 */
+    const val FAILED_DUPLICATE = -1L
 }
 
 @Dao
