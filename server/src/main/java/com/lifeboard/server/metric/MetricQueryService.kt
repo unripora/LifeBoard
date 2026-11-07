@@ -8,6 +8,7 @@ import com.lifeboard.plugin.api.MetricSpec
 import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.server.db.DashboardCardEntity
 import com.lifeboard.server.db.LifeBoardDatabase
+import com.lifeboard.server.plugin.PluginManager
 import com.lifeboard.server.source.SourceRegistry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -98,15 +99,7 @@ object MetricQueryService {
             .getOne(sourceKey, date, bucket.name)
             ?: return@withContext MetricResult.NoData
 
-        MetricResult.Value(
-            MetricReading(
-                value = row.value,
-                title = "${resolved.displayName} · ${bucketLabelOf(bucket)}",
-                unit = bucket.unit,
-                bucket = bucket,
-                date = row.date,
-            ),
-        )
+        MetricResult.Value(resolved.toReading(row.value, row.date))
     }
 
     /**
@@ -140,15 +133,7 @@ object MetricQueryService {
         val row = dao.getOne(sourceKey, date, bucket.name)
             ?: return@withContext MetricResult.NoData
 
-        MetricResult.Value(
-            MetricReading(
-                value = row.value,
-                title = "${resolved.displayName} · ${bucketLabelOf(bucket)}",
-                unit = bucket.unit,
-                bucket = bucket,
-                date = row.date,
-            ),
-        )
+        MetricResult.Value(resolved.toReading(row.value, row.date))
     }
 
     /**
@@ -164,14 +149,40 @@ object MetricQueryService {
     ): Resolved {
         val source = resolveExisting(context, sourceKey)
 
-        // 显式给出的 metricKey 优先：插件源一个源能产出多个指标，
-        // 只按源的默认量纲去读，会把「睡眠」读成「步数」
+        // 插件源必须走注册表：插件的 metricKey 是它自己起的名字（如 `steps`、
+        // `DEMO_STEPS`），不是 MetricBucket 枚举名，所以 MetricSpec.bucketOf 认不出，
+        // 会一路掉到 COUNT 上——读出来的永远是空，或者更糟，读到别的量纲的行。
+        // 量纲只能来自插件声明的 MetricSpec
+        if (source is SourceRef.Plugin) {
+            return resolvePlugin(context, source)
+        }
+
         val bucket = metricKey?.let { MetricSpec.bucketOf(it) }
             ?: defaultBucketOfKey(sourceKey)
-            ?: (source as? SourceRef.Custom)?.bucket
             ?: source.bucket
 
         return Resolved(displayName = source.displayName, bucket = bucket)
+    }
+
+    /**
+     * 插件源：从已加载插件的声明里取量纲与展示名。
+     *
+     * 插件被卸载、或新版本不再声明这个指标时抛 [SourceUnresolvable]：
+     * 对卡片来说这就是「源已经不存在」，应该让用户重新绑定，
+     * 而不是拿一个猜出来的量纲继续读。
+     */
+    private fun resolvePlugin(context: Context, source: SourceRef.Plugin): Resolved {
+        val loaded = PluginManager.loaded().firstOrNull { it.pluginId == source.pluginId }
+            ?: throw SourceUnresolvable(source.key)
+        val spec = loaded.metrics[source.metricKey]
+            ?: throw SourceUnresolvable(source.key)
+
+        return Resolved(
+            displayName = "${loaded.plugin.displayName}·${spec.displayName}",
+            bucket = spec.bucket,
+            unit = spec.unit,
+            metricLabel = spec.displayName,
+        )
     }
 
     /**
@@ -191,7 +202,31 @@ object MetricQueryService {
         return resolved
     }
 
-    private data class Resolved(val displayName: String, val bucket: MetricBucket)
+    /**
+     * 解析好的一次读取：读哪一桶、叫什么、单位是什么。
+     *
+     * @property unit 单位。插件可以自己声明带单位的展示（如「步」），
+     *   所以不能统一取 `bucket.unit`
+     * @property metricLabel 指标在标题里的名字。插件给的是它自己声明的
+     *   displayName（「步数」），内置源与自建源没有声明过，用量的中文名
+     */
+    private data class Resolved(
+        val displayName: String,
+        val bucket: MetricBucket,
+        val unit: String = bucket.unit,
+        val metricLabel: String = bucketLabelOf(bucket),
+    ) {
+        /** 卡片标题：「源名 · 指标名」 */
+        val title: String get() = "$displayName · $metricLabel"
+
+        fun toReading(value: Double, date: String) = MetricReading(
+            value = value,
+            title = title,
+            unit = unit,
+            bucket = bucket,
+            date = date,
+        )
+    }
 }
 
 /** 源已经不存在了。见 [MetricQueryService.resolveExisting] */
@@ -227,27 +262,80 @@ data class MetricOption(
  * 与 `SourceRegistry.selectable` 的区别：那一份是给规则用的（能采集的源），
  * 这里还要再过滤掉读不出量的源，并把指标展开成卡片能绑的键。
  *
- * 插件源不在列表里：宿主的插件注册表还没有暴露「已装插件声明了哪些指标」，
- * 硬列出来只能给出无法解析的占位键（`MetricSpec.bucketOf` 认不出插件自定义的
- * metricKey）。等注册表接上再补，见 M6b2b 的遗留项。
+ * ## 三种源各自怎么来
+ *
+ * - 内置源：一个源一种量纲，只有一项可选。量与含义由 `defaultBucketOfKey` 给出
+ * - 自建源：同上，量纲存在它自己那行里
+ * - 插件源：**一个插件可以声明多个指标**（小米健康同时给步数与睡眠），
+ *   所以按 `MetricSpec` 逐个展开，每项都带 metricKey——插件不认识
+ *   `MetricBucket` 枚举名，metricKey 是卡片唯一能定位到它的东西
+ *
+ * 插件只列 [PluginManager.loaded] 里的，也就是「已装且已信任」。
+ * 未信任的插件一列出来，用户加完卡只会看到「源已不存在」。
  */
 suspend fun MetricQueryService.candidates(context: Context): List<MetricCandidate> =
     withContext(Dispatchers.IO) {
-        SourceRegistry.selectable(context).mapNotNull { source ->
+        val builtinAndCustom = SourceRegistry.selectable(context).mapNotNull { source ->
             val options = when (source) {
-                // 内置源一个源一种量纲，options 只有一项
                 is SourceRef.Builtin -> {
                     val bucket = defaultBucketOfKey(source.key) ?: return@mapNotNull null
                     listOf(MetricOption(null, bucketLabelOf(bucket), bucket.unit))
                 }
                 is SourceRef.Custom ->
                     listOf(MetricOption(null, bucketLabelOf(source.bucket), source.bucket.unit))
-                // 插件源：宿主要知道插件声明了哪些指标，现在拿不到
+                // 插件源不在这一批里，下面单独展开
                 is SourceRef.Plugin -> return@mapNotNull null
             }
             MetricCandidate(source.key, source.displayName, options)
         }
+        builtinAndCustom + pluginCandidates()
     }
+
+/**
+ * 已加载插件的指标，按插件聚成一组。
+ *
+ * 每个插件聚成**一个** [MetricCandidate] 而不是每个指标一个：
+ * 选择器第一屏应该显示「小米健康」，点进去才看到「步数 / 睡眠」。
+ * 七个指标摊平在第一屏，用户得自己从名字里挤出它属于哪个插件。
+ */
+private fun pluginCandidates(): List<MetricCandidate> =
+    PluginManager.loaded()
+        .filter { it.trusted }
+        .mapNotNull { loaded ->
+            val options = loaded.plugin.metrics.map { spec ->
+                MetricOption(
+                    // 插件源的 metricKey 必须存：它不是量纲枚举名，
+                    // 没有它就读不出这个指标
+                    metricKey = spec.metricKey,
+                    label = spec.displayName,
+                    unit = spec.unit,
+                )
+            }
+            if (options.isEmpty()) return@mapNotNull null
+
+            MetricCandidate(
+                // 卡片存的是 per-metric 的落库键，而这里一个插件一组、
+                // 组内有多个指标，所以 sourceKey 由选中的 metricKey 再拼出来。
+                // 见 MetricOption.toSourceKey
+                sourceKey = SourceRef.pluginKey(loaded.pluginId, options.first().metricKey!!),
+                displayName = loaded.plugin.displayName,
+                metrics = options,
+            )
+        }
+
+/**
+ * 选中某个指标后，卡片该存的 sourceKey。
+ *
+ * 插件源每行数据的 key 都是 `PLUGIN_{id}:{metricKey}`（见 [SourceRef.pluginKey]），
+ * 所以一个插件里的两个指标是两个不同的 sourceKey，而不是同一个源的两个指标。
+ *
+ * 内置源与自建源的 key 与指标无关，直接用候选上的那个。
+ */
+fun MetricCandidate.sourceKeyFor(option: MetricOption): String {
+    val metricKey = option.metricKey ?: return sourceKey
+    val plugin = SourceRef.parsePluginKey(sourceKey) ?: return sourceKey
+    return SourceRef.pluginKey(plugin.first, metricKey)
+}
 
 /**
  * 量纲的中文名。

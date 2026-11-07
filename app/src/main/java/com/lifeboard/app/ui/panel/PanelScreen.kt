@@ -1,6 +1,7 @@
 package com.lifeboard.app.ui.panel
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,7 +22,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -29,9 +32,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.lifeboard.app.ui.dashboard.DashboardViewModel
@@ -48,6 +55,7 @@ import com.lifeboard.server.metric.MetricQueryService
 import com.lifeboard.server.metric.MetricReading
 import com.lifeboard.server.metric.MetricResult
 import com.lifeboard.server.metric.candidates
+import com.lifeboard.server.metric.sourceKeyFor
 import java.time.LocalDate
 
 /**
@@ -115,6 +123,18 @@ fun PanelScreen(
     }
     val addable = DashboardCards.addableTo(existingTypes)
 
+    // 拖拽排序（M6.8）。只在编辑态生效，松手时一次性把结果写回库里
+    val drag = rememberCardDrag(
+        count = cards.size,
+        onDrop = { from, to ->
+            // 用「把这张卡挪到目标下标」而不是两两交换：
+            // 从 0 拖到 3 是三个位置的关系，交换会让中间两张卡平白换位
+            storedCards.getOrNull(from)?.let { row ->
+                dashVm.moveCardTo(tabId, row.cardId, to)
+            }
+        },
+    )
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -141,7 +161,17 @@ fun PanelScreen(
         }
 
         cards.forEachIndexed { index, type ->
-            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .dragHandle(
+                        enabled = editing,
+                        index = index,
+                        count = cards.size,
+                        drag = drag,
+                    ),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
                 if (editing) {
                     // 卡片 id 从库里按顺序取：渲染列表和卡片行是同一个 order 排序的，
                     // 所以下标能对上。对不上（库里有一条认不出的类型）时不给操作按钮，
@@ -374,8 +404,9 @@ private fun formatMetricValue(reading: MetricReading): String =
  * 指标卡的数据源 + 指标选择器（M6b2b）。
  *
  * 源和指标分两屏：内置源与自建源各只有一个指标，第一屏直接落到指标上会显得多余；
- * 而插件源将来可能有多个。所以「选了源之后 if 只有一项就立刻选完，否则展开选指标」——
- * 现在所有源都只有一项，实际是点源即完成，但结构上不挡住插件源以后的动作。
+ * 而插件源通常有多个（小米健康同时发步数与睡眠）。所以「选了源之后
+ * if 只有一项就立刻选完，否则展开选指标」——内置源与自建源点一下即完成，
+ * 插件源多一屏。
  */
 @Composable
 private fun MetricSourcePickerDialog(
@@ -415,12 +446,23 @@ private fun MetricSourcePickerDialog(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
 
-                    // 第二屏：这个源的指标。现在只会有一项
+                    // 第二屏：这个源的指标。插件可有多个，内置/自建只有一项
                     expanded != null -> expanded!!.metrics.forEach { option ->
+                        val candidate = expanded!!
                         TextButton(
-                            onClick = { onPick(expanded!!.sourceKey, option.metricKey) },
+                            onClick = {
+                                onPick(candidate.sourceKeyFor(option), option.metricKey)
+                            },
                             modifier = Modifier.fillMaxWidth(),
-                        ) { Text("${expanded!!.displayName} · ${option.label}") }
+                        ) {
+                            Text(
+                                if (option.unit.isBlank()) {
+                                    "${candidate.displayName} · ${option.label}"
+                                } else {
+                                    "${candidate.displayName} · ${option.label}（${option.unit}）"
+                                },
+                            )
+                        }
                     }
 
                     else -> candidates.forEach { candidate ->
@@ -428,7 +470,7 @@ private fun MetricSourcePickerDialog(
                             onClick = {
                                 if (candidate.metrics.size == 1) {
                                     val only = candidate.metrics.first()
-                                    onPick(candidate.sourceKey, only.metricKey)
+                                    onPick(candidate.sourceKeyFor(only), only.metricKey)
                                 } else {
                                     expanded = candidate
                                 }
@@ -439,7 +481,8 @@ private fun MetricSourcePickerDialog(
                                 if (candidate.metrics.size == 1) {
                                     "${candidate.displayName} · ${candidate.metrics.first().label}"
                                 } else {
-                                    candidate.displayName
+                                    // 多项时显示条数，让用户知道点进去还有选择
+                                    "${candidate.displayName}（${candidate.metrics.size} 个指标）"
                                 },
                             )
                         }
@@ -457,6 +500,188 @@ private fun MetricSourcePickerDialog(
         },
     )
 }
+
+/**
+ * 卡片拖拽排序的状态（M6.8）。
+ *
+ * ## 为什么不用现成的 reorderable 库
+ *
+ * 计划里写明了不引三方拖拽库。而这个场景比通用库简单得多：
+ * 列表是整页竖向滚动的固定几项、每项高度不同、只在编辑态可拖。
+ *
+ * ## 为什么要记每项高度
+ *
+ * 卡片高度不固定（待办卡随任务条数变高）。按「固定行高 × 下标」算当前位置，
+ * 拖过一张待办卡就会跳到错误的槽位。所以拖拽开始时实测每项高度，
+ * 再用累计高度判断当前落在第几个槽。
+ *
+ * ## 为什么拖拽期间要占位而不真的移动列表
+ *
+ * 真的把列表项调换位置会让被拖的那张卡在手指下瞬移，看着像 bug。
+ * 这里的做法是：被拖的项原地不动、加位移跟随手指；其余项按「它会插到哪」
+ * 实时让位。松手时才提交最终顺序。
+ */
+@Stable
+private class CardDragState(
+    private var onDrop: (from: Int, to: Int) -> Unit,
+) {
+    /** 正在拖的下标；null 表示没在拖 */
+    var draggingIndex by mutableStateOf<Int?>(null)
+        private set
+
+    /** 手指相对按下点的竖向位移 */
+    var dragOffset by mutableFloatStateOf(0f)
+        private set
+
+    /** 当前算出来的目标槽位 */
+    var targetIndex by mutableStateOf<Int?>(null)
+        private set
+
+    /** 每项的实测高度（含间距），拖拽开始时填 */
+    private var itemHeights = mutableListOf<Float>()
+
+    /** 每项的顶部位置，由高度累加得出 */
+    private var itemTops: List<Float> = emptyList()
+
+    /** 换掉松手时的回调，见 [rememberCardDrag] 里的说明 */
+    fun updateDrop(block: (from: Int, to: Int) -> Unit) {
+        onDrop = block
+    }
+
+    /** 卡片数变了，旧的实测高度不再对应任何一项 */
+    fun resetMeasurements() {
+        itemHeights = mutableListOf()
+        itemTops = emptyList()
+    }
+
+    fun onDragStart(index: Int) {
+        draggingIndex = index
+        dragOffset = 0f
+        targetIndex = index
+    }
+
+    /** 记录实测高度。在拖拽开始前调用（见 [dragHandle] 的 onGloballyPositioned） */
+    fun recordItem(index: Int, height: Float) {
+        while (itemHeights.size <= index) itemHeights.add(0f)
+        itemHeights[index] = height
+        rebuildTops()
+    }
+
+    private fun rebuildTops() {
+        var acc = 0f
+        itemTops = itemHeights.map { h -> acc.also { acc += h } }
+    }
+
+    fun onDrag(delta: Float) {
+        dragOffset += delta
+        val from = draggingIndex ?: return
+        if (itemHeights.isEmpty()) return
+        // 被拖项的中心落在哪个槽里，就算哪个位置。
+        // 用中心而不是顶边：顶边要求用户拖过整整一张卡的高度才认，
+        // 中心更接近「现在这张卡盖住了谁」
+        val center = itemTops.getOrElse(from) { 0f } +
+            itemHeights.getOrElse(from) { 0f } / 2f + dragOffset
+        targetIndex = slotAt(center, from)
+    }
+
+    /** 中心点在 [y] 时落在第几个槽；越界夹到两端 */
+    private fun slotAt(y: Float, fallback: Int): Int {
+        if (itemTops.isEmpty()) return fallback
+        itemTops.forEachIndexed { index, top ->
+            val bottom = top + itemHeights.getOrElse(index) { 0f }
+            if (y in top..bottom) return index
+        }
+        return if (y < 0f) 0 else itemHeights.lastIndex.coerceAtLeast(fallback)
+    }
+
+    /**
+     * 某一项在屏幕上应该额外偏移多少。
+     *
+     * 被拖的那项跟随手指；其余项如果正好夹在「原位置」与「目标位置」之间，
+     * 就朝反方向让出一格——这正是它松手后会变成的样子。
+     */
+    fun offsetFor(index: Int): Float {
+        val from = draggingIndex ?: return 0f
+        val to = targetIndex ?: return 0f
+        if (index == from) return dragOffset
+        val h = itemHeights.getOrElse(index) { 0f }
+        return when {
+            // 往后拖：中间这些项整体上移一格
+            from < to && index in (from + 1)..to -> -h
+            // 往前拖：中间这些项整体下移一格
+            to < from && index in to until from -> h
+            else -> 0f
+        }
+    }
+
+    fun onDragEnd() {
+        val from = draggingIndex
+        val to = targetIndex
+        draggingIndex = null
+        targetIndex = null
+        dragOffset = 0f
+        // 位置没变就不落库：一次误触不应该产生一次写操作
+        if (from != null && to != null && from != to) onDrop(from, to)
+    }
+
+    fun onDragCancel() {
+        draggingIndex = null
+        targetIndex = null
+        dragOffset = 0f
+    }
+
+    fun isDragging(index: Int): Boolean = draggingIndex == index
+}
+
+@Composable
+private fun rememberCardDrag(
+    count: Int,
+    onDrop: (from: Int, to: Int) -> Unit,
+): CardDragState {
+    val state = remember { CardDragState(onDrop) }
+    // 回调闭包会随重组换新，但状态对象是 remember 住的。
+    // 不更新的话松手时调用的还是第一次组合的那个 lambda，
+    // 它捕获的 tabId / storedCards 可能已经过期
+    state.updateDrop(onDrop)
+    // 卡片数变化（删了一张）时丢掉旧的实测高度，否则槽位会算到不存在的位置
+    LaunchedEffect(count) { state.resetMeasurements() }
+    return state
+}
+
+/**
+ * 给一张卡片接上长按拖动。
+ *
+ * 用 `Modifier.pointerInput` 而不是 `draggable`：需要在长按之后才开始跟手，
+ * 在此之前的手势要留给卡片内部（展开待办、点按钮）。
+ * `detectDragGesturesAfterLongPress` 正好是这个语义。
+ *
+ * 只在 [enabled] 时挂手势：非编辑态长按不应该有任何反应，
+ * 否则用户按着卡片想滚动列表会突然开始拖。
+ */
+private fun Modifier.dragHandle(
+    enabled: Boolean,
+    index: Int,
+    count: Int,
+    drag: CardDragState,
+): Modifier = if (!enabled) this else this
+    .zIndex(if (drag.isDragging(index)) 1f else 0f)
+    .graphicsLayer { translationY = drag.offsetFor(index) }
+    .onGloballyPositioned { coords ->
+        // 实测高度交给状态机。用尺寸而不是高度常量：
+        // 待办卡的条数会变，固定常量会让位置越拖越偏
+        drag.recordItem(index, coords.size.height.toFloat())
+    }
+    .pointerInput(index, count) {
+        detectDragGesturesAfterLongPress(
+            onDragStart = { drag.onDragStart(index) },
+            onDrag = { change, amount ->
+                change.consume()
+                drag.onDrag(amount.y)
+            },
+            onDragEnd = { drag.onDragEnd() },
+            onDragCancel = { drag.onDragCancel() },
+        )
+    }
 
 /**
  * 空页签的提示与入口（M6b2a）。
