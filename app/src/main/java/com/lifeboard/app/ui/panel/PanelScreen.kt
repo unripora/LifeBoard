@@ -33,6 +33,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.lifeboard.app.ui.dashboard.DashboardViewModel
 import com.lifeboard.app.ui.theme.GlassCard
 import com.lifeboard.app.ui.theme.GlassProgress
 import com.lifeboard.core.model.RemindLevel
@@ -60,11 +61,13 @@ import java.time.LocalDate
  */
 @Composable
 fun PanelScreen(
+    tabId: String,
     onEditTask: (Long) -> Unit,
     onNewTask: () -> Unit,
     /** 变化时重新判定数据源健康度（如刚完成小米账号登录） */
     refreshKey: Int = 0,
     vm: PanelViewModel = viewModel(),
+    dashVm: DashboardViewModel = viewModel(),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     var pendingDelete by remember { mutableStateOf<TaskRow?>(null) }
@@ -73,10 +76,12 @@ fun PanelScreen(
         if (refreshKey > 0) vm.refreshHealth()
     }
 
-    // 默认布局的顺序：与 M6a 之前的内联顺序完全一致，保证升级后视觉无变化
-    val cards = remember {
-        listOf(CardType.SCORE, CardType.TODO, CardType.WEEK, CardType.SOURCE_HEALTH)
-    }
+    // 卡片来自 dashboard_card 表。就绪前先用默认卡片顶一帧，
+    // 否则冷启动会先闪一下「没有卡片」的空页签
+    val dashState by dashVm.state.collectAsStateWithLifecycle()
+    val storedCards by dashVm.observeCards(tabId)
+        .collectAsStateWithLifecycle(initialValue = emptyList())
+    val cards = dashVm.cardsFor(tabId, dashState.ready, storedCards)
 
     Column(
         modifier = Modifier
@@ -85,6 +90,16 @@ fun PanelScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        if (cards.isEmpty()) {
+            // 只有确实读完了才显示空态：未就绪时上面已经用默认卡片兜住。
+            // 文案只陈述现状，不提「添加卡片」——那一步还没做，
+            // 写了按钮却没有入口，用户只会以为界面坏了
+            Text(
+                "这是一个空页签。后续版本会支持在这里添加和移动卡片。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         cards.forEach { type ->
             CardHost(
                 type = type,
