@@ -188,10 +188,18 @@ object PluginInstallService {
         }
     }
 
-    /** 读 manifest 里的 uses-feature，确认是给本应用的插件 */
+    /**
+     * 读 manifest 里的 uses-feature，确认是给本应用的插件。
+     *
+     * 必须**同时**带上 [PackageManager.GET_META_DATA]：只传 GET_SIGNING_CERTIFICATES 时，
+     * 框架按"只取签名"的路径解析，`reqFeatures` 保持 null，于是所有合法插件都会被判成
+     * "没有声明 lifeboard.plugin 特性"——正是真机上装不上 demo 插件的原因。
+     * GET_META_DATA 会触发完整清单解析，`reqFeatures` 才有值。
+     */
     private fun declaresPluginFeature(context: Context, archive: File): Boolean = runCatching {
         val pm = context.packageManager
-        val flags = android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES
+        val flags = android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES or
+            android.content.pm.PackageManager.GET_META_DATA
         val pi = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
             pm.getPackageArchiveInfo(
                 archive.absolutePath,
@@ -202,8 +210,11 @@ object PluginInstallService {
             pm.getPackageArchiveInfo(archive.absolutePath, flags)
         }
         // reqFeatures 读不到时按「没声明」处理：宁可拒绝，也不放进来路不明的包
-        pi?.reqFeatures?.any { it.name == "lifeboard.plugin" } == true
+        pi?.reqFeatures?.any { it.name == PLUGIN_FEATURE } == true
     }.getOrDefault(false)
+
+    /** 插件包必须在 manifest 里声明的 uses-feature 名，与 plugin-api/PLUGIN_SDK.md 一致 */
+    private const val PLUGIN_FEATURE = "lifeboard.plugin"
 
     /** 原子写入正式目录 */
     private fun commit(context: Context, staged: File, targetName: String): File? =
