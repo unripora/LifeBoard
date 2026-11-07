@@ -1,6 +1,7 @@
 package com.lifeboard.server.db
 
 import androidx.room.Entity
+import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
 
@@ -293,7 +294,24 @@ data class DashboardTabEntity(
  */
 @Entity(
     tableName = "dashboard_card",
-    indices = [Index("tabId")],
+    // 父表是 dashboard_tab：页签的删除动作在 Room 之外用事务显式写（见 DashboardViewModel.deleteTab），
+    // 这里的约束只是第二道防线——只删页签忘了删卡片时，插入孤儿行会直接失败，
+    // 而不是安静地留下一条永远不会被显示、也永远不会被清理的记录
+    foreignKeys = [
+        ForeignKey(
+            entity = DashboardTabEntity::class,
+            parentColumns = ["tabId"],
+            childColumns = ["tabId"],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
+    indices = [
+        Index("tabId"),
+        // 「同一页签里同一种卡只能有一张」。M6b2 起用户可以自己加卡，
+        // 界面上再挡一次也挡不住加卡选择器里连点两下——那是两次独立的读改写。
+        // 非 METRIC 卡没有绑定信息，UI 侧只能按类型去重，所以约束就落在 type 上。
+        Index(value = ["tabId", "type"], unique = true),
+    ],
 )
 data class DashboardCardEntity(
     @PrimaryKey val cardId: String,
