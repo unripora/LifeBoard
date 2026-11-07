@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.room.withTransaction
 import com.lifeboard.server.dashboard.CardType
+import com.lifeboard.server.dashboard.DashboardCards
 import com.lifeboard.server.dashboard.DashboardLayout
 import com.lifeboard.server.db.DashboardCardEntity
 import com.lifeboard.server.db.DashboardTabEntity
@@ -165,6 +166,111 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
             db.withTransaction {
                 tabs.forEachIndexed { index, tab ->
                     if (tab.order != index) db.dashboardTabDao().setOrder(tab.tabId, index)
+                }
+            }
+        }
+    }
+
+    // ---- 卡片（M6b2a） ----
+
+    /**
+     * 往页签末尾加一张卡。
+     *
+     * 三道检查都在这里做，而不是只靠界面把按钮禁掉：
+     * 1. 只有面板可以放卡（其余内置页签是整页，加了也显示不出来）
+     * 2. 类型必须在可选清单里（METRIC 卡要绑定数据源，等 M6b2b）
+     * 3. 该页签还没有同类型的卡
+     *
+     * 第 3 条与库里的 (tabId, type) 唯一索引重复，但不是多余的：
+     * 这里读一次再写，两次点击各跑一次仍然可能都通过读检查；
+     * 索引会在写的时候把后一次挡住，走 [DashboardCardInsert.FAILED_DUPLICATE] 分支。
+     */
+    fun addCard(tabId: String, type: CardType, onAdded: (Boolean) -> Unit = {}) {
+        viewModelScope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                if (!DashboardCards.isCardTab(tabId)) return@withContext false
+                if (type !in DashboardCards.OFFERABLE) return@withContext false
+                val existing = db.dashboardCardDao().getByTab(tabId)
+                if (existing.any { DashboardCards.parseType(it.type) == type }) return@withContext false
+                val card = DashboardCardEntity(
+                    // 与页签一致用时间戳：卡片表主键是字符串，同一毫秒连点两张会撞，
+                    // 所以拼上类型名把冲突概率压到足够低，真撞上了由唯一索引挡住
+                    cardId = "card_${System.currentTimeMillis()}_${type.name.lowercase()}",
+                    type = type.name,
+                    order = (existing.maxOfOrNull { it.order } ?: -1) + 1,
+                    tabId = tabId,
+                )
+                runCatching { db.dashboardCardDao().insert(card) > 0 }.getOrDefault(false)
+            }
+            onAdded(ok)
+        }
+    }
+
+    /**
+     * 删除一张卡。
+     *
+     * 不做「至少留一张」之类的保护：空页签本身就是合法状态，
+     * 界面上也给了重新添加的入口。拦着不让删，用户反而以为按钮坏了。
+     *
+     * 调用方必须给 [tabId]：卡片行删掉之后就再也查不出它原本在哪个页签了，
+     * 而删完要压紧该页签的 order，否则「下移」会跳过已被删除的序号，表现成点了没反应。
+     */
+    fun deleteCard(tabId: String, cardId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            db.withTransaction {
+                db.dashboardCardDao().deleteById(cardId)
+                db.dashboardCardDao().getByTab(tabId).forEachIndexed { index, row ->
+                    if (row.order != index) db.dashboardCardDao().setOrder(row.cardId, index)
+                }
+            }
+        }
+    }
+
+    /**
+     * 卡片在页签内上移 / 下移。
+     *
+     * [delta] 只接受 ±1。整体重写 order 而不是交换两行的值：
+     * 老数据里可能有重复或不连续的序号（比如删过卡），交换会把这些毛病留下来。
+     */
+    fun moveCard(tabId: String, cardId: String, delta: Int) {
+        if (delta == 0) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val cards = db.dashboardCardDao().getByTab(tabId).toMutableList()
+            val from = cards.indexOfFirst { it.cardId == cardId }
+            if (from < 0) return@launch
+            val target = (from + delta).coerceIn(0, cards.lastIndex)
+            if (from == target) return@launch
+            cards.add(target, cards.removeAt(from))
+            db.withTransaction {
+                cards.forEachIndexed { index, card ->
+                    if (card.order != index) db.dashboardCardDao().setOrder(card.cardId, index)
+                }
+            }
+        }
+    }
+
+    /**
+     * 把卡片挪到另一个页签的末尾。
+     *
+     * 目标页签已经有同类型的卡时整条操作放弃：跨页签搬一张「今日得分」过去，
+     * 结果是被唯一索引挡住、卡片凭空消失，比直接不让搬更让人困惑。
+     * 界面应该先把不可搬的目标页签置灰。
+     */
+    fun moveCardToTab(cardId: String, fromTabId: String, toTabId: String) {
+        if (fromTabId == toTabId) return
+        if (!DashboardCards.isCardTab(toTabId)) return
+        viewModelScope.launch(Dispatchers.IO) {
+            db.withTransaction {
+                val card = db.dashboardCardDao().getByTab(fromTabId)
+                    .firstOrNull { it.cardId == cardId } ?: return@withTransaction
+                val target = db.dashboardCardDao().getByTab(toTabId)
+                if (target.any { it.type == card.type }) return@withTransaction
+                db.dashboardCardDao().upsert(
+                    card.copy(tabId = toTabId, order = (target.maxOfOrNull { it.order } ?: -1) + 1),
+                )
+                // 源页签补上空洞，否则那边的「下移」会跳过一格
+                db.dashboardCardDao().getByTab(fromTabId).forEachIndexed { index, row ->
+                    if (row.order != index) db.dashboardCardDao().setOrder(row.cardId, index)
                 }
             }
         }
