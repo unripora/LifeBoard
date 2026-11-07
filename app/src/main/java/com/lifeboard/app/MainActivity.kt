@@ -9,6 +9,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -18,20 +19,30 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.Button
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.lifeboard.app.ui.dashboard.DashboardDefaults
+import com.lifeboard.app.ui.dashboard.DashboardViewModel
+import com.lifeboard.app.ui.dashboard.TabManagerDialog
+import com.lifeboard.app.ui.dashboard.TabRowUi
 import com.lifeboard.app.ui.debug.IpcDebugScreen
 import com.lifeboard.app.ui.notice.NoticeDebugScreen
 import com.lifeboard.app.ui.panel.PanelScreen
@@ -45,9 +56,10 @@ import com.lifeboard.app.ui.settings.SettingsScreen
 import com.lifeboard.app.ui.theme.GlassBackground
 import com.lifeboard.app.ui.theme.LifeBoardTheme
 import com.lifeboard.server.collect.DailyAggregateWorker
+import com.lifeboard.server.dashboard.BuiltinTab
 import com.lifeboard.server.dashboard.BuiltinTabs
-import com.lifeboard.server.dashboard.DashboardLayout
 import com.lifeboard.server.dashboard.TabKind
+import com.lifeboard.server.db.DashboardTabEntity
 import com.lifeboard.server.mihealth.MiHealthMigration
 import com.lifeboard.server.plugin.PluginManager
 import com.lifeboard.server.remind.RemindScheduler
@@ -85,9 +97,9 @@ class MainActivity : ComponentActivity() {
             runCatching {
                 kotlinx.coroutines.runBlocking {
                     MiHealthMigration.cleanupLegacyRows(applicationContext)
-                    // M6a：首次启动写入内置页签与默认卡片。
-                    // 幂等，已存在则直接返回，不会覆盖用户的调整
-                    DashboardLayout.ensureInitialized(applicationContext)
+                    // 默认仪表盘布局的生成不在这里：它由 DashboardViewModel 负责，
+                    // 因为界面必须知道「布局到底就绪没有」才能决定首帧画什么，
+                    // 在启动线程里悄悄写完、界面却不知情，只会让首帧和真相错位
                 }
             }
         }.start()
@@ -127,6 +139,8 @@ private data class TabItem(
     val label: String,
     val route: String,
     val kind: TabKind,
+    /** 内置页签的原始定义；用户页签为 null。管理弹窗据此决定能不能删 */
+    val builtin: BuiltinTab? = null,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -150,10 +164,17 @@ private fun MainScaffold(appearance: AppearanceState) {
     /** 面板上「重新判定数据源健康度」的触发键 */
     var healthRefreshKey by remember { mutableIntStateOf(0) }
 
-    val tabs = remember {
-        BuiltinTabs.ALL.map {
-            TabItem(tabId = it.tabId, label = it.defaultName, route = it.route, kind = TabKind.BUILTIN)
-        }
+    val dashVm: DashboardViewModel = viewModel()
+    val dashState by dashVm.state.collectAsStateWithLifecycle()
+    // 页签管理是压在顶栏上的一层弹窗
+    var showTabManager by remember { mutableStateOf(false) }
+
+    // 未就绪时用内存默认布局顶一帧：这里有顺序敏感的场景——
+    // 冷启动第一帧如果用空列表，ScrollableTabRow 会闪一下空白再出现页签
+    val tabs = if (dashState.ready) {
+        dashState.tabs.map { it.toTabItem() }
+    } else {
+        DashboardDefaults.tabs.map { it.toTabItem() }
     }
 
     fun selectTab(tabId: String) {
@@ -162,10 +183,29 @@ private fun MainScaffold(appearance: AppearanceState) {
             .edit().putString(KEY_SELECTED_TAB, tabId).apply()
     }
 
+    // 三种状态必须分开，不能都当成「布局坏了」：
+    //
+    // 1. 还没就绪 —— 上面的 tabs 已经是默认布局，正常画，什么都不提示
+    // 2. 就绪且有页签 —— 正常画
+    // 3. 就绪但页签表为空 —— 才是真异常，给恢复入口
+    //
+    // 之前用 tabs.isEmpty() 判断，未就绪时也会落进第 3 种，
+    // 冷启动会闪一下「恢复默认页签」的异常页，像是数据坏了。
+    if (dashState.empty) {
+        EmptyDashboard(onRestore = { dashVm.restoreDefaults() })
+        return
+    }
+
     // 存的 tabId 可能已经不存在（页签被删、或来自降级后的旧版本），
     // 一律回退到面板，否则会停在一个空白页
     val selectedIndex = tabs.indexOfFirst { it.tabId == selectedTabId }.takeIf { it >= 0 } ?: 0
     val current = tabs[selectedIndex]
+
+    // 选中页被删掉后，持久化的 tabId 已经失效，把回退后的选择写回去，
+    // 否则每次冷启动都要重新回退一次
+    LaunchedEffect(selectedIndex, current.tabId) {
+        if (current.tabId != selectedTabId) selectTab(current.tabId)
+    }
 
     // 玻璃主题下的页面底色：官方 background + 一层淡主色渐变，内容面板以半透明叠在其上
     GlassBackground {
@@ -180,6 +220,11 @@ private fun MainScaffold(appearance: AppearanceState) {
                     colors = TopAppBarDefaults.topAppBarColors(
                         containerColor = Color.Transparent,
                     ),
+                    actions = {
+                        TextButton(onClick = { showTabManager = true }) {
+                            Text("页签")
+                        }
+                    },
                 )
             },
         ) { padding ->
@@ -213,6 +258,7 @@ private fun MainScaffold(appearance: AppearanceState) {
                 // 所以 else 兜底回面板，不能留空屏
                 when (current.route) {
                     BuiltinTabs.ROUTE_PANEL -> PanelScreen(
+                        tabId = current.tabId,
                         onEditTask = {
                             editorSession++
                             editingTaskId = it
@@ -232,7 +278,9 @@ private fun MainScaffold(appearance: AppearanceState) {
                     BuiltinTabs.ROUTE_SETTINGS -> SettingsScreen(
                         appearance = appearance,
                     )
+                    // 用户页签（route 为空）与一切未知路由都落到卡片容器
                     else -> PanelScreen(
+                        tabId = current.tabId,
                         onEditTask = {
                             editorSession++
                             editingTaskId = it
@@ -261,6 +309,67 @@ private fun MainScaffold(appearance: AppearanceState) {
                     )
                 }
             }
+        }
+
+        if (showTabManager) {
+            TabManagerDialog(
+                tabs = tabs.map { TabRowUi(tabId = it.tabId, label = it.label, builtin = it.builtin) },
+                onDismiss = { showTabManager = false },
+                onCreate = { name ->
+                    dashVm.createTab(name) { newId -> selectTab(newId) }
+                },
+                onRename = { tabId, name -> dashVm.renameTab(tabId, name) },
+                onDelete = { tab ->
+                    dashVm.deleteTab(tab.tabId)
+                    // 删的是当前页时立刻回到面板，不等列表刷新再回退，
+                    // 否则中间那一帧会用已经删掉的 tabId 去找页面
+                    if (tab.tabId == selectedTabId) selectTab(BuiltinTabs.TAB_ID_PANEL)
+                },
+                onMove = { tabId, to -> dashVm.moveTab(tabId, to) },
+            )
+        }
+    }
+}
+
+/**
+ * 把库里的页签行还原成界面用的 [TabItem]。
+ *
+ * 内置页签的 route 由 [BuiltinTabs] 反查得出——库里只存 tabId 与展示名，
+ * 不存 route：route 是代码里的分发约定，跟着代码走，不该成为用户数据。
+ * 反查不到说明是内置页签但代码已经不认它了（升级后删掉了某个内置页），
+ * route 留空，分发的 else 分支会把它当卡片容器处理并给出空态，而不是崩溃。
+ */
+private fun DashboardTabEntity.toTabItem(): TabItem {
+    val builtin = BuiltinTabs.byTabId(tabId)
+    return TabItem(
+        tabId = tabId,
+        label = name.ifBlank { builtin?.defaultName ?: "未命名" },
+        route = builtin?.route ?: "",
+        kind = if (isBuiltin) TabKind.BUILTIN else TabKind.USER,
+        builtin = builtin,
+    )
+}
+
+/**
+ * 页签表被清空时的兜底页。
+ *
+ * 正常情况下到不了这里：内置页签不允许删除。留着是因为一旦真到了这一步，
+ * 主界面会连一个页签都没有，用户除了重装没有别的路可以走。
+ */
+@Composable
+private fun EmptyDashboard(onRestore: () -> Unit) {
+    GlassBackground {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text("没有可显示的页签", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "内置页签不会被删掉，出现这个界面说明布局数据异常。可以恢复成默认布局。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Button(onClick = onRestore) { Text("恢复默认页签") }
         }
     }
 }

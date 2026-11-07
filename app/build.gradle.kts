@@ -89,6 +89,10 @@ dependencies {
 
     implementation(libs.kotlinx.coroutines.android)
 
+    // 纯逻辑（页签名归一化、布局状态判定）在 JVM 单测里验证，
+    // 不必为了跑几个纯函数上真机
+    testImplementation(libs.junit)
+
     // Legacy Xposed API 桩：compileOnly，运行时由 LSPosed 注入
     compileOnly(libs.legacy.xposed.api)
 }
