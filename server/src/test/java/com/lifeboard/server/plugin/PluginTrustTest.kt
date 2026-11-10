@@ -111,20 +111,38 @@ class PluginTrustTest {
     }
 
     @Test
-    fun updateSignature_supersetIsAllowed() {
-        // 证书轮换期间新版同时带新旧签名，属于正常情况
-        assertNull(PluginTrust.checkUpdateSignature(setOf(sigA), setOf(sigA, sigB)))
-    }
-
-    @Test
-    fun updateSignature_keepingOldOnly_isAllowed() {
+    fun updateSignature_sameSet_isAllowed() {
         assertNull(PluginTrust.checkUpdateSignature(setOf(sigA), setOf(sigA)))
+        assertNull(PluginTrust.checkUpdateSignature(setOf(sigA, sigB), setOf(sigB, sigA)))
     }
 
     @Test
-    fun updateSignature_droppingOld_isRejected() {
-        // 只要求有交集的话，攻击者能混进自己的签名，所以必须是包含关系
+    fun updateSignature_addedSignature_isRejected() {
+        // 曾经允许超集（证书轮换），但加载阶段要求严格相等。
+        // 两处结论不一致会出现「装成功了却加载失败」，所以统一为拒绝
+        assertTrue(PluginTrust.checkUpdateSignature(setOf(sigA), setOf(sigA, sigB)) != null)
+    }
+
+    @Test
+    fun updateSignature_changedSignature_isRejected() {
         assertTrue(PluginTrust.checkUpdateSignature(setOf(sigA), setOf(sigB)) != null)
         assertTrue(PluginTrust.checkUpdateSignature(setOf(sigA, sigB), setOf(sigA)) != null)
+    }
+
+    @Test
+    fun updateSignature_matchesLoadStageVerdict() {
+        // 安装期放行的包，加载期不能反过来说签名不对
+        val previous = setOf(sigA)
+        val current = setOf(sigA, sigB)
+        val installAllows = PluginTrust.checkUpdateSignature(previous, current) == null
+        val loadAllows = PluginTrust.evaluate(
+            info(signatures = listOf(sigA, sigB)),
+            trust(
+                trusted = setOf(info(signatures = listOf(sigA, sigB)).identity.key),
+                versions = mapOf(pkg to InstalledVersion(versionCode = 1, signatureHashes = previous)),
+            ),
+        ) is TrustVerdict.Trusted
+
+        assertEquals(loadAllows, installAllows)
     }
 }

@@ -11,8 +11,11 @@ import com.lifeboard.server.db.LifeBoardDatabase
 import com.lifeboard.server.plugin.CredentialVault
 import com.lifeboard.server.plugin.LoadedPlugin
 import com.lifeboard.server.plugin.PluginInstallService
+import com.lifeboard.server.plugin.PluginInstaller
 import com.lifeboard.server.plugin.PluginLoader
 import com.lifeboard.server.plugin.PluginManager
+import com.lifeboard.app.ui.task.TaskCenter
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -133,11 +136,25 @@ class PluginViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             _state.value = _state.value.copy(loading = true)
             val ctx = getApplication<Application>()
-            val rows = withContext(Dispatchers.IO) {
-                runCatching { PluginManager.refresh(ctx) }
-                buildRows(ctx)
+            // 扫描要解压、校验签名、经 DexClassLoader 加载每个插件，插件多时能跑几秒，
+            // 这段正是顶栏指示器该转的时候
+            val handle = TaskCenter.begin("扫描插件", "重新加载已安装插件")
+            try {
+                val rows = withContext(Dispatchers.IO) {
+                    runCatching { PluginManager.refresh(ctx) }
+                    buildRows(ctx)
+                }
+                handle.finish()
+                _state.value = _state.value.copy(loading = false, installed = rows.first, pending = rows.second, broken = rows.third)
+            } catch (e: CancellationException) {
+                // ViewModel 销毁导致的取消不算失败，但也要把那条任务收掉，
+                // 否则它会永远停在「进行中」
+                handle.finish()
+                throw e
+            } catch (e: Exception) {
+                handle.fail(e.message ?: "扫描失败")
+                _state.value = _state.value.copy(loading = false)
             }
-            _state.value = _state.value.copy(loading = false, installed = rows.first, pending = rows.second, broken = rows.third)
         }
     }
 
@@ -240,7 +257,7 @@ class PluginViewModel(app: Application) : AndroidViewModel(app) {
                     staged = outcome.stagedFile
                     _state.value = _state.value.copy(
                         pendingInstall = PendingInstall(
-                            archiveName = outcome.incoming.packageName + ".ext",
+                            archiveName = outcome.incoming.packageName + PluginInstaller.APK_SUFFIX,
                             packageName = outcome.incoming.packageName,
                             versionName = outcome.incoming.versionName,
                             signatureHashes = outcome.incoming.signatureHashes.sorted(),
