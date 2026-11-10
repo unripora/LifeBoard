@@ -48,17 +48,33 @@ import com.lifeboard.server.notice.ScreenCaptureAccessibilityService
  * 只放「外观」这一类设置：明暗模式与色系。
  * 采集授权、规则等在各自的页面里，不放这里——设置页一旦什么都装，
  * 用户找任何东西都要先翻一遍。
+ *
+ * 末尾的「关于」是唯一例外：它是只读的应用信息，不是设置项，
+ * 但用户被问「你装的是哪一版」时最先会来这里找，没有更合适的位置。
  */
 @Composable
 fun SettingsScreen(
     appearance: AppearanceState,
     onOpenLogs: () -> Unit = {},
+    onOpenAbout: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     LazyColumn(
         modifier = modifier.fillMaxSize().padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        item {
+            GlassCard(modifier = Modifier.fillMaxWidth()) {
+                Text("关于", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "应用图标、版本号与运行环境。反馈问题时先说版本号，能省掉一轮来回确认。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OptionRow(title = "查看关于信息", selected = false, onClick = onOpenAbout)
+            }
+        }
+
         item {
             GlassCard(modifier = Modifier.fillMaxWidth()) {
                 Text("运行日志", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)

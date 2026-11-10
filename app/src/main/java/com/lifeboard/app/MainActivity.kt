@@ -64,6 +64,7 @@ import com.lifeboard.app.ui.plugin.PluginScreen
 import com.lifeboard.app.ui.plugin.detail.PluginDetailScreen
 import com.lifeboard.app.ui.remind.RemindTestScreen
 import com.lifeboard.app.ui.rules.RulesScreen
+import com.lifeboard.app.ui.settings.AboutScreen
 import com.lifeboard.app.ui.settings.AppearanceState
 import com.lifeboard.app.ui.settings.SettingsScreen
 import com.lifeboard.app.ui.task.TaskIndicatorButton
@@ -161,6 +162,7 @@ private fun MainScaffold(appearance: AppearanceState) {
     var detailSession by remember { mutableIntStateOf(0) }
     var showLogs by remember { mutableStateOf(false) }
     var logSession by remember { mutableIntStateOf(0) }
+    var showAbout by remember { mutableStateOf(false) }
 
     /** 面板上「重新判定数据源健康度」的触发键 */
     var healthRefreshKey by remember { mutableIntStateOf(0) }
@@ -304,6 +306,7 @@ private fun MainScaffold(appearance: AppearanceState) {
                             logSession++
                             showLogs = true
                         },
+                        onOpenAbout = { showAbout = true },
                     )
                     // 用户页签（route 为空）与一切未知路由都落到卡片容器
                     else -> PanelScreen(
@@ -359,6 +362,12 @@ private fun MainScaffold(appearance: AppearanceState) {
                 GlassBackground {
                     LogScreen(onClose = { showLogs = false })
                 }
+            }
+        }
+
+        if (showAbout) {
+            GlassBackground {
+                AboutScreen(onClose = { showAbout = false })
             }
         }
 
