@@ -13,8 +13,20 @@ android {
         applicationId = "com.lifeboard.app"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        // 版本号规则（与 :mihealth-plugin 一致，别再手工维护 versionCode）：
+        //
+        // - versionName 由人决定，改功能时手动提升，用来在设备上认出「装的是哪一版」
+        // - versionCode 由构建时间自动生成，**每次构建必然递增**
+        //
+        // 为什么不让 versionCode 也手工写：忘了加就会覆盖安装失败
+        // （adb 报 INSTALL_FAILED_VERSION_DOWNGRADE），而且从 APK 上看不出差别；
+        // 自动递增后「有新代码就一定装得上」，不需要任何人记得这件事。
+        //
+        // 取分钟计数而不是秒：同一分钟内重复构建不撞号，数值也不会长到没法看。
+        // 起点 10000 保证高于历史上手工填的 1、2，避免降级。
+        val buildStamp = ((System.currentTimeMillis() / 60_000L) % 10_000L).toInt()
+        versionCode = 10_000 + buildStamp
+        versionName = "0.3.3"
     }
 
     // 内测分发用的签名：复用 AGP 自带的 debug 证书，这样 release 包也能直接安装，

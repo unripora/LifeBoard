@@ -20,10 +20,25 @@ android {
         applicationId = "com.lifeboard.plugin.mihealth"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+
+        // 版本号每次构建自动递增，用于确认「设备上装的到底是哪一版」。
+        //
+        // 为什么需要它：插件被静默替换后，界面上只有 「v1.0」，
+        // 根本分不清装的是新代码还是旧代码，排查时白白浪费一轮真机验证
+        // （已经发生过一次：改动没触发重编译，测的其实是旧包）。
+        //
+        // 补丁号 = 当前毫秒数除以 6 万再对 10000 取模，即「分钟计数」，
+        // 同一分钟内重复构建不会撞号，位数也不会长到没法看。
+        val buildStamp = ((System.currentTimeMillis() / 60_000L) % 10_000L).toInt()
+        versionCode = 10_000 + buildStamp
+        // 与宿主同一套规则：versionCode 自动递增保证装得上，versionName 改功能时手动提升
+        versionName = "1.1.$buildStamp"
 
         manifestPlaceholders["pluginFeature"] = "lifeboard.plugin"
+
+        // 解析规则的仪器测试需要 runner：本模块是 application 而不是 library，
+        // 不声明这一行，测试 APK 装到设备上也没有可执行的 instrumentation
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -55,4 +70,8 @@ dependencies {
     // 宿主不提供，也不会在宿主里出现小米专用的类
     implementation(libs.okhttp)
     implementation(libs.kotlinx.coroutines.android)
+
+    // 解析规则依赖 org.json，JVM 单测里它只是空壳，所以放仪器测试验证
+    androidTestImplementation(libs.androidx.test.junit)
+    androidTestImplementation(libs.androidx.test.runner)
 }

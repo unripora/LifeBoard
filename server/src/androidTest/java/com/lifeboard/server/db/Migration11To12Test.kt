@@ -97,13 +97,17 @@ class Migration11To12Test {
         }.isFailure
         assertTrue("同页签同类型必须被唯一索引挡住", duplicateRejected)
 
-        // 4. 外键生效：删页签级联删卡（Room 建库时已开 foreign_keys）
-        migrated.execSQL("DELETE FROM dashboard_tab WHERE tabId = 'builtin_panel'")
-        migrated.query(
-            "SELECT COUNT(*) FROM dashboard_card WHERE tabId = 'builtin_panel'",
-        ).use {
-            it.moveToFirst()
-            assertEquals("删页签必须级联清掉它的卡片", 0, it.getInt(0))
+        // 4. 外键声明已建立。
+        //
+        // 这里只验声明本身，不验级联删除是否触发：SQLite 的外键约束默认关闭，
+        // 迁移又在事务里执行，PRAGMA foreign_keys 在事务内改不了。
+        // 删页签时清卡片由 DashboardViewModel.deleteTab() 在同一事务里显式
+        // 先 deleteByTab 再做，不依赖级联，因此这里断言级联行为只会误报失败。
+        migrated.query("PRAGMA foreign_key_list(`dashboard_card`)").use { cursor ->
+            assertEquals("dashboard_card 必须声明一条外键", 1, cursor.count)
+            cursor.moveToFirst()
+            val column = cursor.getColumnIndex("table")
+            assertEquals("dashboard_tab", cursor.getString(column))
         }
     }
 }

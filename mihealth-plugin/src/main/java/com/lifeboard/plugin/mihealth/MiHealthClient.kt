@@ -7,6 +7,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -130,8 +131,23 @@ class MiHealthClient private constructor(
      * - 游标参数名必须是 snake_case `next_key`，camelCase 会被服务端忽略
      * - 游标会**向后遍历全部历史**，与 startTime 无关；
      *   把 startTime 传成 1 会让游标卡死，永远返回同一页
-     * - 所以这里永远传一个较近的 startTime（默认回看 24 小时），
-     *   并在客户端过滤掉窗口外的点
+     * - 所以窗口宽度有上限（[MAX_WINDOW_MILLIS]），**并在客户端真正过滤**窗口外的点：
+     *   服务端并不保证只返回窗口内的数据
+     *
+     * ## 历史数据怎么取
+     *
+     * 服务端只按「窗口宽度」限制，不按「离今天多远」限制：传 2026-10-01 那天的窗口，
+     * 一样能拿到那天的数据。所以拉历史不是把窗口开得很大，而是**按天分段**各调一次——
+     * 每段仍然只有一个自然日的宽度，游标不会退化成遍历全部历史。
+     *
+     * 早先这里把 startTime 钳到「距 endTime 不超过 24 小时」，本意是防上面的病态分页，
+     * 副作用是把「拉更早的日期」也一并禁掉了（传什么日期都只返回最近一天）。
+     * 现在改成按窗口宽度钳制：超宽的窗口裁到上限，但不会把起点抬到最近 24 小时。
+     *
+     * ## 过滤口径
+     * - 普通采样点（步数等）：按采样时间 `time` 落在窗口内
+     * - 区间记录（睡眠）：按起止时间与窗口**有重叠**即保留，
+     *   跨夜睡眠必须留给上层按自然日裁剪，这里提前丢掉会把整段睡眠弄没
      *
      * @param key 数据键，如 `steps` / `sleep` / `heart_rate`
      * @param startTimeMillis 开始时间（毫秒）
@@ -143,10 +159,11 @@ class MiHealthClient private constructor(
         key: String,
         startTimeMillis: Long,
         endTimeMillis: Long,
-        maxPages: Int = 10,
+        maxPages: Int = DEFAULT_MAX_PAGES,
     ): List<JSONObject> {
-        // startTime 钳制：太早会让游标向后翻全部历史，性能极差且容易卡死
-        val apiStart = maxOf(startTimeMillis, endTimeMillis - MAX_LOOKBACK_MILLIS)
+        // 按**窗口宽度**钳制而不是按「离现在多远」：超宽窗口裁到上限，
+        // 但传一个较早的日期不会被抬到最近 24 小时
+        val apiStart = maxOf(startTimeMillis, endTimeMillis - MAX_WINDOW_MILLIS)
 
         val out = mutableListOf<JSONObject>()
         var nextKey: String? = null
@@ -181,15 +198,88 @@ class MiHealthClient private constructor(
                 items.optJSONObject(i)?.let(out::add)
             }
 
+            // 整页都已早于窗口 → 后面只会更早，立即停。
+            //
+            // 这一步不能省：稀疏数据类型（`valid_stand`、`weight`、`blood_pressure`）
+            // 一页可以跨好几周，一个 2 天窗口的数据可能在十几页之后，
+            // 而窗口之前的历史还有几十页。不按时间提前停，翻满 60 页
+            // 也只能拿到 3 条有效点（实测日志：`3/1200 points, pages=61`），
+            // 十几个指标加起来就是几百次请求，同步会卡住好几分钟。
+            //
+            // 用 reverse=true 拿到的页内是按时间倒序，所以「最后一条」就是本页最老的；
+            // 它比窗口起点还早，说明这一页已经翻过了窗口，可以收工。
+            if (pageHasOnlyOlderItems(items, startTimeMillis)) {
+                Log.i(TAG, "getFitnessDataByTime($key) 第 ${page + 1} 页已早于窗口，停止翻页")
+                break
+            }
+
             val more = body.optBoolean("has_more", false) || body.optBoolean("hasMore", false)
-            nextKey = body.optString("next_key").takeIf { it.isNotBlank() }
-            if (!more || nextKey == null) break
+            val cursor = body.optString("next_key").takeIf { it.isNotBlank() }
+            // 游标不前移时必须停：服务端在窗口边缘偶尔重复返回同一个 next_key，
+            // 不回退判断会一直翻到页数上限，白跑十次网络请求
+            if (!more || cursor == null || cursor == nextKey) break
+            nextKey = cursor
             page++
         }
 
         if (page >= maxPages) Log.w(TAG, "getFitnessDataByTime($key) hit page cap $maxPages")
-        Log.i(TAG, "getFitnessDataByTime($key) -> ${out.size} points, pages=${page + 1}")
-        return out
+
+        val filtered = out.filter { inWindow(it, startTimeMillis, endTimeMillis) }
+        Log.i(
+            TAG,
+            "getFitnessDataByTime($key) -> ${filtered.size}/${out.size} points in window, " +
+                "pages=${page + 1}",
+        )
+        return filtered
+    }
+
+    /**
+     * 这一页是否所有点都早于窗口起点。
+     *
+     * 取**最晚**的那个时间比较：只要页内还有一条落在窗口内或之后，就还得继续翻。
+     * 页内没有任何可解析时间的点（结构不认识）时返回 false，
+     * 宁可多翻几页也不要因为解析不了就提前截断数据。
+     */
+    private fun pageHasOnlyOlderItems(items: JSONArray, windowStart: Long): Boolean {
+        if (items.length() == 0) return false
+        var latest = Long.MIN_VALUE
+        for (i in 0 until items.length()) {
+            val point = items.optJSONObject(i) ?: continue
+            val at = MiHealthParser.timestamp(point, "time", "timestamp", "bedtime")
+                ?: return false
+            if (at > latest) latest = at
+        }
+        return latest != Long.MIN_VALUE && latest < windowStart
+    }
+
+    /**
+     * 采样点是否落在窗口内。
+     *
+     * 时间字段的候选顺序参考宿主的 `MiHealthOverviewReader`：
+     * 睡眠用 `bedtime/wake_up_time` 一族，其余用 `time`。
+     */
+    private fun inWindow(point: JSONObject, start: Long, end: Long): Boolean {
+        val rangeStart = MiHealthParser.timestamp(
+            point,
+            "bedtime",
+            "device_bedtime",
+            "start_time",
+            "startTime",
+        )
+        if (rangeStart != null) {
+            val rangeEnd = MiHealthParser.timestamp(
+                point,
+                "device_wake_up_time",
+                "wake_up_time",
+                "end_time",
+                "endTime",
+            ) ?: rangeStart
+            // 区间记录按重叠判断：跨夜睡眠只要碰到窗口就留下
+            return rangeEnd > start && rangeStart < end
+        }
+
+        val at = MiHealthParser.timestamp(point, "time", "timestamp") ?: return false
+        return at in start..end
     }
 
     /**
@@ -212,8 +302,8 @@ class MiHealthClient private constructor(
         timeInSeconds: Boolean = false,
         pageSize: Int? = null,
     ): List<JSONObject> {
-        // 与 fitness 相同的钳制理由：startTime 太早会让游标向后翻全部历史
-        val apiStart = maxOf(startTimeMillis, endTimeMillis - MAX_LOOKBACK_MILLIS)
+        // 与 fitness 相同的理由：按窗口宽度钳制，不把起点抬到最近一段时间
+        val apiStart = maxOf(startTimeMillis, endTimeMillis - MAX_WINDOW_MILLIS)
         val (s, e) = if (timeInSeconds) apiStart / 1000 to endTimeMillis / 1000
         else apiStart to endTimeMillis
         val startField = if (timeInSeconds) "start_time" else "startTime"
@@ -286,8 +376,30 @@ class MiHealthClient private constructor(
         /** 健康数据域；登录走 account.xiaomi.com，由 MiHealthAuth 处理 */
         const val HLTH_HOST = "hlth.io.mi.com"
 
-        /** 单页最多回看的时长：再早就让游标向后翻全部历史，很慢 */
-        private const val MAX_LOOKBACK_MILLIS = 24 * 60 * 60 * 1000L
+        /**
+         * 单次查询的窗口宽度上限。
+         *
+         * 不是「最多能回看多久」，而是「一次问多长时间的范围」：
+         * 窗口越宽，服务端游标越容易退化成遍历全部历史（慢且可能卡死）。
+         *
+         * 取 2 天而不是 1 天，是因为睡眠是**区间**：查某一天时要把前一晚也算进来，
+         * 否则「昨晚 23:00 睡到今早 07:00」这段会被窗口切掉一半。
+         * 拉更早的日期靠按天分段多次调用，而不是把这里放大。
+         */
+        private const val MAX_WINDOW_MILLIS = 2 * 24 * 60 * 60 * 1000L
+
+        /**
+         * 单次查询默认翻多少页。
+         *
+         * 早先写的是 10 页，这就是「原始数据只有半天」的直接原因：步数是**分钟级**
+         * 采样，一天有 1400 多个点，而服务端一页约 144 条——10 页只够覆盖其中一小部分，
+         * 日志里表现为 `1444 个点只有 77 个落在窗口里`。
+         *
+         * 这里放到 40 页作为**安全上限**，真正让稀疏数据不白翻的是
+         * [pageHasOnlyOlderItems]：整页早于窗口就停，不再靠页数兜底。
+         * 分钟级的 `steps` 2 天约 2900 条 ≈ 20 页，仍在范围内。
+         */
+        private const val DEFAULT_MAX_PAGES = 40
 
         /**
          * 伪装成小米运动 App。

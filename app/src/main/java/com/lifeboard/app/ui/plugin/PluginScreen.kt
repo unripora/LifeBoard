@@ -3,6 +3,7 @@ package com.lifeboard.app.ui.plugin
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -31,13 +32,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.lifeboard.app.ui.common.DataUriImage
 import com.lifeboard.app.ui.theme.GlassCard
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 /**
  * 插件页。
@@ -47,7 +46,10 @@ import kotlinx.coroutines.withContext
  * 普通用户没法把文件丢进去，"放到某个目录"不能作为唯一安装方式。
  */
 @Composable
-fun PluginScreen(modifier: Modifier = Modifier) {
+fun PluginScreen(
+    modifier: Modifier = Modifier,
+    onOpenDetail: (pluginId: String) -> Unit = {},
+) {
     val vm: PluginViewModel = viewModel()
     val state by vm.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
@@ -104,7 +106,7 @@ fun PluginScreen(modifier: Modifier = Modifier) {
                     )
                 }
                 items(state.installed, key = { it.archiveName }) { row ->
-                    InstalledCard(row, vm) { confirmAction = it }
+                    InstalledCard(row, vm, onOpenDetail) { confirmAction = it }
                 }
             }
 
@@ -198,9 +200,16 @@ private sealed interface ConfirmAction {
 private fun InstalledCard(
     row: PluginRow,
     vm: PluginViewModel,
+    onOpenDetail: (pluginId: String) -> Unit,
     onConfirm: (ConfirmAction) -> Unit,
 ) {
-    GlassCard(modifier = Modifier.fillMaxWidth()) {
+    // 整卡可点进详情页。按钮行单独放在下方且不加 clickable，
+    // 点按钮不会因为事件冒泡顺带把详情页打开
+    GlassCard(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onOpenDetail(row.pluginId) },
+    ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -392,7 +401,11 @@ private fun LoginDialog(
 
                 // 验证码图必须显示在输入框上方：用户要先看图才能填
                 login.captchaImage?.let { image ->
-                    AsyncImageFromDataUri(image)
+                    DataUriImage(
+                        dataUri = image,
+                        contentDescription = "验证码",
+                        errorText = "验证码图片加载失败，请取消后重试",
+                    )
                 }
 
                 login.error?.let {
@@ -431,50 +444,4 @@ private fun LoginDialog(
             TextButton(onClick = onCancel, enabled = !login.busy) { Text("取消") }
         },
     )
-}
-
-/**
- * 显示 `data:image/...;base64,...` 形式的图片。
- *
- * 插件给的是数据 URI 而不是文件或 URL：验证码与那次登录会话绑定，
- * 落成文件反而要管清理。直接解码成 Bitmap 最省事。
- *
- * 解码放后台线程：虽然验证码只有几 KB，但解码是插件的输入，
- * 不该假设它一定小——大 Base64 在 UI 线程解会卡住整个弹窗。
- */
-@Composable
-private fun AsyncImageFromDataUri(dataUri: String) {
-    // null 表示还在解码，false 表示解码失败，true 表示解码成功
-    var decoded by remember(dataUri) { mutableStateOf<Boolean?>(null) }
-    val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, dataUri) {
-        val result = withContext(Dispatchers.Default) {
-            runCatching {
-                val comma = dataUri.indexOf(',')
-                if (comma < 0) return@withContext null
-                val bytes = android.util.Base64.decode(
-                    dataUri.substring(comma + 1),
-                    android.util.Base64.DEFAULT,
-                )
-                android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            }.getOrNull()
-        }
-        decoded = result != null
-        value = result
-    }
-
-    val image = bitmap
-    if (image != null) {
-        Image(
-            bitmap = image.asImageBitmap(),
-            contentDescription = "验证码",
-            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-        )
-    } else if (decoded == false) {
-        // 只有确认解码失败才提示：还在解码时提示会在每次重组时闪一下
-        Text(
-            "验证码图片加载失败，请取消后重试",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.error,
-        )
-    }
 }

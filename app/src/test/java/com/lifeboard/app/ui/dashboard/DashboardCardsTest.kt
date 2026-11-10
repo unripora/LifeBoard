@@ -29,6 +29,16 @@ class DashboardCardsTest {
             tabId = tabId,
         )
 
+    private fun metricCard(sourceKey: String, metricKey: String?, tabId: String = "user_1") =
+        DashboardCardEntity(
+            cardId = "c_METRIC_$sourceKey",
+            type = CardType.METRIC.name,
+            sourceKey = sourceKey,
+            metricKey = metricKey,
+            order = 0,
+            tabId = tabId,
+        )
+
     @Test
     fun metricCardIsOfferableButLast() {
         // M6b2b 起指标卡可以加。排在最后：它不是「选了就完」的选项，
@@ -53,14 +63,54 @@ class DashboardCardsTest {
     }
 
     @Test
+    fun metricStaysAddableAfterOneIsPlaced() {
+        // 指标卡绑的是具体指标，一个页签里可以摆多张（步数 + 睡眠 + 屏幕使用）。
+        // 之前按类型排除，导致加了一张之后再也加不了第二张
+        val existing = DashboardCards.OFFERABLE
+        assertEquals(listOf(CardType.METRIC), DashboardCards.addableTo(existing))
+    }
+
+    @Test
     fun addableKeepsDeclarationOrder() {
         // 顺序即选择器里的顺序，不能随已有卡片而变，否则每次打开都换一遍位置
         assertEquals(DashboardCards.OFFERABLE, DashboardCards.addableTo(emptyList()))
     }
 
     @Test
-    fun addableIsEmptyWhenAllPresent() {
-        assertTrue(DashboardCards.addableTo(DashboardCards.OFFERABLE).isEmpty())
+    fun addableNeverFullyEmptyBecauseMetricAlwaysAvailable() {
+        // 加卡按钮的显示条件是 addable.isNotEmpty()，指标卡恒在意味着入口不会消失
+        assertTrue(DashboardCards.addableTo(DashboardCards.OFFERABLE).isNotEmpty())
+    }
+
+    @Test
+    fun nonMetricDuplicateIsDetectedByType() {
+        val existing = listOf(card(CardType.SCORE))
+        assertTrue(DashboardCards.isDuplicate(CardType.SCORE, null, null, existing))
+        assertFalse(DashboardCards.isDuplicate(CardType.TODO, null, null, existing))
+    }
+
+    @Test
+    fun sameMetricBindingIsDuplicate() {
+        val existing = listOf(metricCard("PLUGIN_p:STEPS", "STEPS"))
+        assertTrue(
+            DashboardCards.isDuplicate(CardType.METRIC, "PLUGIN_p:STEPS", "STEPS", existing),
+        )
+    }
+
+    @Test
+    fun differentMetricBindingIsNotDuplicate() {
+        // 同一个插件的两个指标是两个不同的 sourceKey，不算重复
+        val existing = listOf(metricCard("PLUGIN_p:STEPS", "STEPS"))
+        assertFalse(
+            DashboardCards.isDuplicate(CardType.METRIC, "PLUGIN_p:SLEEP", "SLEEP", existing),
+        )
+    }
+
+    @Test
+    fun blankBindingIsNormalizedBeforeCompare() {
+        // 内置源的 metricKey 存的是 null，读出来可能是空串，两者必须等价
+        val existing = listOf(metricCard("SCREEN_TIME", null))
+        assertTrue(DashboardCards.isDuplicate(CardType.METRIC, "SCREEN_TIME", "", existing))
     }
 
     @Test

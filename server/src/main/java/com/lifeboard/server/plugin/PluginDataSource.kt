@@ -58,6 +58,10 @@ class PluginDataSource(
     override suspend fun collect(date: String): List<MetricRecord> {
         if (!plugin.trusted) return emptyList()
 
+        // 告诉上下文「这次采集是哪一天」：插件上报原始条目时若没带日期，
+        // 就归到这一天，避免条目落不到任何日期上而被丢掉
+        pluginContext.bindCollectDate(date)
+
         val produced = runCatching {
             plugin.plugin.fetch(pluginContext, date)
         }.getOrElse { error ->

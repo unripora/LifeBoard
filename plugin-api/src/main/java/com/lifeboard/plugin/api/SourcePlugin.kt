@@ -22,8 +22,12 @@ interface SourcePlugin {
     /**
      * 契约版本。
      *
-     * 单版本策略：与 [PluginApi.VERSION] 不一致即拒绝加载并说明原因，
-     * 不做多代并存（见 I 阶段 §八）。
+     * 向后兼容：**不高于** [PluginApi.VERSION] 即可加载。
+     * 契约只允许新增带默认实现的方法与新增数据类，这类变更不影响已编译的插件；
+     * 只有破坏性变更（改已有签名、删字段、改语义）才递增 [PluginApi.VERSION]，
+     * 而那类变更必须让插件重新编译，版本号本身拦不住运行时错误。
+     *
+     * 高于宿主版本则拒绝加载并说明原因——那种插件可能用了宿主还没有的契约能力。
      */
     val apiVersion: Int
 
@@ -77,4 +81,33 @@ interface SourcePlugin {
 
     /** 连通性与健康度；失败必须返回 [PluginHealth]，不要抛异常 */
     suspend fun health(context: PluginContext): PluginHealth
+
+    /**
+     * 详情页里由插件自己决定的那部分内容。
+     *
+     * 宿主会把返回的区块渲染在「通用信息」（包名、版本、签名、健康度）之下、
+     * 「通用操作」（停止使用、清除凭据、卸载）之上。这两个通用区由宿主固定，
+     * 插件插不进去也改不了：装的是哪个包、签名是什么，必须由宿主说了算。
+     *
+     * 默认返回空列表，此时详情页只显示通用信息与通用操作。
+     * 插件不需要展示任何自有内容时不必重写本方法。
+     *
+     * **不要在这里发网络请求**：用户点进详情页只是想看细节，
+     * 不期望顺便触发一次采集。需要实时数据请用 [ActionResult.TriggerSync] 显式触发。
+     */
+    suspend fun detailUi(context: PluginContext): List<UiBlock> = emptyList()
+
+    /**
+     * 用户在详情页点了 [ButtonSpec.actionId] 对应的按钮。
+     *
+     * 宿主会在本方法返回前禁用该按钮，插件不必自己防连点；
+     * 但**同一插件可能被并发调用**（两个按钮几乎同时点），需要互斥时请自行加锁。
+     *
+     * 失败不要抛异常：异常会被宿主兜住并转成一句通用错误，
+     * 用户看不到原因。要说明情况请返回 [ActionResult.ShowMessage]。
+     *
+     * @param actionId 插件在 [ButtonSpec] 里给出的标识
+     */
+    suspend fun onAction(context: PluginContext, actionId: String): ActionResult =
+        ActionResult.NoOp
 }

@@ -36,6 +36,9 @@ import com.lifeboard.app.ui.theme.ColorPalette
 import com.lifeboard.app.ui.theme.GlassCard
 import com.lifeboard.app.ui.theme.ThemeMode
 import com.lifeboard.app.ui.theme.colors
+import com.lifeboard.server.collect.CollectionPrefs
+import com.lifeboard.server.collect.DailyAggregateWorker
+import com.lifeboard.server.collect.RefreshInterval
 import com.lifeboard.server.notice.CapturePrefs
 import com.lifeboard.server.notice.ScreenCaptureAccessibilityService
 
@@ -49,12 +52,26 @@ import com.lifeboard.server.notice.ScreenCaptureAccessibilityService
 @Composable
 fun SettingsScreen(
     appearance: AppearanceState,
+    onOpenLogs: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     LazyColumn(
         modifier = modifier.fillMaxSize().padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        item {
+            GlassCard(modifier = Modifier.fillMaxWidth()) {
+                Text("运行日志", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "插件没加载、数据没刷新时，先看这里。日志存在本机，可以按级别筛、搜索、导出成文件，" +
+                        "不需要连电脑。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OptionRow(title = "查看运行日志", selected = false, onClick = onOpenLogs)
+            }
+        }
+
         item {
             GlassCard(modifier = Modifier.fillMaxWidth()) {
                 Text("明暗模式", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
@@ -87,6 +104,33 @@ fun SettingsScreen(
                         palette = palette,
                         selected = appearance.palette == palette,
                         onClick = { appearance.applyPalette(palette) },
+                    )
+                }
+            }
+        }
+
+        item {
+            val context = LocalContext.current
+            var interval by remember { mutableStateOf(CollectionPrefs.interval(context)) }
+            GlassCard(modifier = Modifier.fillMaxWidth()) {
+                Text("数据源自动刷新", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "统一刷新内置数据源、自建源与已安装的插件，没有单独给某个插件配周期的入口。" +
+                        "系统会为省电合并后台任务，实际时间可能晚于设定；" +
+                        "关闭后仍可在插件详情页手动同步。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                RefreshInterval.entries.forEach { option ->
+                    OptionRow(
+                        title = option.label,
+                        selected = interval == option,
+                        onClick = {
+                            interval = option
+                            CollectionPrefs.setInterval(context, option)
+                            // 立即生效：改完不必等下次启动，也不必重启应用
+                            DailyAggregateWorker.schedule(context)
+                        },
                     )
                 }
             }

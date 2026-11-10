@@ -24,11 +24,11 @@ import java.io.File
  *
  * ```
  * file_picker/xxx.tmp          校验通过前的落脚点，始终不进 plugins/
- * plugins/foo.ext.part         正在写入（见 PluginInstaller.install）
- * plugins/foo.ext              正式插件包
+ * plugins/foo.apk.part         正在写入（见 PluginInstaller.install）
+ * plugins/foo.apk              正式插件包
  * ```
  *
- * 校验放在正式目录之外，是为了不让一个坏包以 `.ext` 结尾留在插件列表里，
+ * 校验放在正式目录之外，是为了不让一个坏包以 `.apk` 结尾留在插件列表里，
  * 变成用户看不懂的「加载失败」条目。
  */
 object PluginInstallService {
@@ -96,7 +96,7 @@ object PluginInstallService {
 
             // 文件名用包名生成，不用用户选的那个：
             // SAF 给的显示名可能带空格、中文、奇怪后缀，甚至重名覆盖别的插件
-            val targetName = "${info.packageName}.ext"
+            val targetName = "${info.packageName}${PluginInstaller.APK_SUFFIX}"
 
             // 同包名已存在：交给调用方问用户要不要覆盖
             val existing = PluginInstaller.listArchives(appContext)
@@ -105,6 +105,12 @@ object PluginInstallService {
             if (existing != null) {
                 val existingInfo = PluginInstaller.readArchiveInfo(appContext, existing)
                 if (existingInfo != null) {
+                    // 确认覆盖之前先做版本与签名裁决：绕过这一步，一个换签名或降级的包
+                    // 会先把旧包覆盖掉，再在加载阶段被拒，用户既丢了旧版本又用不了新版本
+                    rejectIfNotUpgradable(appContext, info)?.let { reason ->
+                        staged.delete()
+                        return@withContext InstallOutcome.Failed(reason)
+                    }
                     return@withContext InstallOutcome.Conflict(
                         existingArchiveName = existing.name,
                         existing = existingInfo,
@@ -112,6 +118,12 @@ object PluginInstallService {
                         stagedFile = staged,
                     )
                 }
+            }
+
+            // 首次安装不需要问覆盖，但已安装记录仍可能存在（用户先删了包文件没清记录）
+            rejectIfNotUpgradable(appContext, info)?.let { reason ->
+                staged.delete()
+                return@withContext InstallOutcome.Failed(reason)
             }
 
             commit(appContext, staged, targetName).let { installed ->
@@ -123,11 +135,40 @@ object PluginInstallService {
             }
         }
 
-    /** 用户确认覆盖后调用，把暂存文件落成正式包 */
+    /**
+     * 用户确认覆盖后调用，把暂存文件落成正式包。
+     *
+     * 确认框可能停留很久，期间已安装包也可能被别的入口换掉，
+     * 所以这里**重新读一次待装包**再做裁决，不复用之前的结论。
+     */
     suspend fun confirmOverwrite(context: Context, staged: File, targetName: String): Boolean =
         withContext(Dispatchers.IO) {
-            commit(context.applicationContext, staged, targetName) != null
+            val appContext = context.applicationContext
+            val incoming = PluginInstaller.readArchiveInfo(appContext, staged) ?: return@withContext false
+            if (rejectIfNotUpgradable(appContext, incoming) != null) {
+                runCatching { staged.delete() }
+                return@withContext false
+            }
+            commit(appContext, staged, targetName) != null
         }
+
+    /**
+     * 版本与签名裁决，返回拒绝原因；可安装时返回 null。
+     *
+     * 复用 [PluginVersionPolicy]（纯函数、已有单测），这里只负责把
+     * 「已安装记录」喂给它。安装前拒绝和加载阶段拒绝必须给出同一个结论，
+     * 否则会出现「装进去了但用不了」。
+     */
+    private fun rejectIfNotUpgradable(
+        context: Context,
+        incoming: PluginArchiveInfo,
+    ): String? {
+        val installed = PluginTrustStore.load(context).installedVersions[incoming.packageName]
+        return when (val verdict = PluginVersionPolicy.evaluate(installed, incoming)) {
+            is VersionVerdict.Rejected -> verdict.reason
+            else -> null
+        }
+    }
 
     /** 放弃一次待确认的安装，清掉暂存文件 */
     fun discard(staged: File) {
@@ -173,7 +214,7 @@ object PluginInstallService {
     private fun validate(context: Context, staged: File) {
         // getPackageArchiveInfo 只认 .apk 之外的路径也行，但它对非 ZIP 文件返回 null
         val info = PluginInstaller.readArchiveInfo(context, staged)
-            ?: throw Rejected("无法解析这个文件，它可能不是插件包（应为重命名为 .ext 的 APK）")
+            ?: throw Rejected("无法解析这个文件，它可能不是插件包（应为 APK，后缀可以随意改）")
 
         if (!info.isSigned) {
             throw Rejected("插件包没有签名，无法建立信任，不能安装")
@@ -191,27 +232,68 @@ object PluginInstallService {
     /**
      * 读 manifest 里的 uses-feature，确认是给本应用的插件。
      *
-     * 必须**同时**带上 [PackageManager.GET_META_DATA]：只传 GET_SIGNING_CERTIFICATES 时，
-     * 框架按"只取签名"的路径解析，`reqFeatures` 保持 null，于是所有合法插件都会被判成
-     * "没有声明 lifeboard.plugin 特性"——正是真机上装不上 demo 插件的原因。
-     * GET_META_DATA 会触发完整清单解析，`reqFeatures` 才有值。
+     * ## 为什么不用 `getPackageArchiveInfo(...).reqFeatures`
+     *
+     * 真机实测这条取不到值：`reqFeatures` 只在完整安装解析时才填充，
+     * 无论 flag 加不加 `GET_META_DATA`，对未安装的包都可能是 null，
+     * 结果是所有合法插件都被判成「没声明特性」。
+     *
+     * ## 为什么不用 AssetManager + XmlResourceParser
+     *
+     * 试过用 `addAssetPath` 挂载未安装的 APK 再解 XML，同样在真机失败：
+     * `AssetManager()` 的构造器、`addAssetPath`、`openXmlResourceParser`
+     * 都是隐藏 API，从 Android 14 起进了非 SDK 接口限制名单（本设备是 API 36），
+     * 反射调用直接抛异常。
+     *
+     * ## 现在的做法
+     *
+     * 二进制 AXML 的字符串池是明文存放的，直接把 APK 里 `AndroidManifest.xml`
+     * 的字节读出来做子串匹配。这不依赖任何隐藏 API，也不会因为系统版本变化失效。
+     *
+     * 代价是它只证明「这个字符串出现过」，不能证明它挂在 `<uses-feature>` 上。
+     * 因此同时要求 `uses-feature` 这个标签名也在字符串池里，
+     * 把「随便塞个字符串」的误判挡掉。真正的安全边界是签名校验（见 [validate]），
+     * 这里只做「这不是给人乱选的文件」的初筛。
      */
     private fun declaresPluginFeature(context: Context, archive: File): Boolean = runCatching {
-        val pm = context.packageManager
-        val flags = android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES or
-            android.content.pm.PackageManager.GET_META_DATA
-        val pi = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-            pm.getPackageArchiveInfo(
-                archive.absolutePath,
-                android.content.pm.PackageManager.PackageInfoFlags.of(flags.toLong()),
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            pm.getPackageArchiveInfo(archive.absolutePath, flags)
+        java.util.zip.ZipFile(archive).use { zip ->
+            val entry = zip.getEntry(MANIFEST_ENTRY) ?: return@use false
+            if (entry.size > MAX_MANIFEST_BYTES) return@use false
+            val bytes = zip.getInputStream(entry).use { it.readBytes() }
+            containsAxmlString(bytes, "uses-feature") &&
+                containsAxmlString(bytes, PLUGIN_FEATURE)
         }
-        // reqFeatures 读不到时按「没声明」处理：宁可拒绝，也不放进来路不明的包
-        pi?.reqFeatures?.any { it.name == PLUGIN_FEATURE } == true
-    }.getOrDefault(false)
+    }.getOrElse {
+        Log.w(TAG, "读取插件包的 uses-feature 失败：${archive.name}", it)
+        false
+    }
+
+    /**
+     * 在二进制 AXML 的字符串池里找一段明文。
+     *
+     * 字符串池按 [android.util.TypedValue] 的标志分 UTF-8 与 UTF-16 两种编码，
+     * aapt2 对小字符串默认用 UTF-8，老工具链可能用 UTF-16，两种都试一遍。
+     */
+    private fun containsAxmlString(bytes: ByteArray, target: String): Boolean {
+        fun indexOf(needle: ByteArray): Boolean {
+            if (needle.isEmpty() || needle.size > bytes.size) return false
+            outer@ for (i in 0..bytes.size - needle.size) {
+                for (j in needle.indices) {
+                    if (bytes[i + j] != needle[j]) continue@outer
+                }
+                return true
+            }
+            return false
+        }
+        return indexOf(target.toByteArray(Charsets.UTF_8)) ||
+            indexOf(target.toByteArray(Charsets.UTF_16LE))
+    }
+
+    /** APK 里未编译前的清单文件路径（ZIP 内的固定名字） */
+    private const val MANIFEST_ENTRY = "AndroidManifest.xml"
+
+    /** 正常 manifest 只有几 KB，超过这个量说明文件不对，直接拒掉免得读进内存 */
+    private const val MAX_MANIFEST_BYTES = 1L * 1024 * 1024
 
     /** 插件包必须在 manifest 里声明的 uses-feature 名，与 plugin-api/PLUGIN_SDK.md 一致 */
     private const val PLUGIN_FEATURE = "lifeboard.plugin"

@@ -30,7 +30,15 @@ import java.io.File
 class PluginLoaderEndToEndTest {
 
     private lateinit var context: Context
-    private val demoArchive = "demo-plugin.ext"
+
+    /**
+     * 落到插件目录时必须是 `.apk`。
+     *
+     * `.ext` 只是分发给用户的文件后缀（安装服务读 SAF 时会改名），
+     * 插件目录里只认 `包名.apk`，写成 `.ext` 会被 `listArchives` 直接过滤掉，
+     * 表现为「扫描结果永远是 0 个插件」。
+     */
+    private val demoArchive = "com.lifeboard.plugin.demo${PluginInstaller.APK_SUFFIX}"
 
     @Before
     fun setUp() {
@@ -137,21 +145,22 @@ class PluginLoaderEndToEndTest {
     @Test
     fun brokenArchive_isReportedWithReason_notSilentlyDropped() {
         // 用户放了个不是 APK 的文件：必须出现在 broken 列表里，否则用户找不到原因
-        File(PluginInstaller.pluginsDir(context), "garbage.ext").writeText("not an apk")
+        File(PluginInstaller.pluginsDir(context), "garbage${PluginInstaller.APK_SUFFIX}").writeText("not an apk")
 
         PluginLoader.scan(context)
 
         val broken = PluginLoader.brokenPlugins()
         assertEquals(1, broken.size)
-        assertEquals("garbage.ext", broken.first().archiveName)
+        assertEquals("garbage${PluginInstaller.APK_SUFFIX}", broken.first().archiveName)
         assertTrue(broken.first().reason.isNotBlank())
     }
 
     @Test
     fun pluginDeclaresCurrentApiVersion() {
-        // 插件声明的契约版本必须与宿主一致，否则会被加载器拒绝。
-        // demo 插件已改为跟随 PluginApi.VERSION，这里守住这条约定：
-        // 写死数字的插件在契约升级时会静默失效（M5 就把 6 个用例一起弄红过）
+        // 插件应当跟随 PluginApi.VERSION 而不是写死数字：
+        // 写死的版本在契约升级后会与宿主脱节（M5 就把 6 个用例一起弄红过）。
+        // 注意加载器现在是向后兼容判定（插件版本 ≤ 宿主即可），
+        // 所以这条断言守的是「插件与宿主源码在同一版本上」，不是加载条件本身
         installDemoArchive()
         val archive = File(PluginInstaller.pluginsDir(context), demoArchive)
         val info = PluginInstaller.readArchiveInfo(context, archive)!!

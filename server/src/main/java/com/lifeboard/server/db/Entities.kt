@@ -152,6 +152,33 @@ data class SourceHealthEntity(
 )
 
 /**
+ * 应用内日志。
+ *
+ * 为什么要有这张表：排查插件、采集、调度问题时只靠 `adb logcat` 很不可靠——
+ * 日志缓冲随时被系统日志顶掉，进程被杀后更是什么都不剩，
+ * 「到底加载了没有、为什么没出数」在用户手机上无从查证。
+ * 落进数据库后，手机端自己就能看、能导出，不依赖电脑。
+ *
+ * 与 `android.util.Log` 是**并行**关系：Logcat 仍照常输出，
+ * 这里只是多一份可持久化、可检索的记录（参考 `external/AutoAccounting` 的做法）。
+ */
+@Entity(
+    tableName = "app_log",
+    indices = [Index("time"), Index("level")],
+)
+data class AppLogEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0L,
+    /** DEBUG / INFO / WARN / ERROR */
+    val level: String,
+    /** 来源模块，如 PluginLoader、Aggregate，方便按模块筛 */
+    val tag: String,
+    /** 调用点，形如 `PluginLoader.kt:168`，由记录方自动填入 */
+    val location: String,
+    val message: String,
+    val time: Long,
+)
+
+/**
  * 原始通知流水（M4 校准用）。
  *
  * 记录目标应用的每一条通知原文，不管是否命中规则——
@@ -307,10 +334,23 @@ data class DashboardTabEntity(
     ],
     indices = [
         Index("tabId"),
-        // 「同一页签里同一种卡只能有一张」。M6b2 起用户可以自己加卡，
-        // 界面上再挡一次也挡不住加卡选择器里连点两下——那是两次独立的读改写。
-        // 非 METRIC 卡没有绑定信息，UI 侧只能按类型去重，所以约束就落在 type 上。
-        Index(value = ["tabId", "type"], unique = true),
+        // 「同一页签里同一种卡只能有一张」这条规则**不再由数据库索引保证**。
+        //
+        // 原因是指标卡需要放开：它绑的是某个源的具体指标，一个页签里摆
+        // 「步数 / 睡眠 / 屏幕使用」是正常需求，而 v12 的 (tabId, type) 唯一索引
+        // 不区分类型，导致加了一张指标卡之后再也加不了第二张（界面表现为点了没反应）。
+        //
+        // 想只对非指标卡唯一，需要 SQLite 的局部索引
+        // `... ON (tabId, type) WHERE type <> 'METRIC'`，但 **Room 的 @Index 表达不了
+        // WHERE 子句**：它生成的建表语句是整表唯一索引，迁移脚本建的是局部索引，
+        // 两者 SQL 文本对不上，Room 打开数据库时的 schema 校验会直接报
+        // 「Migration didn't properly handle」并崩溃。
+        //
+        // 所以去重口径统一收到应用层的 [com.lifeboard.server.dashboard.DashboardCards.isDuplicate]：
+        // 它比索引更精确（指标卡能细到「源 + 指标」），代价是失去「连点两下」的
+        // 数据库兜底——两次并发的读改写理论上能各插一张。这个代价可以接受：
+        // 重复的卡只是显示同一个数字，不像重复写记录那样有副作用。
+        Index("tabId", "type"),
     ],
 )
 data class DashboardCardEntity(
@@ -321,3 +361,74 @@ data class DashboardCardEntity(
     val order: Int,
     val tabId: String,
 )
+
+/**
+ * 插件上报的原始条目（「上次同步的快照」）。
+ *
+ * ## 为什么单独一张表而不是塞进 metric
+ *
+ * `metric` 的主键是 `(sourceType, date, bucket)`，一天一条聚合值——
+ * 原始条目一天可能几十上百条，塞进去会破坏主键语义，也会污染所有按天聚合的查询。
+ * 而且这些条目**只用于展示**：不参与判定、不参与计分、不进趋势图。
+ *
+ * ## 为什么是快照而不是历史
+ *
+ * 用户想看的是「某次同步到底拿到了什么」。这张表按 `(pluginId, date, metricKey)`
+ * 整体替换：同一天同一指标再同步一次就覆盖，不同日期各存各的——
+ * 历史回补拉回来的旧日期也能留下来，时间段筛选就是在这些日期里挑。
+ *
+ * @property pluginId 所属插件，清空与查询都按它过滤
+ * @property date 条目所属的日期（`yyyy-MM-dd`）。按它做时间段筛选与整体替换
+ * @property metricKey 属于哪个指标，展示时按它分组
+ * @property timestamp 条目时间（毫秒），区间类条目取起始时刻
+ * @property value 条目数值，区间类条目是时长
+ * @property detail 附注（如「23:40 → 07:20」），可为空
+ * @property seq 同一指标内的原始顺序，用来稳定排序：
+ *   时间戳可能相同（同一秒的多个采样点），光按 timestamp 排会每次刷新换一遍顺序
+ */
+@Entity(
+    tableName = "plugin_raw_record",
+    indices = [
+        Index(value = ["pluginId", "date"]),
+        Index(value = ["pluginId", "date", "metricKey"]),
+    ],
+)
+data class PluginRawRecordEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0L,
+    val pluginId: String,
+    val date: String,
+    val metricKey: String,
+    val timestamp: Long,
+    val value: Double,
+    val detail: String = "",
+    val seq: Int = 0,
+)
+
+/**
+ * 记录「某个插件的某个指标在某天被查询过」。
+ *
+ * ## 为什么单独一张表，而不是在 `plugin_raw_record` 里插一行空记录
+ *
+ * 要解决的问题：插件查了某个指标但一条都没拿到时，详情页应该显示「暂无」，
+ * 而不是让这个指标凭空消失。光靠 `plugin_raw_record` 分不清
+ * 「没查过」和「查了但为空」——两种情况下那张表都没有行。
+ *
+ * 用一张只有一行的旁表，查询侧的语义最直接：先按时间段取「查过哪些指标」，
+ * 再把这些指标各自去 `plugin_raw_record` 里取条目，取不到就显示「暂无」。
+ * 若改在主表插空行，则每个读主表的地方都要过滤掉这些假条目，
+ * 漏一处就会在列表里看到一行 `value = 0` 的幽灵数据。
+ *
+ * 主键是 `(pluginId, date, metricKey)`：同一天重复查询只留一行，
+ * 不需要额外的去重逻辑。
+ */
+@Entity(
+    tableName = "plugin_metric_query",
+    primaryKeys = ["pluginId", "date", "metricKey"],
+    indices = [Index(value = ["pluginId", "date"])],
+)
+data class PluginMetricQueryEntity(
+    val pluginId: String,
+    val date: String,
+    val metricKey: String,
+)
+

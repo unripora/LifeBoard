@@ -22,6 +22,8 @@ import com.lifeboard.server.db.AppUsageEntity
 import com.lifeboard.server.db.LifeBoardDatabase
 import com.lifeboard.server.health.SourceHealthChecker
 import com.lifeboard.server.ipc.MetricWriter
+import com.lifeboard.server.log.AppLogger
+import com.lifeboard.server.plugin.PluginLoader
 import com.lifeboard.server.source.SourceProviderRegistry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.filterNotNull
@@ -49,10 +51,15 @@ class DailyAggregateWorker(
         val today = Dates.today()
         val yesterday = today.minusDays(1)
 
+        // WorkManager 可能在应用初始化扫描插件之前就拉起本进程。
+        // 不先等一次扫描，注册表就是空的，插件会被静默跳过（界面看着正常、数据不动）
+        runCatching { PluginLoader.awaitFirstScan(applicationContext) }
+            .onFailure { AppLogger.error("确保插件扫描失败", it) }
+
         // 每次聚合都刷新全部数据源的健康度，而不只是屏幕时长：
         // 通知使用权可能在两次聚合之间被系统回收，早发现早提示。
         runCatching { SourceHealthChecker.persist(applicationContext) }
-            .onFailure { Log.e(TAG, "persist source health failed", it) }
+            .onFailure { AppLogger.error("刷新数据源健康度失败", it) }
 
         // 实例化入口走注册表：Worker 里不出现任何具体采集器类名，
         // 将来新增源（含插件）只需要在注册表登记，这里一行都不用改
@@ -60,7 +67,7 @@ class DailyAggregateWorker(
             .create(applicationContext, builtinRef(SourceType.SCREEN_TIME))
             as? ScreenTimeSource
         if (screenTime == null) {
-            Log.e(TAG, "screen time source not registered")
+            AppLogger.error("屏幕时长数据源未注册")
             return Result.failure()
         }
 
@@ -72,7 +79,7 @@ class DailyAggregateWorker(
             // 未授权只跳过屏幕时长本身，**不能提前 return**：
             // 小米健康等其它源不依赖这个权限，提前返回会把它们一起停掉，
             // 表现为「没开使用情况访问权，步数睡眠也全没了」。
-            Log.w(TAG, "usage access not granted, skip screen time only")
+            AppLogger.warn("未授予使用情况访问权，本次只跳过屏幕时长")
         }
 
         // 其它主动源（含插件）由注册表派发，与屏幕时长互不影响：失败只影响自己，不拖累整体
@@ -99,7 +106,7 @@ class DailyAggregateWorker(
                     runCatching {
                         source.collect(day.toString()).forEach { writeMetric(it) }
                     }.onFailure {
-                        Log.w(TAG, "collect ${provider.source.key} failed for $day", it)
+                        AppLogger.warn("采集 ${provider.source.key} 失败（$day）：${it.message.orEmpty()}")
                     }
                 }
             }
@@ -108,12 +115,12 @@ class DailyAggregateWorker(
     private suspend fun collectInto(source: ScreenTimeSource, day: LocalDate): Boolean {
         val date = day.toString()
         val records = runCatching { source.collect(date) }.getOrElse {
-            Log.e(TAG, "collect failed for $date", it)
+            AppLogger.error("屏幕时长采集失败：$date", it)
             return false
         }
         records.forEach { writeMetric(it) }
         writeAppUsage(source, day)
-        Log.i(TAG, "aggregated $date: ${records.joinToString { "${it.bucket}=${it.value}" }}")
+        AppLogger.info("已聚合 $date：${records.joinToString { "${it.bucket}=${it.value}" }}")
         return true
     }
 
@@ -145,7 +152,7 @@ class DailyAggregateWorker(
             )
             // 只留最近 14 天，分应用数据每天几十行，不清会一直涨
             dao.trimBefore(day.minusDays(APP_USAGE_KEEP_DAYS).toString())
-        }.onFailure { Log.w(TAG, "write app usage failed for $day", it) }
+        }.onFailure { AppLogger.warn("写入分应用用量失败：$day") }
     }
 
     /** 应用展示名，取不到就退回包名，不让一条查名失败拖垮整批写入 */
@@ -177,30 +184,51 @@ class DailyAggregateWorker(
         private const val APP_USAGE_KEEP_DAYS = 14L
 
         /**
-         * 注册每日聚合任务。
+         * 注册聚合任务，周期取自 [CollectionPrefs]。
          *
          * 用 [ExistingPeriodicWorkPolicy.UPDATE] 而不是 KEEP：改了这个 Worker 的实现后
          * 重新注册能直接生效，不会被旧的已存在任务挡住。
          *
-         * 首次注册时初始化延迟设为"距下一个 00:05 的时长"，让第一次在预期时刻跑，
-         * 而不是装上应用 0 分钟后就跑一次。
+         * 周期口径：
+         * - 每天：初始延迟设为「距下一个 00:05」，让首次在预期的日切时刻跑
+         * - 其它周期：不设固定初始延迟，按所选间隔运行
+         * - 关闭：直接取消唯一任务，不能留着旧任务继续跑
+         *
+         * 启动和开机恢复都走这里读同一份偏好，所以用户关掉之后
+         * 不会因为重启又被悄悄重新启用。
          */
         fun schedule(context: Context) {
-            val request = PeriodicWorkRequestBuilder<DailyAggregateWorker>(1, TimeUnit.DAYS)
-                .setInitialDelay(initialDelayMinutes(), TimeUnit.MINUTES)
-                .setConstraints(
-                    Constraints.Builder()
-                        .setRequiredNetworkType(NetworkType.NOT_REQUIRED)
-                        .build(),
-                )
-                .build()
+            val interval = CollectionPrefs.interval(context)
+            if (!interval.enabled) {
+                cancelSchedule(context)
+                return
+            }
+
+            val builder = PeriodicWorkRequestBuilder<DailyAggregateWorker>(
+                interval.minutes,
+                TimeUnit.MINUTES,
+            ).setConstraints(
+                Constraints.Builder()
+                    .setRequiredNetworkType(NetworkType.NOT_REQUIRED)
+                    .build(),
+            )
+            // 只有「每天」需要对齐到 00:05；其它间隔对齐反而会让用户等了半天还没跑过
+            if (interval == RefreshInterval.DAILY) {
+                builder.setInitialDelay(initialDelayMinutes(), TimeUnit.MINUTES)
+            }
 
             WorkManager.getInstance(context).enqueueUniquePeriodicWork(
                 WORK_NAME,
                 ExistingPeriodicWorkPolicy.UPDATE,
-                request,
+                builder.build(),
             )
-            Log.i(TAG, "daily aggregate scheduled, first run in ${initialDelayMinutes()} min")
+            AppLogger.info("自动刷新已注册，周期 ${interval.minutes} 分钟")
+        }
+
+        /** 取消周期刷新；手动 [collectNow] 不受影响 */
+        fun cancelSchedule(context: Context) {
+            WorkManager.getInstance(context).cancelUniqueWork(WORK_NAME)
+            AppLogger.info("自动刷新已取消")
         }
 
         /** 距离下一个 00:05 还有多少分钟 */

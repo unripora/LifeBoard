@@ -179,11 +179,13 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
      * 三道检查都在这里做，而不是只靠界面把按钮禁掉：
      * 1. 只有卡片页签可以放卡（内置整页放不了，加了也显示不出来）
      * 2. 类型必须在可选清单里
-     * 3. 该页签还没有同类型的卡
+     * 3. 该页签还没有「同样的」卡（口径见 [DashboardCards.isDuplicate]）
      *
-     * 第 3 条与库里的 (tabId, type) 唯一索引重复，但不是多余的：
-     * 这里读一次再写，两次点击各跑一次仍然可能都通过读检查；
-     * 索引会在写的时候把后一次挡住，返回 false。
+     * 第 3 条对指标卡是「同源同指标」才算重复，所以一个页签里可以放多张
+     * 绑不同指标的卡片。数据库那边的唯一索引只挡非指标卡，指标卡的真正去重
+     * 只靠这里——这是两次点击之间没有任何约束兜底的地方，
+     * 所以用两次读改写也仍然可能重复；不过重复的指标卡只是显示同一个数字，
+     * 不像重复的待办卡那样有副作用。
      *
      * @param sourceKey 指标卡绑定的数据源；其他类型必须留空（它们读固定位置的数据）。
      *   留空时指标卡会显示「数据源已不存在」，所以界面必须传
@@ -204,10 +206,12 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
                 // 指标卡没有源就是一张永远显示「源不存在」的卡，不如不加
                 if (type == CardType.METRIC && sourceKey.isNullOrBlank()) return@withContext false
                 val existing = db.dashboardCardDao().getByTab(tabId)
-                if (existing.any { DashboardCards.parseType(it.type) == type }) return@withContext false
+                if (DashboardCards.isDuplicate(type, sourceKey, metricKey, existing)) {
+                    return@withContext false
+                }
                 val card = DashboardCardEntity(
-                    // 与页签一致用时间戳：卡片表主键是字符串，同一毫秒连点两张会撞，
-                    // 所以拼上类型名把冲突概率压到足够低，真撞上了由唯一索引挡住
+                    // 与页签一致用时间戳。指标卡可以有两张，同一毫秒连点会撞主键，
+                    // 所以拼上类型名与源键把冲突概率压到足够低
                     cardId = "card_${System.currentTimeMillis()}_${type.name.lowercase()}",
                     type = type.name,
                     // 非指标卡不存绑定：留着会让「这张卡绑了什么」这种问题在无关的卡上也有答案
@@ -219,6 +223,49 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching { db.dashboardCardDao().insert(card) > 0 }.getOrDefault(false)
             }
             onAdded(ok)
+        }
+    }
+
+    /**
+     * 给一张指标卡换绑数据源与指标。
+     *
+     * 用户点卡片上的「切换数据源」时走这里，而不是「删掉再加一张」：
+     * 换绑应该保留卡片在页签里的位置，否则用户每换一次源，
+     * 这张卡就会跳到页签末尾。
+     *
+     * 目标绑定与页签里另一张指标卡重复时整条放弃（返回 false）：
+     * 页签里立刻会出现两张显示同一个数字的卡，多半是误点。
+     */
+    fun rebindMetricCard(
+        tabId: String,
+        cardId: String,
+        sourceKey: String,
+        metricKey: String?,
+        onDone: (Boolean) -> Unit = {},
+    ) {
+        if (sourceKey.isBlank()) {
+            onDone(false)
+            return
+        }
+        viewModelScope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                val cards = db.dashboardCardDao().getByTab(tabId)
+                val card = cards.firstOrNull { it.cardId == cardId } ?: return@withContext false
+                if (DashboardCards.parseType(card.type) != CardType.METRIC) {
+                    return@withContext false
+                }
+                // 判重时要排除卡片自己，否则「换成同一个源」会被当成重复
+                val others = cards.filterNot { it.cardId == cardId }
+                if (DashboardCards.isDuplicate(CardType.METRIC, sourceKey, metricKey, others)) {
+                    return@withContext false
+                }
+                runCatching {
+                    db.dashboardCardDao().upsert(
+                        card.copy(sourceKey = sourceKey, metricKey = metricKey),
+                    )
+                }.isSuccess
+            }
+            onDone(ok)
         }
     }
 
@@ -302,8 +349,9 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * 把卡片挪到另一个页签的末尾。
      *
-     * 目标页签已经有同类型的卡时整条操作放弃：跨页签搬一张「今日得分」过去，
-     * 结果是被唯一索引挡住、卡片凭空消失，比直接不让搬更让人困惑。
+     * 目标页签已经有「同样的」卡时整条操作放弃（口径见 [DashboardCards.isDuplicate]）。
+     * 对非指标卡来说是被唯一索引挡住、卡片凭空消失；对指标卡来说是目标页签里
+     * 已经有一张同指标的卡，搬过去只是多一个重复数字。两种情况都不如直接不搬。
      * 界面应该先把不可搬的目标页签置灰。
      */
     fun moveCardToTab(cardId: String, fromTabId: String, toTabId: String) {
@@ -313,8 +361,11 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
             db.withTransaction {
                 val card = db.dashboardCardDao().getByTab(fromTabId)
                     .firstOrNull { it.cardId == cardId } ?: return@withTransaction
+                val type = DashboardCards.parseType(card.type) ?: return@withTransaction
                 val target = db.dashboardCardDao().getByTab(toTabId)
-                if (target.any { it.type == card.type }) return@withTransaction
+                if (DashboardCards.isDuplicate(type, card.sourceKey, card.metricKey, target)) {
+                    return@withTransaction
+                }
                 db.dashboardCardDao().upsert(
                     card.copy(tabId = toTabId, order = (target.maxOfOrNull { it.order } ?: -1) + 1),
                 )

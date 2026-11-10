@@ -312,35 +312,39 @@ class MiHealthAuth private constructor(
                 val gate = "$IDENTITY/auth/verify$method"
 
                 // 提交验证码
-                val vresp = postJson(
-                    client,
-                    gate,
-                    mapOf(
+                val (vresp, loc) = submitVerifyCode(
+                    client = client,
+                    gate = gate,
+                    form = mapOf(
                         "_flag" to flag.toString(),
                         "ticket" to code.trim(),
                         "trust" to "false",
                         "_json" to "true",
                     ),
-                    extraQuery = mapOf(
+                    query = mapOf(
                         "_dc" to System.currentTimeMillis().toString(),
                         "_flag" to flag.toString(),
                         "_json" to "true",
                         "sid" to SID,
                         "context" to pending.context,
                     ),
-                ) ?: return@withContext LoginResult.Failure("验证码提交失败")
+                    identityUserId = pending.identityUserId,
+                )
+                if (vresp == null && loc.isBlank()) {
+                    return@withContext LoginResult.Failure("验证码提交失败")
+                }
 
-                val vcode = vresp.optInt("code", 0)
-                val loc = vresp.optString("location")
+                val vcode = vresp?.optInt("code", 0) ?: 0
                 Log.i(
                     TAG,
-                    "complete2FA verify$method: code=$vcode loc=${loc.take(80)} raw=${vresp.toString().take(300)}",
+                    "complete2FA verify$method: code=$vcode loc=$loc " +
+                        "raw=${vresp?.toString()?.take(300)}",
                 )
                 if (vcode != 0 && loc.isBlank()) {
                     Log.e(TAG, "complete2FA verify$method rejected: code=$vcode raw=$vresp")
                     return@withContext LoginResult.Failure(
                         "验证码校验未通过（code=$vcode " +
-                            "${vresp.optString("desc")}）",
+                            "${vresp?.optString("desc").orEmpty()}）",
                         vcode,
                     )
                 }
@@ -350,87 +354,107 @@ class MiHealthAuth private constructor(
 
                 // 访问 location 建立已认证会话。
                 //
-                // 这里**必须跟随重定向**：客户端的 followRedirects 是关的
-                // （passport 的第一步要求不跟随），但这一步恰恰要靠跳转链把
-                // 认证 cookie 一层层种下去。只发一个不跟随的请求，会话不算建立，
-                // 后面重做 serviceLogin 就还是未认证状态，返回 70016。
-                //
-                // 也不要在这里覆盖 UA：跳转链后半段落在 identity / sts 域上，
-                // 那些端点认的是米家 App 形态的 UA，套用 passport 的 UA 会被拒。
+                // 这里必须把整条跳转链走完：认证 cookie（passToken / cUserId /
+                // userId / passInfo / identity_session）是在中间那一跳的
+                // `Set-Cookie` 里种下的，最后一跳才给出 serviceToken。
+                // 参考实现（Python requests）由 `session.get(loc)` 自动完成，
+                // 插件这边改为**手动逐跳跟随**：不依赖 OkHttp 的
+                // `followRedirects` 对跨域/跨协议跳转的处理细节，
+                // 也避免某一跳的响应体没被读完就继续、导致 cookie 丢失。
                 runCatching {
-                    val noRedirect = client.newBuilder().followRedirects(true).build()
-                    noRedirect.newCall(
-                        Request.Builder().url(absUrl(loc)).build(),
-                    ).execute().use { it.body?.string() }
+                    followRedirectsManually(client, absUrl(loc), pending.identityUserId)
                 }.onFailure { Log.w(TAG, "complete2FA: visit location failed", it) }
 
-                // 到这里 2FA 已经真正通过：服务端在这次会话里下发了
-                // passToken / serviceToken / cUserId / userId（见 cookieSummary）。
-                //
-                // 原先这里会重做一次 serviceLogin 去换 ssecurity，但那一步在
-                // 已认证会话上会返回 70016——token 明明已经拿到，却非要再问一次，
-                // 反而被拒。认证凭据直接从会话里取。
+                // 访问 location 前后的 cookie 差异，是判断「会话是否建立」的唯一依据。
+                // requests.Session 会自动沉淀 Set-Cookie，OkHttp 要靠 cookieJar 显式接住，
+                // 两者行为不一致时这里能直接看出来。
+                Log.i(
+                    TAG,
+                    "after visitLocation cookies=${pending.cookieSummary()} " +
+                        "passTokenLen=${pending.cookieJar()?.value("passToken")?.length ?: 0}",
+                )
+
+                // 到这里 2FA 已经通过，会话里应当同时有
+                // passToken / cUserId / userId / serviceToken。
+                // 先把它们从 cookie 里取出来——后面的三条取 ssecurity 的路都用得上。
                 val jar = pending.cookieJar()
-                val serviceToken = jar?.value("serviceToken").orEmpty()
                 val passInfo = jar?.value("passInfo").orEmpty()
 
-                // ssecurity 有三个可能来源，按可靠性依次尝试：
-                // 1. auth2 响应（服务端亲手给的，最可靠）
-                // 2. passInfo cookie（实测经常为空）
-                // 3. 重做 serviceLogin——只有在 location 已经访问过、会话真正认证后
-                //    才会返回 code=0；之前失败是因为顺序反了（先问再访问）
-                var ssecurity = pending.auth2Ssecurity.ifBlank { extractSsecurity(passInfo) }
-                var cUserId = jar?.value("cUserid") ?: jar?.value("cUserId").orEmpty()
+                var cUserId = jar?.value("cUserId").orEmpty()
                 var passToken = jar?.value("passToken").orEmpty()
-                var finalToken = serviceToken
+                var userId = jar?.value("userId").orEmpty()
+                var finalToken = jar?.value("serviceToken").orEmpty()
 
-                if (ssecurity.isBlank() || finalToken.isBlank()) {
-                    val again = getJson(
-                        client, "$ACCOUNT/pass/serviceLogin",
-                        mapOf("sid" to SID, "_json" to "true"),
-                    )
-                    if (again != null) {
-                        lastLoginDiagnostic = "code=${again.optInt("code", -1)} " +
-                            "desc=${again.optString("desc")} " +
-                            "hasSsec=${again.optString("ssecurity").isNotBlank()} " +
-                            "hasLoc=${again.optString("location").isNotBlank()}"
-                        if (ssecurity.isBlank()) {
-                            ssecurity = again.optString("ssecurity")
+                // ── 第 1 条路：重做 serviceLogin ──
+                //
+                // 参考实现 `login.py:finish_2fa` 的做法：2FA 通过后会话已认证，
+                // 再问一次 serviceLogin 就能直接拿到 ssecurity。
+                //
+                // 实测本账号返回 code=0 但没有 ssecurity，说明这条路并不可靠，
+                // 因此只作为其中一次尝试，不再当成唯一来源。
+                var ssecurity = ""
+                val again = getJsonRaw(
+                    client, "$ACCOUNT/pass/serviceLogin",
+                    mapOf("sid" to SID, "_json" to "true"),
+                )
+                lastLoginDiagnostic = if (again == null) {
+                    "serviceLogin 返回空"
+                } else {
+                    "code=${again.optInt("code", -1)} " +
+                        "desc=${again.optString("desc")} " +
+                        "hasSsec=${again.optString("ssecurity").isNotBlank()} " +
+                        "hasLoc=${again.optString("location").isNotBlank()}"
+                }
+                if (again != null) {
+                    ssecurity = again.optString("ssecurity").orEmpty()
+                    // 重做时可能带出新的 token / 用户标识，缺哪个补哪个
+                    if (cUserId.isBlank()) cUserId = again.optString("cUserId").orEmpty()
+                    if (passToken.isBlank()) passToken = again.optString("passToken").orEmpty()
+                    if (userId.isBlank()) userId = again.optString("userId").orEmpty()
+                    if (finalToken.isBlank()) {
+                        val loc2 = again.optString("location").orEmpty()
+                        if (loc2.isNotBlank()) {
+                            finalToken = fetchServiceToken(client, loc2).orEmpty()
                         }
-                        if (cUserId.isBlank()) cUserId = again.optString("cUserId")
-                        if (passToken.isBlank()) passToken = again.optString("passToken")
-                        if (finalToken.isBlank()) {
-                            val loc2 = again.optString("location")
-                            if (loc2.isNotBlank()) {
-                                finalToken = fetchServiceToken(client, loc2).orEmpty()
-                            }
-                        }
-                    } else {
-                        lastLoginDiagnostic = "serviceLogin 返回空"
                     }
                 }
 
-                if (ssecurity.isBlank()) {
-                    // 最后一条路：用拿到的 passToken 独立换一套完整凭据。
-                    // 这条路径是给「日常续期」用的，逻辑最简单也最稳，
-                    // 不依赖当前这个已经被 2FA 搅过的会话。
-                    val refreshed = if (passToken.isNotBlank()) {
-                        refreshWithPassToken(
-                            passToken = passToken,
-                            cUserId = cUserId,
-                            userId = jar?.value("userid").orEmpty(),
-                        )?.copy(account = pending.account)
-                    } else {
-                        null
-                    }
+                // ── 第 2 条路：从 passInfo cookie 解析 ──
+                // 服务端有时只把 ssecurity 塞进这个 cookie，响应体里没有。
+                if (ssecurity.isBlank()) ssecurity = extractSsecurity(passInfo)
+
+                // ── 第 3 条路：用 passToken 独立换一套完整凭据 ──
+                //
+                // 这条路是给「日常续期」用的，逻辑最简单也最稳，
+                // 不依赖当前这个已经被 2FA 搅过的会话。
+                //
+                // userId 的 cookie 名大小写敏感（大写 I）。曾写成全小写的 `userid`，
+                // 取值永远是 null，于是换票请求只带 passToken，
+                // 服务端按「未认证」处理，稳定返回 70016。
+                if (ssecurity.isBlank() && passToken.isNotBlank()) {
+                    val refreshed = refreshWithPassToken(
+                        passToken = passToken,
+                        cUserId = cUserId,
+                        userId = userId,
+                    )
                     if (refreshed != null && refreshed.isValid()) {
-                        return@withContext LoginResult.Success(refreshed)
+                        return@withContext LoginResult.Success(
+                            refreshed.copy(account = pending.account),
+                        )
                     }
-                    // 拿不到 ssecurity 就无法解密任何后续响应，必须让用户看到原因
+                }
+
+                if (ssecurity.isBlank() || finalToken.isBlank()) {
+                    // 拿不到 ssecurity 就派生不出 sessionKey，任何数据接口都会失败，
+                    // 必须让用户看到原因而不是静默返回空数据
                     return@withContext LoginResult.Failure(
-                        "登录已通过但缺少 ssecurity。retry=[$lastLoginDiagnostic] " +
+                        "登录已通过但缺少 " +
+                            (if (ssecurity.isBlank()) "ssecurity" else "serviceToken") +
+                            "。retry=[$lastLoginDiagnostic] " +
                             "refresh=[$lastRefreshDiagnostic] " +
-                            "passToken=${passToken.length}",
+                            "passToken=${passToken.length} " +
+                            "cUserId=${cUserId.length} userId=${userId.length} " +
+                            "serviceToken=${finalToken.length}",
                     )
                 }
 
@@ -531,20 +555,30 @@ class MiHealthAuth private constructor(
         account: String,
     ): LoginResult {
         val notificationUrl = absUrl(notificationUrlRaw)
-        // 同 complete2FA：authStart 要靠跳转链建立验证会话，必须跟随重定向
-        runCatching {
-            val follow = client.newBuilder().followRedirects(true).build()
-            follow.newCall(
-                Request.Builder().url(notificationUrl).header("User-Agent", ua()).build(),
-            ).execute().use { it.body?.string() }
-        }.onFailure { Log.w(TAG, "start2FA: authStart failed", it) }
 
         val ctx = notificationUrl.substringAfter("context=", "")
             .substringBefore("&").let { if (it.isBlank()) "" else it }
 
+        // identity 的 UA 里要带真实 userId，参考实现从这里取（login.py start_2fa）
+        val identityUserId = notificationUrl.substringAfter("userId=", "")
+            .substringBefore("&").let { if (it.isBlank()) "" else it }
+
+        // authStart 也要带 identity UA：这一步是 identity 会话的起点，
+        // 缺了 UA 后面 verify 提交就找不到会话
+        runCatching {
+            val follow = client.newBuilder().followRedirects(true).build()
+            follow.newCall(
+                Request.Builder()
+                    .url(notificationUrl)
+                    .header("User-Agent", identityUa(identityUserId))
+                    .build(),
+            ).execute().use { it.body?.string() }
+        }.onFailure { Log.w(TAG, "start2FA: authStart failed", it) }
+
         val listJson = getJson(
             client, "$IDENTITY/list",
             mapOf("sid" to SID, "supportedMask" to "0", "_locale" to "zh_CN", "context" to ctx),
+            identityUserId = identityUserId,
         ) ?: return LoginResult.Failure("无法获取二次验证方式")
 
         val flag = listJson.optInt("flag", 4)
@@ -554,11 +588,13 @@ class MiHealthAuth private constructor(
         getJson(
             client, "$IDENTITY/auth/verify$method",
             mapOf("_flag" to flag.toString(), "_json" to "true"),
+            identityUserId = identityUserId,
         )
         if (method == "Phone") {
             postJson(
                 client, "$IDENTITY/auth/sendPhoneTicket",
                 mapOf("retry" to "0", "icode" to "", "_json" to "true"),
+                identityUserId = identityUserId,
             )
         }
 
@@ -575,6 +611,7 @@ class MiHealthAuth private constructor(
                 hint = hint,
                 auth2Ssecurity = auth2Ssecurity,
                 account = account,
+                identityUserId = identityUserId,
             ),
             method = method,
             hint = hint,
@@ -670,7 +707,8 @@ class MiHealthAuth private constructor(
         client: OkHttpClient,
         url: String,
         query: Map<String, String>,
-    ): JSONObject? = exec(client, "GET", url, query, null)
+        identityUserId: String = "",
+    ): JSONObject? = exec(client, "GET", url, query, null, identityUserId = identityUserId)
 
     private fun postJson(
         client: OkHttpClient,
@@ -678,7 +716,10 @@ class MiHealthAuth private constructor(
         form: Map<String, String>,
         extraQuery: Map<String, String> = emptyMap(),
         extraHeaders: Map<String, String> = emptyMap(),
-    ): JSONObject? = exec(client, "POST", url, extraQuery, form, extraHeaders)
+        identityUserId: String = "",
+    ): JSONObject? = exec(
+        client, "POST", url, extraQuery, form, extraHeaders, identityUserId,
+    )
 
     private fun exec(
         client: OkHttpClient,
@@ -687,6 +728,7 @@ class MiHealthAuth private constructor(
         query: Map<String, String>,
         form: Map<String, String>?,
         extraHeaders: Map<String, String> = emptyMap(),
+        identityUserId: String = "",
     ): JSONObject? {
         val base = url.toHttpUrlOrNull() ?: return null
         val full = base.newBuilder().apply {
@@ -698,7 +740,7 @@ class MiHealthAuth private constructor(
         val isIdentity = url.contains("/identity/")
         val builder = Request.Builder()
             .url(full)
-            .header("User-Agent", if (isIdentity) identityUa() else ua())
+            .header("User-Agent", if (isIdentity) identityUa(identityUserId) else ua())
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("Referer", "$ACCOUNT/")
         extraHeaders.forEach { (k, v) -> builder.header(k, v) }
@@ -732,6 +774,141 @@ class MiHealthAuth private constructor(
     }
 
     /**
+     * 提交二次验证码，并把 location 的三个来源都试一遍。
+     *
+     * 参考实现（`login.py:finish_2fa`）这么做：小米在部分场景下不把 `location`
+     * 放进 JSON，而是放在响应头 `Location`，甚至只出现在响应原文里。
+     * 只读 JSON 字段会误判成「验证码通过但没拿到跳转地址」。
+     *
+     * @return JSON（可能为 null）+ 最终确定的 location（可能为空）
+     */
+    private fun submitVerifyCode(
+        client: OkHttpClient,
+        gate: String,
+        form: Map<String, String>,
+        query: Map<String, String>,
+        identityUserId: String,
+    ): Pair<JSONObject?, String> {
+        val base = gate.toHttpUrlOrNull() ?: return null to ""
+        val full = base.newBuilder().apply {
+            query.forEach { (k, v) -> addQueryParameter(k, v) }
+        }.build()
+        val body = form.entries.joinToString("&") { (k, v) -> "${enc(k)}=${enc(v)}" }
+        val req = Request.Builder()
+            .url(full)
+            .header("User-Agent", identityUa(identityUserId))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Referer", "$ACCOUNT/")
+            .post(body.toRequestBody(FORM_MEDIA))
+            .build()
+
+        return try {
+            client.newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty().trim()
+                Log.d(TAG, "submitVerifyCode http=${resp.code} body=${text.take(300)}")
+                val json = parseMiapiJson(text)
+                // ① JSON 字段 → ② 响应头 Location → ③ 响应原文里的 location
+                val loc = json?.optString("location")?.takeIf { it.isNotBlank() }
+                    ?: resp.header("Location")?.takeIf { it.isNotBlank() }
+                    ?: Regex("location\\s*[:=]\\s*[\"']([^\"']+)")
+                        .find(text)?.groupValues?.getOrNull(1)
+                        ?.takeIf { it.isNotBlank() }
+                    ?: ""
+                json to loc
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "submitVerifyCode failed", e)
+            null to ""
+        }
+    }
+
+    /**
+     * 手动跟随重定向，逐跳把 `Set-Cookie` 存进 CookieJar。
+     *
+     * 为什么不用 `followRedirects(true)`：
+     *
+     * 1. 认证 cookie 是在中间那一跳种下的，一旦某一跳被跳过或提前中断，
+     *    `passToken` / `identity_session` 就永远拿不到，后面重做 serviceLogin
+     *    必然返回 `70016`（实测现象：`passTokenLen=0`）。
+     * 2. 跳转链会从 `account.xiaomi.com` 跨到 `sts-hlth.io.mi.com`，
+     *    依赖客户端对跨域跳转的默认处理不如自己控制来得确定。
+     * 3. 每一跳的 UA 都要保持一致（服务端认米家 App 形态的 UA），
+     *    自动跟随无法逐跳调整。
+     *
+     * 与参考实现 `requests.Session.get(loc)` 的行为对齐：读完每一跳的响应体，
+     * 记录状态码与 `Set-Cookie`，最多跟随 [MAX_REDIRECTS] 跳。
+     */
+    private fun followRedirectsManually(
+        client: OkHttpClient,
+        startUrl: String,
+        identityUserId: String,
+    ) {
+        var current = startUrl
+        repeat(MAX_REDIRECTS) { hop ->
+            val req = Request.Builder()
+                .url(current)
+                .header("User-Agent", identityUa(identityUserId))
+                .build()
+
+            val (code, nextUrl, setCookies) = client.newCall(req).execute().use { resp ->
+                // 必须读完 body：不读完就关掉会让 OkHttp 中断连接，
+                // 某些情况下后续跳转不会被触发
+                resp.body?.string().orEmpty()
+                val setCookie = resp.headers.values("Set-Cookie")
+                Triple(
+                    resp.code,
+                    resp.header("Location")?.let { java.net.URL(java.net.URL(current), it).toString() },
+                    setCookie,
+                )
+            }
+            Log.i(
+                TAG,
+                "visit hop$hop http=$code url=${current.take(90)} " +
+                    "setCookie=${setCookies.size} next=${nextUrl?.take(60) ?: "-"}",
+            )
+
+            if (code !in 300..399 || nextUrl.isNullOrBlank()) return
+
+            // 跳转目标可能跨域（account.xiaomi.com → sts-hlth.io.mi.com）
+            current = nextUrl
+        }
+    }
+
+    /**
+     * 同 [getJson]，但把原始响应体完整打进日志。
+     *
+     * 用于排查「字段明明该有却读不到」的情况：小米 passport 的响应有时是
+     * `&&&START&&&` 前缀 + JSON，有时夹带 HTML 或换行，只看解析结果会丢掉线索。
+     */
+    private fun getJsonRaw(
+        client: OkHttpClient,
+        url: String,
+        query: Map<String, String>,
+    ): JSONObject? {
+        val base = url.toHttpUrlOrNull() ?: return null
+        val full = base.newBuilder().apply {
+            query.forEach { (k, v) -> addQueryParameter(k, v) }
+        }.build()
+        val req = Request.Builder()
+            .url(full)
+            .header("User-Agent", ua())
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Referer", "$ACCOUNT/")
+            .get()
+            .build()
+        return try {
+            client.newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty().trim()
+                Log.i(TAG, "RAW serviceLogin http=${resp.code} body=$text")
+                parseMiapiJson(text)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "RAW serviceLogin failed", e)
+            null
+        }
+    }
+
+    /**
      * 小米 passport 的 JSON 响应常带 `&&&START&&&` 前缀，不能直接当 JSON 解析。
      */
     private fun parseMiapiJson(text: String): JSONObject? {
@@ -752,10 +929,14 @@ class MiHealthAuth private constructor(
      * 必须像米家 App：带 `DeviceId/` 与 `UserId/` 段，且带 `Platform/Region`。
      * 用上面 passport 那套 UA 请求 identity，服务端会返回异常或空响应，
      * 表现为「验证码发出去了，但提交后拿不到跳转地址」。
+     *
+     * [userId] 取自 `notificationUrl` 的 `userId` 查询参数。参考实现
+     * （`login.py:_identity_headers`）就是从那里取的；写死 0 在部分账号上
+     * 会让 identity 会话与账号对不上，表现为 2FA 提交后 serviceLogin 仍返回 70016。
      */
-    private fun identityUa(): String =
+    private fun identityUa(userId: String = ""): String =
         "MiHome/11.3.203 (com.xiaomi.mihome; build:11.3.203; Android 9) " +
-            "APP/com.xiaomi.mihome APPV/11.3.203 DeviceId/${deviceId} UserId/0 " +
+            "APP/com.xiaomi.mihome APPV/11.3.203 DeviceId/$deviceId UserId/$userId " +
             "Platform/Android Region/CN L/zh_CN"
 
     private fun absUrl(path: String): String =
@@ -802,6 +983,8 @@ class MiHealthAuth private constructor(
         internal val auth2Ssecurity: String = "",
         /** 登录用的账号，仅用于界面显示「当前登录的是谁」 */
         val account: String = "",
+        /** identity UA 里要带的真实 userId，取自 notificationUrl，见 [identityUa] */
+        val identityUserId: String = "",
     ) {
         /** 诊断用：列出当前会话持有的 cookie 名，判断 passToken / cUserId 有没有拿到 */
         internal fun cookieSummary(): String = cookieJar()?.names()?.joinToString(",").orEmpty()
@@ -847,9 +1030,11 @@ class MiHealthAuth private constructor(
         }
 
         override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+            val now = System.currentTimeMillis()
             cookies.forEach { c ->
                 store.removeAll { it.name == c.name && it.domain == c.domain }
-                store.add(c)
+                // 已过期的（Max-Age=0）等同于删除，不要再存回来
+                if (c.expiresAt > now && c.value != "EXPIRED") store.add(c)
             }
         }
 
@@ -862,9 +1047,13 @@ class MiHealthAuth private constructor(
          */
         override fun loadForRequest(url: HttpUrl): List<Cookie> {
             val host = url.host
+            val now = System.currentTimeMillis()
             return store.filter { c ->
                 val d = c.domain.trimStart('.')
-                host == d || host.endsWith(".$d")
+                // 跳过已过期的：小米会在跳转链里下发 ptn_count=EXPIRED（Max-Age=0），
+                // 这类 cookie 必须当作删除处理，否则会带着废值去请求
+                val alive = c.expiresAt > now && c.value != "EXPIRED"
+                alive && (host == d || host.endsWith(".$d"))
             }
         }
 
@@ -891,10 +1080,18 @@ class MiHealthAuth private constructor(
 
     companion object {
         private const val TAG = "LifeBoardMiHealth"
-
         private const val ACCOUNT = "https://account.xiaomi.com"
         private const val IDENTITY = "$ACCOUNT/identity"
         private const val SID = "miothealth"
+
+        /**
+         * 手动跟随重定向的最大跳数。
+         *
+         * 实测小米 2FA 的 location 跳转链是 2 跳
+         * （identity/result/check → pass/serviceLoginAuth2/end → sts-hlth），
+         * 留 10 跳余量足够，同时防止异常情况下无限循环。
+         */
+        private const val MAX_REDIRECTS = 10
 
         /** passport 要求客户端自称的 SDK 版本，缺了会被判 70016 */
         private const val SDK_VERSION = "accountsdk-18.8.15"

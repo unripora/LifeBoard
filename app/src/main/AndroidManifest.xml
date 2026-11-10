@@ -30,6 +30,7 @@
         tools:ignore="QueryAllPackagesPermission" />
 
     <application
+        android:name="com.lifeboard.app.LifeBoardApp"
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
@@ -62,6 +63,18 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 日志导出：把 cache/logs 下的 .log 以 content:// 交给分享目标。
+             只暴露这一个子目录，避免整个缓存目录被任意读取 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.logs"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <!-- 强提醒：前台服务播闹钟铃声。specialUse 需声明子类型原因 -->
         <service

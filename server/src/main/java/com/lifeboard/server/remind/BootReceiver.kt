@@ -30,6 +30,8 @@ class BootReceiver : BroadcastReceiver() {
         val app = context.applicationContext
         runCatching { RemindScheduler.rescheduleAll(app) }
             .onFailure { Log.e(TAG, "reschedule after boot failed", it) }
+        // schedule 内部读用户的刷新周期偏好：关掉自动刷新的用户，
+        // 开机后不能又被重新注册周期任务
         runCatching { DailyAggregateWorker.schedule(app) }
             .onFailure { Log.e(TAG, "reschedule aggregate failed", it) }
     }

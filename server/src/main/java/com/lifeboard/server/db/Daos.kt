@@ -7,6 +7,48 @@ import androidx.room.Query
 import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
 
+/**
+ * 应用内日志的读写。
+ *
+ * 保留策略与 `external/AutoAccounting` 一致：只留最近 [KEEP_LIMIT] 条，
+ * 每次插入后立刻裁剪。比按文件大小轮转简单，也不会让库无限膨胀。
+ */
+@Dao
+interface AppLogDao {
+
+    @Insert
+    suspend fun insert(log: AppLogEntity)
+
+    /** 最新在前；level 传空表示不按级别过滤 */
+    @Query(
+        "SELECT * FROM app_log WHERE (:level = '' OR level = :level) " +
+            "AND (:query = '' OR message LIKE '%' || :query || '%' OR tag LIKE '%' || :query || '%') " +
+            "ORDER BY id DESC LIMIT :limit OFFSET :offset",
+    )
+    suspend fun page(level: String, query: String, limit: Int, offset: Int): List<AppLogEntity>
+
+    @Query("SELECT * FROM app_log ORDER BY id DESC LIMIT :limit")
+    suspend fun latest(limit: Int): List<AppLogEntity>
+
+    @Query("SELECT COUNT(*) FROM app_log")
+    suspend fun count(): Int
+
+    @Query("DELETE FROM app_log")
+    suspend fun clearAll()
+
+    /** 只保留最近 [KEEP_LIMIT] 条，其余删掉 */
+    @Query(
+        "DELETE FROM app_log WHERE id NOT IN " +
+            "(SELECT id FROM app_log ORDER BY id DESC LIMIT $KEEP_LIMIT)",
+    )
+    suspend fun trim()
+
+    companion object {
+        /** 一万条足够回溯一次完整的启动 + 采集，又不至于把库撑大 */
+        const val KEEP_LIMIT = 10_000
+    }
+}
+
 @Dao
 interface TaskDao {
     @Query("SELECT * FROM task ORDER BY id ASC")
@@ -314,7 +356,6 @@ interface DashboardCardDao {
 
 @Dao
 interface PluginCredentialDao {
-
     /** 取某插件某个槽位的密文；没有返回 null */
     @Query("SELECT cipherText FROM plugin_credential WHERE pluginId = :pluginId AND slot = :slot")
     suspend fun get(pluginId: String, slot: String): String?
@@ -333,5 +374,76 @@ interface PluginCredentialDao {
     /** 删除单个槽位 */
     @Query("DELETE FROM plugin_credential WHERE pluginId = :pluginId AND slot = :slot")
     suspend fun deleteSlot(pluginId: String, slot: String)
+}
+
+/**
+ * 插件原始条目的读写。
+ *
+ * 替换粒度是 `(pluginId, date, metricKey)`：同一天同一指标再同步就覆盖那一格，
+ * 别的格一律不动。粒度不能再粗——按天替换会让「这天只采到步数」把睡眠的历史条目抹掉，
+ * 按插件替换会让一次不完整的同步清空整段回补数据。
+ */
+@Dao
+interface PluginRawRecordDao {
+
+    /**
+     * 某插件在 [from]..[to] 这段日期内的原始条目。
+     *
+     * 排序用 `(date, metricKey, seq)` 而不是 `timestamp`：同一秒可能有多条采样点，
+     * 光按时间排会让每次展示的顺序都不稳定。
+     */
+    @Query(
+        "SELECT * FROM plugin_raw_record WHERE pluginId = :pluginId " +
+            "AND date BETWEEN :from AND :to " +
+            "ORDER BY date DESC, metricKey ASC, seq ASC, id ASC",
+    )
+    suspend fun getByRange(pluginId: String, from: String, to: String): List<PluginRawRecordEntity>
+
+    /** 某插件有原始数据的日期区间，供时间段选择器展示可选范围 */
+    @Query("SELECT MIN(date) FROM plugin_raw_record WHERE pluginId = :pluginId")
+    suspend fun earliestDate(pluginId: String): String?
+
+    @Query("SELECT MAX(date) FROM plugin_raw_record WHERE pluginId = :pluginId")
+    suspend fun latestDate(pluginId: String): String?
+
+    @Insert
+    suspend fun insertAll(rows: List<PluginRawRecordEntity>)
+
+    /**
+     * 清掉某插件某天某个指标的快照，准备用新数据整体替换。
+     *
+     * 必须带上 metricKey：只按天清会让「这天只有步数」的同步
+     * 顺手删掉库里已有的睡眠条目，表现为「同步一次原始数据反而变少了」。
+     */
+    @Query(
+        "DELETE FROM plugin_raw_record WHERE pluginId = :pluginId " +
+            "AND date = :date AND metricKey = :metricKey",
+    )
+    suspend fun deleteByDateAndMetric(pluginId: String, date: String, metricKey: String): Int
+}
+
+/**
+ * 「某个插件在某天查询过哪些指标」的读写。
+ *
+ * 只用来区分「查了但没数据」和「根本没查」，条目本身一律存在
+ * [PluginRawRecordDao]。两者按 `(pluginId, date, metricKey)` 对齐。
+ */
+@Dao
+interface PluginMetricQueryDao {
+
+    /** 某插件在 [from]..[to] 内查过的指标键，去重后的列表 */
+    @Query(
+        "SELECT DISTINCT metricKey FROM plugin_metric_query " +
+            "WHERE pluginId = :pluginId AND date BETWEEN :from AND :to",
+    )
+    suspend fun metricsInRange(pluginId: String, from: String, to: String): List<String>
+
+    /** 某插件最早有过查询痕迹的日期，供「全部」时间段算起点 */
+    @Query("SELECT MIN(date) FROM plugin_metric_query WHERE pluginId = :pluginId")
+    suspend fun earliestDate(pluginId: String): String?
+
+    /** 用 REPLACE 而不是普通 INSERT：同一天重复查询同一指标不该报主键冲突 */
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertAll(rows: List<PluginMetricQueryEntity>)
 }
 

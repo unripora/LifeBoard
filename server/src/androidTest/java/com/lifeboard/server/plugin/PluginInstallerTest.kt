@@ -24,7 +24,7 @@ import java.io.File
 class PluginInstallerTest {
 
     private lateinit var context: Context
-    private val fileName = "test-plugin.ext"
+    private val fileName = "test-plugin" + PluginInstaller.APK_SUFFIX
 
     @Before
     fun setUp() {
@@ -48,8 +48,10 @@ class PluginInstallerTest {
         assertNotNull(installed)
         assertTrue(installed!!.exists())
         assertEquals(fileName, installed.name)
+        // Android 14+ 加载 dex 要求文件不可写，安装后必须是只读
+        assertFalse("插件包安装后必须只读，否则 DexClassLoader 拒绝加载", installed.canWrite())
         // .part 必须已被 rename 掉，否则会被误认为一次未完成的写入
-        assertFalse(File(PluginInstaller.pluginsDir(context), fileName + ".ext.part").exists())
+        assertFalse(File(PluginInstaller.pluginsDir(context), fileName + ".part").exists())
         source.delete()
     }
 
@@ -68,13 +70,16 @@ class PluginInstallerTest {
 
     @Test
     fun listArchives_ignoresPartFilesAndDirectories() {
-        PluginInstaller.pluginsDir(context).resolve("good.ext").writeText("x")
-        PluginInstaller.pluginsDir(context).resolve("broken.ext.part").writeText("x")
+        val good = "good" + PluginInstaller.APK_SUFFIX
+        PluginInstaller.pluginsDir(context).resolve(good).writeText("x")
+        PluginInstaller.pluginsDir(context).resolve(good + ".part").writeText("x")
+        // 旧的 .ext 后缀已经不再被识别（API 34+ 无法作为 dex 加载）
+        PluginInstaller.pluginsDir(context).resolve("legacy.ext").writeText("x")
         PluginInstaller.pluginsDir(context).resolve("some-plugin-dir").mkdirs()
 
         val names = PluginInstaller.listArchives(context).map { it.name }
 
-        assertEquals(listOf("good.ext"), names)
+        assertEquals(listOf(good), names)
     }
 
     @Test

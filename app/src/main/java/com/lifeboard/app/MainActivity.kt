@@ -11,10 +11,19 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
@@ -41,27 +50,30 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.lifeboard.app.ui.dashboard.DashboardDefaults
 import com.lifeboard.app.ui.dashboard.DashboardViewModel
+import com.lifeboard.app.ui.dashboard.MAX_TAB_NAME_LENGTH
 import com.lifeboard.app.ui.dashboard.TabManagerDialog
 import com.lifeboard.app.ui.dashboard.TabRowUi
+import com.lifeboard.app.ui.dashboard.validateTabName
 import com.lifeboard.app.ui.debug.IpcDebugScreen
+import com.lifeboard.app.ui.log.LogScreen
 import com.lifeboard.app.ui.notice.NoticeDebugScreen
 import com.lifeboard.app.ui.panel.PanelScreen
 import com.lifeboard.app.ui.panel.TaskEditScreen
 import com.lifeboard.app.ui.panel.TrendScreen
 import com.lifeboard.app.ui.plugin.PluginScreen
+import com.lifeboard.app.ui.plugin.detail.PluginDetailScreen
 import com.lifeboard.app.ui.remind.RemindTestScreen
 import com.lifeboard.app.ui.rules.RulesScreen
 import com.lifeboard.app.ui.settings.AppearanceState
 import com.lifeboard.app.ui.settings.SettingsScreen
+import com.lifeboard.app.ui.task.TaskIndicatorButton
+import com.lifeboard.app.ui.task.TaskListDialog
 import com.lifeboard.app.ui.theme.GlassBackground
 import com.lifeboard.app.ui.theme.LifeBoardTheme
-import com.lifeboard.server.collect.DailyAggregateWorker
 import com.lifeboard.server.dashboard.BuiltinTab
 import com.lifeboard.server.dashboard.BuiltinTabs
 import com.lifeboard.server.dashboard.TabKind
 import com.lifeboard.server.db.DashboardTabEntity
-import com.lifeboard.server.mihealth.MiHealthMigration
-import com.lifeboard.server.plugin.PluginManager
 import com.lifeboard.server.remind.RemindScheduler
 
 /**
@@ -83,26 +95,8 @@ class MainActivity : ComponentActivity() {
         // Android 13+ 通知必须运行时申请，只在清单里声明是不够的：
         // 不申请的话所有提醒都发不出去，而界面上看起来一切正常
         ensureNotificationPermission()
-        // 进入应用即确保每日聚合任务已注册，避免首次安装后忘记调度
-        DailyAggregateWorker.schedule(this)
-        // 扫描已安装的 .ext 插件并注册进采集注册表。
-        // 放在主线程之外：读 APK 元数据与实例化 dex 都有 IO，不能卡启动。
-        // 失败不影响启动——插件是可选能力，坏了也不能让应用起不来。
-        Thread {
-            runCatching { PluginManager.refresh(applicationContext) }
-            // 小米健康在 M5 从内置源改成了 .ext 插件。
-            // 内置实现产出过的历史行已经没有生产者，留着会让面板出现
-            // 一张点开永远不更新的卡片，所以一次性清掉，之后靠标记不再执行。
-            // runBlocking 是安全的：这里是独立后台线程，不会阻塞 UI
-            runCatching {
-                kotlinx.coroutines.runBlocking {
-                    MiHealthMigration.cleanupLegacyRows(applicationContext)
-                    // 默认仪表盘布局的生成不在这里：它由 DashboardViewModel 负责，
-                    // 因为界面必须知道「布局到底就绪没有」才能决定首帧画什么，
-                    // 在启动线程里悄悄写完、界面却不知情，只会让首帧和真相错位
-                }
-            }
-        }.start()
+        // 插件扫描、小米历史数据清理与聚合调度都收敛在 LifeBoardApp：
+        // WorkManager 也会在没有 Activity 的情况下拉起进程，放在这里会让那种进程拿不到插件
         // 闹钟在进程被杀或跨天后会失效，每次打开应用都重排一次
         runCatching { RemindScheduler.rescheduleAll(this) }
         setContent {
@@ -161,6 +155,13 @@ private fun MainScaffold(appearance: AppearanceState) {
     // 每次打开编辑页自增，作为 Compose key 强制重建编辑器，避免复用上次状态
     var editorSession by remember { mutableIntStateOf(0) }
 
+    // 插件详情页：非 null 表示正在看该插件。同样用自增 session 做 key，
+    // 因为两次点同一个插件时 pluginId 不变，LaunchedEffect 不会重跑
+    var detailPluginId by remember { mutableStateOf<String?>(null) }
+    var detailSession by remember { mutableIntStateOf(0) }
+    var showLogs by remember { mutableStateOf(false) }
+    var logSession by remember { mutableIntStateOf(0) }
+
     /** 面板上「重新判定数据源健康度」的触发键 */
     var healthRefreshKey by remember { mutableIntStateOf(0) }
 
@@ -168,6 +169,11 @@ private fun MainScaffold(appearance: AppearanceState) {
     val dashState by dashVm.state.collectAsStateWithLifecycle()
     // 页签管理是压在顶栏上的一层弹窗
     var showTabManager by remember { mutableStateOf(false) }
+    // 「+」打开的是一层更轻的弹窗：只输入名字，建完就用。
+    // 增删改排序仍然在 TabManagerDialog 里，从「+」弹窗可以跳过去
+    var showTabCreator by remember { mutableStateOf(false) }
+    // 顶部任务指示器点开的列表
+    var showTaskList by remember { mutableStateOf(false) }
 
     // 未就绪时用内存默认布局顶一帧：这里有顺序敏感的场景——
     // 冷启动第一帧如果用空列表，ScrollableTabRow 会闪一下空白再出现页签
@@ -221,9 +227,8 @@ private fun MainScaffold(appearance: AppearanceState) {
                         containerColor = Color.Transparent,
                     ),
                     actions = {
-                        TextButton(onClick = { showTabManager = true }) {
-                            Text("页签")
-                        }
+                        // 任务指示器：空闲是静止圆环，有任务时旋转，点开看进度与历史
+                        TaskIndicatorButton(onClick = { showTaskList = true })
                     },
                 )
             },
@@ -233,23 +238,36 @@ private fun MainScaffold(appearance: AppearanceState) {
                     .fillMaxSize()
                     .padding(padding),
             ) {
-                // 8 个页签在窄屏上放不下，必须可横向滚动：
-                // 用 TabRow 会等分压缩，标签被截成两三个字就看不出是什么了
-                ScrollableTabRow(
-                    selectedTabIndex = selectedIndex,
-                    containerColor = Color.Transparent,
-                    edgePadding = 8.dp,
-                ) {
-                    tabs.forEach { tab ->
-                        Tab(
-                            selected = current.tabId == tab.tabId,
-                            onClick = { selectTab(tab.tabId) },
-                            text = {
-                                Text(
-                                    tab.label,
-                                    style = MaterialTheme.typography.labelMedium,
-                                )
-                            },
+                // 页签行 = 可横向滚动的页签 + 固定在右端的「+」。
+                // 「+」不能放进 ScrollableTabRow 里面：那样它会跟着页签一起滚走，
+                // 页签一多就找不到新增入口了
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    // 8 个页签在窄屏上放不下，必须可横向滚动：
+                    // 用 TabRow 会等分压缩，标签被截成两三个字就看不出是什么了
+                    ScrollableTabRow(
+                        selectedTabIndex = selectedIndex,
+                        containerColor = Color.Transparent,
+                        edgePadding = 8.dp,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        tabs.forEach { tab ->
+                            Tab(
+                                selected = current.tabId == tab.tabId,
+                                onClick = { selectTab(tab.tabId) },
+                                text = {
+                                    Text(
+                                        tab.label,
+                                        style = MaterialTheme.typography.labelMedium,
+                                    )
+                                },
+                            )
+                        }
+                    }
+                    IconButton(onClick = { showTabCreator = true }) {
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = "新建页签",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 }
@@ -273,10 +291,19 @@ private fun MainScaffold(appearance: AppearanceState) {
                     BuiltinTabs.ROUTE_TREND -> TrendScreen()
                     BuiltinTabs.ROUTE_REMIND -> RemindTestScreen()
                     BuiltinTabs.ROUTE_NOTICE -> NoticeDebugScreen()
-                    BuiltinTabs.ROUTE_PLUGIN -> PluginScreen()
+                    BuiltinTabs.ROUTE_PLUGIN -> PluginScreen(
+                        onOpenDetail = { pluginId ->
+                            detailSession++
+                            detailPluginId = pluginId
+                        },
+                    )
                     BuiltinTabs.ROUTE_DEBUG -> IpcDebugScreen()
                     BuiltinTabs.ROUTE_SETTINGS -> SettingsScreen(
                         appearance = appearance,
+                        onOpenLogs = {
+                            logSession++
+                            showLogs = true
+                        },
                     )
                     // 用户页签（route 为空）与一切未知路由都落到卡片容器
                     else -> PanelScreen(
@@ -311,6 +338,30 @@ private fun MainScaffold(appearance: AppearanceState) {
             }
         }
 
+        val detail = detailPluginId
+        if (detail != null) {
+            // 与编辑页同一种覆盖层：全屏、自带背景与顶栏、返回由页面自己的 BackHandler 接管。
+            // key 用「打开次数」而不是 pluginId：连续两次点同一个插件时 pluginId 不变，
+            // LaunchedEffect 不会重跑，页面会沿用上次读到的状态
+            key(detailSession) {
+                GlassBackground {
+                    PluginDetailScreen(
+                        pluginId = detail,
+                        onClose = { detailPluginId = null },
+                    )
+                }
+            }
+        }
+
+        if (showLogs) {
+            // 与插件详情页同一种覆盖层；每次打开都重建，保证看到的是当下最新的日志
+            key(logSession) {
+                GlassBackground {
+                    LogScreen(onClose = { showLogs = false })
+                }
+            }
+        }
+
         if (showTabManager) {
             TabManagerDialog(
                 tabs = tabs.map { TabRowUi(tabId = it.tabId, label = it.label, builtin = it.builtin) },
@@ -328,7 +379,88 @@ private fun MainScaffold(appearance: AppearanceState) {
                 onMove = { tabId, to -> dashVm.moveTab(tabId, to) },
             )
         }
+
+        if (showTabCreator) {
+            NewTabDialog(
+                onDismiss = { showTabCreator = false },
+                onManage = {
+                    showTabCreator = false
+                    showTabManager = true
+                },
+                onCreate = { name ->
+                    // 建完立刻切过去：新页签是空的，停在原页签会让人以为没建成
+                    dashVm.createTab(name) { newId -> selectTab(newId) }
+                },
+            )
+        }
+
+        if (showTaskList) {
+            TaskListDialog(onDismiss = { showTaskList = false })
+        }
     }
+}
+
+/**
+ * 「+」点开的新建页签弹窗。
+ *
+ * 只问名字。重命名、删除、排序这些低频操作留在 [TabManagerDialog]，
+ * 用一个入口跳过去——新建是高频动作，不该每次都先经过一个管理列表。
+ */
+@Composable
+private fun NewTabDialog(
+    onDismiss: () -> Unit,
+    onManage: () -> Unit,
+    onCreate: (String) -> Unit,
+) {
+    var name by remember { mutableStateOf("") }
+    // 与 TabManagerDialog 共用同一套校验：这里不让叫的名字，
+    // 换个入口也不能叫出来（validateTabName 返回 null 表示合法）
+    val valid = validateTabName(name) != null
+    val tooLong = name.length > MAX_TAB_NAME_LENGTH
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("新建页签") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    singleLine = true,
+                    label = { Text("页签名称") },
+                    isError = tooLong,
+                    supportingText = {
+                        // 不截断输入，只说明原因：直接吞字符会让人以为是输入法的问题
+                        Text(
+                            if (tooLong) {
+                                "超出 $MAX_TAB_NAME_LENGTH 个字符，请缩短后再提交"
+                            } else {
+                                "${name.trim().length}/$MAX_TAB_NAME_LENGTH"
+                            },
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                TextButton(onClick = onManage, contentPadding = PaddingValues(0.dp)) {
+                    Text("管理现有页签", style = MaterialTheme.typography.labelLarge)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    if (valid) {
+                        onCreate(name.trim())
+                        onDismiss()
+                    }
+                },
+                enabled = valid,
+            ) { Text("创建") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
 }
 
 /**

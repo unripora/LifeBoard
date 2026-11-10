@@ -38,7 +38,15 @@ import java.io.File
 class MiHealthPluginEndToEndTest {
 
     private lateinit var context: Context
-    private val archiveName = "mihealth-plugin.ext"
+
+    /** assets 里的文件名（`.ext` 只是分发后缀） */
+    private val assetName = "mihealth-plugin.ext"
+
+    /**
+     * 落到插件目录时的文件名必须是 `包名.apk`：
+     * [PluginInstaller.listArchives] 只认 `.apk` 结尾，写成 `.ext` 会被直接过滤掉。
+     */
+    private val archiveName = "com.lifeboard.plugin.mihealth${PluginInstaller.APK_SUFFIX}"
 
     @Before
     fun setUp() {
@@ -58,7 +66,7 @@ class MiHealthPluginEndToEndTest {
     }
 
     private fun installArchive() {
-        val apk = InstrumentationRegistry.getInstrumentation().context.assets.open(archiveName)
+        val apk = InstrumentationRegistry.getInstrumentation().context.assets.open(assetName)
         apk.use { input ->
             val target = File(PluginInstaller.pluginsDir(context), archiveName)
             target.outputStream().use { output -> input.copyTo(output) }

@@ -6,6 +6,7 @@ import com.lifeboard.plugin.api.PluginApi
 import com.lifeboard.plugin.api.PluginMetrics
 import com.lifeboard.plugin.api.SourcePlugin
 import com.lifeboard.plugin.api.SourceRef
+import com.lifeboard.server.log.AppLogger
 import com.lifeboard.server.source.SourceProviderRegistry
 import dalvik.system.DexClassLoader
 import java.io.File
@@ -45,6 +46,16 @@ object PluginLoader {
      * 因此单独记一份，供「待处理」列表展示包名与签名，让用户决定是否信任。
      */
     private val pending = mutableListOf<PendingPlugin>()
+
+    /**
+     * 是否已经完整扫描过一次。
+     *
+     * 后台聚合可能在应用初始化扫描完成之前就被 WorkManager 拉起，
+     * 此时注册表为空，采集会静默跑成「一个插件都没有」。
+     * 采集前用 [awaitFirstScan] 等一次完整扫描，堵住这个窗口。
+     */
+    @Volatile
+    private var scanned = false
 
     /**
      * 一个加载失败的插件。
@@ -141,7 +152,30 @@ object PluginLoader {
         }
 
         applyLoaded(newLoaded, newBroken, newPending)
+        scanned = true
         return newLoaded
+    }
+
+    /**
+     * 确保至少完成过一次扫描。
+     *
+     * 已经扫过就直接返回，不重复读 APK：周期任务每次执行都会调用它，
+     * 每次都全量扫描既慢又会让正在使用的插件实例被替换。
+     *
+     * 用 `synchronized` 而不是协程锁：这里的临界区是纯内存判断 + 一次
+     * 同步扫描，没有挂起点，锁持有时间就是扫描本身的时间。
+     */
+    fun awaitFirstScan(context: Context) {
+        if (scanned) return
+        synchronized(this) {
+            // 双检：等锁期间可能已被另一个线程扫完
+            if (scanned) return
+            runCatching { scan(context.applicationContext) }
+                .onFailure { AppLogger.error("首次插件扫描失败", it) }
+            // 即使扫描抛异常也标记为已扫：否则每次采集都要重试一遍坏包，
+            // 反而让后台任务一直卡在同一个失败上
+            scanned = true
+        }
     }
 
     /**
@@ -192,7 +226,7 @@ object PluginLoader {
             }
         }
         SourceProviderRegistry.setPluginProviders(providers)
-        Log.i(TAG, "已注册插件源 ${providers.size} 个，来自 ${plugins.size} 个插件")
+        AppLogger.info("已注册插件源 ${providers.size} 个，来自 ${plugins.size} 个插件")
     }
 
     /** 按插件声明 id 找已加载的插件 */
@@ -270,6 +304,10 @@ object PluginLoader {
         // 先清掉 dex 输出目录里的旧产物，否则换版本后会加载到上一版的类
         val dexOut = File(context.codeCacheDir, "plugin_dex").also { if (!it.exists()) it.mkdirs() }
 
+        // 加载前再收紧一次权限：老版本装进来的包是 rw-，升级后要能被纠正；
+        // 某些文件系统上安装时的 chmod 也可能没生效（见 PluginInstaller.markLoadable）
+        PluginInstaller.markLoadable(archive)
+
         return runCatching {
             val classLoader = DexClassLoader(
                 archive.absolutePath,
@@ -285,12 +323,19 @@ object PluginLoader {
                 return fail(archive, info.packageName, "入口类 $entryClass 未实现 SourcePlugin")
             }
 
-            // 契约版本单版本策略：不一致直接拒绝，不做多代并存
-            if (instance.apiVersion != PluginApi.VERSION) {
+            // 契约版本向后兼容：插件声明的版本不高于宿主即可加载。
+            // 契约只允许「加东西」（新增带默认实现的方法、新增数据类），
+            // 那类变更对已编译的插件二进制没有影响——它不需要重写新方法，
+            // 调用时自然走接口的默认实现。
+            //
+            // 更高版本的插件拒绝加载才是必要的：它可能用了宿主还没有的契约能力，
+            // 跑起来会以缺失方法的形式炸在半路，报错点离真正原因很远。
+            if (instance.apiVersion > PluginApi.VERSION) {
                 return fail(
                     archive,
                     info.packageName,
-                    "契约版本不匹配：插件为 ${instance.apiVersion}，宿主为 ${PluginApi.VERSION}",
+                    "插件要求的契约版本 ${instance.apiVersion} 高于宿主支持的 " +
+                        "${PluginApi.VERSION}，请升级 LifeBoard 后再使用",
                 )
             }
 
@@ -310,7 +355,7 @@ object PluginLoader {
             LoadResult.Success(LoadedPlugin(info, archive.name, instance))
         }.getOrElse { error ->
             // 插件构造里抛出的任何异常都在这里兜住，不影响其他插件
-            Log.w(TAG, "加载插件失败：${archive.name}", error)
+            AppLogger.error("加载插件失败：${archive.name}", error)
             fail(archive, info.packageName, "加载失败：${error.javaClass.simpleName} ${error.message.orEmpty()}".trim())
         }
     }
@@ -324,7 +369,7 @@ object PluginLoader {
             props.getProperty("entryClass")?.takeIf { it.isNotBlank() }
         }
     }.getOrElse { error ->
-        Log.w(TAG, "读取插件元数据失败：${archive.name}", error)
+        AppLogger.warn("读取插件元数据失败：${archive.name}：${error.message.orEmpty()}")
         null
     }
 
