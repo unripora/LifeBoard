@@ -58,15 +58,52 @@ object DashboardCards {
      * 某个页签里还没被占用的卡片类型。
      *
      * 已经放过的类型不再列出——一张「今日得分」卡在同一个页签里放两张没有任何意义，
-     * 数据库那边也有 (tabId, type) 唯一索引兜着。
+     * 数据库那边也有 (tabId, type) 的局部唯一索引兜着（指标卡除外，见 [DashboardCardEntity]）。
      *
-     * 注意这条规则对指标卡也生效，所以一个页签目前只能有一张指标卡。
-     * 这是 (`UniqueIndex` 落在 type 上) 的直接后果：卡片行里没有比 type 更细的身份，
-     * 两张指标卡在库里会撞索引。要放开得先给唯一索引加上绑定维度，是独立的一次迁移。
+     * **指标卡永远可加**，只要还有可选的数据源。它绑的是某个源的具体指标，
+     * 一个页签里摆「步数 / 睡眠 / 屏幕使用」是正常需求；
+     * 「同一个指标放两张」由 [isDuplicate] 挡，而不是在这里按类型排除。
      *
      * @param existing 该页签已有的卡片类型（未能识别的类型应已被过滤掉）
      */
-    fun addableTo(existing: List<CardType>): List<CardType> = OFFERABLE.filter { it !in existing }
+    fun addableTo(existing: List<CardType>): List<CardType> =
+        OFFERABLE.filter { it == CardType.METRIC || it !in existing }
+
+    /**
+     * 这张卡是否与页签里已有的某张卡重复。
+     *
+     * 判重口径随类型而变：
+     * - 指标卡：**同一个数据源 + 同一个指标**才算重复。同一个指标放两张，
+     *   读出来是同一个数字，纯属重复；不同指标则完全合法
+     * - 其余类型：同类型即重复，它们读的是固定位置的数据，没有更细的身份
+     *
+     * 与数据库的唯一索引是两层保障，但**含义不同**：索引只管到 type，
+     * 这里能管到「指标卡绑的是哪个指标」。所以指标卡的真正去重只在这里生效。
+     *
+     * @param type 要加的卡片类型
+     * @param sourceKey 要加的卡片绑定的数据源（仅指标卡有）
+     * @param metricKey 要加的卡片绑定的指标（仅指标卡有）
+     * @param existing 该页签已有的卡片行
+     */
+    fun isDuplicate(
+        type: CardType,
+        sourceKey: String?,
+        metricKey: String?,
+        existing: List<DashboardCardEntity>,
+    ): Boolean {
+        if (type != CardType.METRIC) {
+            return existing.any { parseType(it.type) == type }
+        }
+        // 指标卡没有源就是一张永远显示「源不存在」的卡，调用方应先挡掉；
+        // 走到这里时按源与指标一起比
+        val normalizedSource = sourceKey?.takeIf { it.isNotBlank() }
+        val normalizedMetric = metricKey?.takeIf { it.isNotBlank() }
+        return existing.any { row ->
+            parseType(row.type) == CardType.METRIC &&
+                row.sourceKey?.takeIf { it.isNotBlank() } == normalizedSource &&
+                row.metricKey?.takeIf { it.isNotBlank() } == normalizedMetric
+        }
+    }
 
     /**
      * 这个页签上可以放卡片吗。

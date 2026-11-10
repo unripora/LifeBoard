@@ -49,6 +49,7 @@ import com.lifeboard.core.util.Dates
 import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.server.dashboard.CardType
 import com.lifeboard.server.dashboard.DashboardCards
+import com.lifeboard.server.db.DashboardCardEntity
 import com.lifeboard.server.health.SourceHealthChecker
 import com.lifeboard.server.metric.MetricCandidate
 import com.lifeboard.server.metric.MetricQueryService
@@ -116,8 +117,13 @@ fun PanelScreen(
     // 第一层关掉之后再开这一层，两个弹窗不会同时存在
     var pickingMetric by remember(tabId) { mutableStateOf(false) }
 
+    // 正在换绑数据源的那张指标卡。null 表示不在换绑。
+    // 与 pickingMetric 分开：换绑针对一张已存在的卡，加卡针对「将要新增的卡」，
+    // 两者共用一个弹窗但落点不同
+    var rebindingCard by remember(tabId) { mutableStateOf<DashboardCardEntity?>(null) }
+
     // 「已存在类型」按卡片行本身算，而不是按上面渲染用的 CardType：
-    // 加卡片的判重必须和库里的 (tabId, type) 唯一索引看同一份事实
+    // 加卡片的判重必须和库里的唯一索引看同一份事实
     val existingTypes = remember(storedCards) {
         storedCards.mapNotNull { DashboardCards.parseType(it.type) }
     }
@@ -192,6 +198,13 @@ fun PanelScreen(
                     state = state,
                     metricReading = storedCards.getOrNull(index)
                         ?.let { row -> metricStates.firstOrNull { it.cardId == row.cardId } },
+                    // 指标卡可以点开换数据源（M6b2c）。其他类型传 null：
+                    // 它们读的是固定位置的数据，没有「换源」这回事
+                    onChangeMetricSource = if (type == CardType.METRIC) {
+                        { storedCards.getOrNull(index)?.let { rebindingCard = it } }
+                    } else {
+                        null
+                    },
                     onRefresh = { vm.reevaluate() },
                     onMarkDone = { vm.markDone(it) },
                     onEditTask = onEditTask,
@@ -254,6 +267,29 @@ fun PanelScreen(
         )
     }
 
+    // 换绑：与加卡共用同一个选择器。disabled 里塞的是本页签已被占用的绑定，
+    // 用户能看见「睡眠（已添加）」而不是点下去没反应
+    rebindingCard?.let { card ->
+        MetricSourcePickerDialog(
+            title = "切换数据源",
+            disabled = remember(storedCards, card.cardId) {
+                storedCards
+                    .filter { it.cardId != card.cardId && it.type == CardType.METRIC.name }
+                    .mapNotNull { row ->
+                        val source = row.sourceKey?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                        source to row.metricKey?.takeIf { it.isNotBlank() }
+                    }
+                    .toSet()
+            },
+            onDismiss = { rebindingCard = null },
+            onPick = { sourceKey, metricKey ->
+                dashVm.rebindMetricCard(tabId, card.cardId, sourceKey, metricKey) { ok ->
+                    if (ok) rebindingCard = null
+                }
+            },
+        )
+    }
+
     pendingDelete?.let { row ->
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
@@ -287,6 +323,8 @@ private fun CardHost(
     type: CardType,
     state: PanelUiState,
     metricReading: MetricCardState?,
+    /** 指标卡的「换数据源」入口；非指标卡为 null */
+    onChangeMetricSource: (() -> Unit)?,
     onRefresh: () -> Unit,
     onMarkDone: (TaskRow) -> Unit,
     onEditTask: (Long) -> Unit,
@@ -321,7 +359,10 @@ private fun CardHost(
             }
         }
 
-        CardType.METRIC -> MetricCard(reading = metricReading)
+        CardType.METRIC -> MetricCard(
+            reading = metricReading,
+            onChangeSource = onChangeMetricSource,
+        )
     }
 }
 
@@ -333,9 +374,17 @@ private fun CardHost(
  * - 没有数据：空状态 + 一句为什么，让用户知道该等等还是该去查源
  * - 源不见了：明确说出来，并提示这张卡需要重新绑定
  *   （这张卡绑的自建源被删了、插件被卸了——不是「还没采集到」）
+ *
+ * ## 为什么换源按钮放在卡内右上角而不是编辑态里
+ *
+ * 换数据源是「这张卡要显示什么」的问题，和「这张卡摆在哪」是两回事。
+ * 放进编辑态的话，用户想换一个源要先点「调整卡片」，换完再点「完成」——
+ * 而他此刻只是想看另一个指标。右上角本来就空着，放一个「换源」不占新的一行。
+ *
+ * @param onChangeSource 换绑入口；为 null 时（非指标卡场景）连按钮都不出现
  */
 @Composable
-private fun MetricCard(reading: MetricCardState?) {
+private fun MetricCard(reading: MetricCardState?, onChangeSource: (() -> Unit)? = null) {
     GlassCard(modifier = Modifier.fillMaxWidth()) {
         when (val result = reading?.result) {
             null -> {
@@ -350,7 +399,7 @@ private fun MetricCard(reading: MetricCardState?) {
 
             is MetricResult.Value -> {
                 val value = result.reading
-                Text(value.title, style = MaterialTheme.typography.titleSmall)
+                MetricCardHeader(title = value.title, onChangeSource = onChangeSource)
                 Text(
                     formatMetricValue(value),
                     style = MaterialTheme.typography.headlineMedium,
@@ -367,7 +416,7 @@ private fun MetricCard(reading: MetricCardState?) {
             }
 
             MetricResult.NoData -> {
-                Text("指标", style = MaterialTheme.typography.titleSmall)
+                MetricCardHeader(title = "指标", onChangeSource = onChangeSource)
                 Text(
                     "还没有数据。采集完成后这里会自动更新。",
                     style = MaterialTheme.typography.bodySmall,
@@ -376,9 +425,9 @@ private fun MetricCard(reading: MetricCardState?) {
             }
 
             MetricResult.SourceUnavailable -> {
-                Text("指标", style = MaterialTheme.typography.titleSmall)
+                MetricCardHeader(title = "指标", onChangeSource = onChangeSource)
                 Text(
-                    "这个数据源已经不存在了。移除这张卡后重新添加即可。",
+                    "这个数据源已经不存在了。点右上角「换源」重新选一个即可。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
@@ -388,17 +437,41 @@ private fun MetricCard(reading: MetricCardState?) {
 }
 
 /**
+ * 指标卡的标题行：左边标题，右边「换源」。
+ *
+ * 抽出来是因为上面三种状态各自的标题文字不同，而换源按钮要一直都在——
+ * 源已经不存在时反而更需要它，那是用户唯一的出路。
+ */
+@Composable
+private fun MetricCardHeader(title: String, onChangeSource: (() -> Unit)?) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(title, style = MaterialTheme.typography.titleSmall)
+        if (onChangeSource != null) {
+            TextButton(onClick = onChangeSource) { Text("换源") }
+        }
+    }
+}
+
+/**
  * 指标值的展示文本。
  *
  * FLAG 量纲显示成「完成 / 未完成」而不是 1 / 0：后者只有写代码的人看得懂。
+ *
+ * 睡眠单独换算成小时：库里存的是分钟，但「946.3 分钟」没人读得出来是几小时，
+ * 而睡眠正好是最常被放上卡片的指标之一。口径与插件详情页的「全部数据」块一致，
+ * 两处显示同一个数字不该有两种写法。
+ *
  * 其余量纲复用 `PanelViewModel.formatValue` 的数字规整（整数值不拖小数点）。
  */
-private fun formatMetricValue(reading: MetricReading): String =
-    if (reading.bucket == MetricBucket.FLAG) {
-        if (reading.value > 0.0) "完成" else "未完成"
-    } else {
-        PanelViewModel.formatValue(reading.value, reading.unit)
-    }
+private fun formatMetricValue(reading: MetricReading): String = when (reading.bucket) {
+    MetricBucket.FLAG -> if (reading.value > 0.0) "完成" else "未完成"
+    MetricBucket.SLEEP_MINUTES -> "%.1f 小时".format(reading.value / 60.0)
+    else -> PanelViewModel.formatValue(reading.value, reading.unit)
+}
 
 /**
  * 指标卡的数据源 + 指标选择器（M6b2b）。
@@ -407,11 +480,25 @@ private fun formatMetricValue(reading: MetricReading): String =
  * 而插件源通常有多个（小米健康同时发步数与睡眠）。所以「选了源之后
  * if 只有一项就立刻选完，否则展开选指标」——内置源与自建源点一下即完成，
  * 插件源多一屏。
+ *
+ * ## 数据源的范围
+ *
+ * [MetricQueryService.candidates] 同时列出内置源、自建源与**已装的插件源**，
+ * 所以这个弹窗既是「加指标卡」的第二步，也是「给已有卡换源」的唯一入口。
+ * 插件源在第二屏按 `MetricSpec` 逐个展开（步数 / 睡眠…），
+ * 一个插件里有几个指标就有几项可选。
+ *
+ * @param title 弹窗标题。加卡与换源用同一个选择器，但用户的心理动作不同，
+ *   标题要跟着变，否则换源时看到「选择数据源」会以为是在加一张新卡
+ * @param disabled 已被同页签其他指标卡占用的「源 + 指标」组合。这些项仍然展示，
+ *   但标成「已添加」且点不动——直接隐藏会让人以为数据源列表里少了东西
  */
 @Composable
 private fun MetricSourcePickerDialog(
     onDismiss: () -> Unit,
     onPick: (sourceKey: String, metricKey: String?) -> Unit,
+    title: String = "选择数据源",
+    disabled: Set<Pair<String, String?>> = emptySet(),
 ) {
     val context = LocalContext.current
     var candidates by remember { mutableStateOf<List<MetricCandidate>>(emptyList()) }
@@ -423,9 +510,17 @@ private fun MetricSourcePickerDialog(
         loading = false
     }
 
+    /** 某个候选指标是否已被本页签的其他卡占用 */
+    fun isTaken(candidate: MetricCandidate, optionIndex: Int): Boolean {
+        val option = candidate.metrics.getOrNull(optionIndex) ?: return false
+        val source = candidate.sourceKeyFor(option)
+        val metric = option.metricKey?.takeIf { it.isNotBlank() }
+        return source to metric in disabled
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (expanded == null) "选择数据源" else "选择指标") },
+        title = { Text(if (expanded == null) title else "选择指标") },
         text = {
             Column(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
@@ -447,25 +542,31 @@ private fun MetricSourcePickerDialog(
                     )
 
                     // 第二屏：这个源的指标。插件可有多个，内置/自建只有一项
-                    expanded != null -> expanded!!.metrics.forEach { option ->
+                    expanded != null -> expanded!!.metrics.forEachIndexed { index, option ->
                         val candidate = expanded!!
+                        val taken = isTaken(candidate, index)
                         TextButton(
                             onClick = {
                                 onPick(candidate.sourceKeyFor(option), option.metricKey)
                             },
+                            enabled = !taken,
                             modifier = Modifier.fillMaxWidth(),
                         ) {
                             Text(
-                                if (option.unit.isBlank()) {
-                                    "${candidate.displayName} · ${option.label}"
-                                } else {
-                                    "${candidate.displayName} · ${option.label}（${option.unit}）"
+                                buildString {
+                                    append(candidate.displayName)
+                                    append(" · ")
+                                    append(option.label)
+                                    if (option.unit.isNotBlank()) append("（${option.unit}）")
+                                    if (taken) append(" · 已添加")
                                 },
                             )
                         }
                     }
 
                     else -> candidates.forEach { candidate ->
+                        // 整组只有一个指标且已被占用时，这一项本身也不该可点
+                        val allTaken = candidate.metrics.indices.all { isTaken(candidate, it) }
                         TextButton(
                             onClick = {
                                 if (candidate.metrics.size == 1) {
@@ -475,14 +576,20 @@ private fun MetricSourcePickerDialog(
                                     expanded = candidate
                                 }
                             },
+                            enabled = !allTaken,
                             modifier = Modifier.fillMaxWidth(),
                         ) {
                             Text(
-                                if (candidate.metrics.size == 1) {
-                                    "${candidate.displayName} · ${candidate.metrics.first().label}"
-                                } else {
-                                    // 多项时显示条数，让用户知道点进去还有选择
-                                    "${candidate.displayName}（${candidate.metrics.size} 个指标）"
+                                buildString {
+                                    val title = if (candidate.metrics.size == 1) {
+                                        "${candidate.displayName} · " +
+                                            candidate.metrics.first().label
+                                    } else {
+                                        // 多项时显示条数，让用户知道点进去还有选择
+                                        "${candidate.displayName}（${candidate.metrics.size} 个指标）"
+                                    }
+                                    append(title)
+                                    if (allTaken) append(" · 已添加")
                                 },
                             )
                         }

@@ -41,7 +41,15 @@ import java.io.File
 class PluginHealthAndTrustTest {
 
     private lateinit var context: Context
-    private val demoArchive = "demo-plugin.ext"
+
+    /** assets 里的文件名（`.ext` 只是分发后缀） */
+    private val assetName = "demo-plugin.ext"
+
+    /**
+     * 落到插件目录时必须用 `.apk` 结尾：
+     * `PluginInstaller.listArchives` 只认这个后缀，`.ext` 会被直接过滤掉。
+     */
+    private val demoArchive = "com.lifeboard.plugin.demo${PluginInstaller.APK_SUFFIX}"
 
     @Before
     fun setUp() {
@@ -61,7 +69,7 @@ class PluginHealthAndTrustTest {
     }
 
     private fun installDemoArchive() {
-        val apk = InstrumentationRegistry.getInstrumentation().context.assets.open(demoArchive)
+        val apk = InstrumentationRegistry.getInstrumentation().context.assets.open(assetName)
         apk.use { input ->
             val target = File(PluginInstaller.pluginsDir(context), demoArchive)
             target.outputStream().use { output -> input.copyTo(output) }

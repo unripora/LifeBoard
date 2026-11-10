@@ -7,6 +7,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.room.withTransaction
 import androidx.sqlite.db.SupportSQLiteDatabase
+import androidx.room.RoomDatabase.Callback
 
 @Database(
     entities = [
@@ -23,8 +24,11 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         PluginCredentialEntity::class,
         DashboardTabEntity::class,
         DashboardCardEntity::class,
+        AppLogEntity::class,
+        PluginRawRecordEntity::class,
+        PluginMetricQueryEntity::class,
     ],
-    version = 12,
+    version = 16,
     exportSchema = true,
 )
 abstract class LifeBoardDatabase : RoomDatabase() {
@@ -41,6 +45,9 @@ abstract class LifeBoardDatabase : RoomDatabase() {
     abstract fun pluginCredentialDao(): PluginCredentialDao
     abstract fun dashboardTabDao(): DashboardTabDao
     abstract fun dashboardCardDao(): DashboardCardDao
+    abstract fun appLogDao(): AppLogDao
+    abstract fun pluginRawRecordDao(): PluginRawRecordDao
+    abstract fun pluginMetricQueryDao(): PluginMetricQueryDao
 
     companion object {
         const val NAME = "lifeboard.db"
@@ -243,6 +250,133 @@ abstract class LifeBoardDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v12 → v13：新增应用内日志表。
+         *
+         * 纯新建表，不动任何已有数据；日志可丢，所以没有回填历史记录的需求。
+         */
+        internal val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `app_log` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `level` TEXT NOT NULL,
+                        `tag` TEXT NOT NULL,
+                        `location` TEXT NOT NULL,
+                        `message` TEXT NOT NULL,
+                        `time` INTEGER NOT NULL
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_app_log_time` ON `app_log` (`time`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_app_log_level` ON `app_log` (`level`)")
+            }
+        }
+
+        /**
+         * v13 → v14：去掉「同一页签同类型只能一张卡」的唯一约束。
+         *
+         * ## 为什么要去掉
+         *
+         * v12 的唯一索引不区分卡片类型，导致一个页签里只能有一张指标卡。
+         * 而指标卡才是用户真正会想放多张的东西——同一个页签里摆「步数 / 睡眠」，
+         * 或者把「屏幕使用」和「背单词次数」并排放，都是正常需求。
+         * 表现是：加了一张指标卡之后，加卡选择器里就再也点不出第二张，
+         * 界面上看是「点了没反应」。
+         *
+         * ## 为什么不是「只对非指标卡唯一」
+         *
+         * 那需要 SQLite 的局部索引 `... WHERE type <> 'METRIC'`，但 Room 的
+         * `@Index` 表达不了 WHERE 子句：实体生成的建表语句是整表唯一索引，
+         * 迁移建的是局部索引，两者 SQL 文本对不上，Room 打开库时的 schema 校验
+         * 会报「Migration didn't properly handle」并崩溃。**迁移里的索引必须与
+         * `14.json` 逐字对齐**，所以这里改成普通索引。
+         *
+         * 去重改由 [com.lifeboard.server.dashboard.DashboardCards.isDuplicate] 保证，
+         * 它比索引更精确（指标卡能细到「源 + 指标」）。
+         *
+         * ## 不重建表
+         *
+         * 索引不是表结构，DROP 再建即可，不涉及搬数据——
+         * 与 MIGRATION_11_12 不同，那次是加外键，非重建不可。
+         */
+        internal val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("DROP INDEX IF EXISTS `index_dashboard_card_tabId_type`")
+                // 与 14.json 里的非唯一索引逐字一致
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_dashboard_card_tabId_type` " +
+                        "ON `dashboard_card` (`tabId`, `type`)",
+                )
+            }
+        }
+
+        /**
+         * v14 → v15：新增插件原始条目快照表。
+         *
+         * 纯新建表，不动任何已有数据。这张表存「上次同步拿到的原始条目」，
+         * 只是展示用，丢了也不影响任何判定与计分——所以没有回填历史的需求。
+         *
+         * **必须显式迁移**：不挂 destructive fallback，缺迁移会让应用起不来。
+         */
+        internal val MIGRATION_14_15 = object : Migration(14, 15) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `plugin_raw_record` (
+                        `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `pluginId` TEXT NOT NULL,
+                        `date` TEXT NOT NULL,
+                        `metricKey` TEXT NOT NULL,
+                        `timestamp` INTEGER NOT NULL,
+                        `value` REAL NOT NULL,
+                        `detail` TEXT NOT NULL,
+                        `seq` INTEGER NOT NULL
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_plugin_raw_record_pluginId_date` " +
+                        "ON `plugin_raw_record` (`pluginId`, `date`)",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS " +
+                        "`index_plugin_raw_record_pluginId_date_metricKey` " +
+                        "ON `plugin_raw_record` (`pluginId`, `date`, `metricKey`)",
+                )
+            }
+        }
+
+        /**
+         * v15 → v16：新增 `plugin_metric_query`，记录「哪个指标被查过」。
+         *
+         * 为什么要这张表：插件查了某指标但一条没拿到时，详情页要显示「暂无」。
+         * 光看 `plugin_raw_record` 分不清「没查过」和「查了但为空」——
+         * 两种情况下都没有行。
+         *
+         * 不需要回填历史：这张表只是「查询意图」的旁证，
+         * 老数据没有它时行为退化成「只显示有条目的指标」，与升级前一致。
+         */
+        internal val MIGRATION_15_16 = object : Migration(15, 16) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `plugin_metric_query` (
+                        `pluginId` TEXT NOT NULL,
+                        `date` TEXT NOT NULL,
+                        `metricKey` TEXT NOT NULL,
+                        PRIMARY KEY(`pluginId`, `date`, `metricKey`)
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_plugin_metric_query_pluginId_date` " +
+                        "ON `plugin_metric_query` (`pluginId`, `date`)",
+                )
+            }
+        }
+
         @Volatile
         private var instance: LifeBoardDatabase? = null
 
@@ -260,8 +394,25 @@ abstract class LifeBoardDatabase : RoomDatabase() {
                     MIGRATION_9_10,
                     MIGRATION_10_11,
                     MIGRATION_11_12,
+                    MIGRATION_12_13,
+                    MIGRATION_13_14,
+                    MIGRATION_14_15,
+                    MIGRATION_15_16,
                 )
-                    .fallbackToDestructiveMigration()
+                    // 外键约束在 SQLite 里默认不生效，必须显式打开。
+                    // 不打开时 dashboard_card 的 ON DELETE CASCADE 只是摆设：
+                    // 删页签后卡片仍留在库里，变成永远不会显示的孤儿数据
+                    .addCallback(
+                        object : Callback() {
+                            override fun onOpen(db: SupportSQLiteDatabase) {
+                                db.execSQL("PRAGMA foreign_keys = ON")
+                            }
+                        },
+                    )
+                    // 不挂 fallbackToDestructiveMigration：它会静默清空整库，
+                    // 连插件凭据一起丢（表现为升级后全部要重新登录），
+                    // 而且清完界面上看不出发生过什么。缺迁移就让它显式失败，
+                    // 由开发者补一条 Migration，而不是让用户承担数据损失。
                     .build().also { instance = it }
             }
     }

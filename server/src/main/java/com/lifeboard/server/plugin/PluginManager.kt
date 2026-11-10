@@ -1,8 +1,11 @@
 package com.lifeboard.server.plugin
 
 import android.content.Context
+import com.lifeboard.plugin.api.ActionResult
 import com.lifeboard.plugin.api.AuthState
 import com.lifeboard.plugin.api.LoginResult
+import com.lifeboard.plugin.api.UiBlock
+import com.lifeboard.server.collect.DailyAggregateWorker
 
 /**
  * 插件系统的对外入口：扫描、信任与撤销。
@@ -126,19 +129,88 @@ object PluginManager {
         }
     }
 
-    /** 查询插件当前登录态；失败按「未登录」处理，避免 UI 卡在没有状态 */
+    /**
+     * 查询插件当前登录态；失败按「未登录」处理，避免 UI 卡在没有状态。
+     *
+     * 未信任时不进插件代码：撤销信任只是给已加载实例打标记，实例本身还在，
+     * 继续调用就等于「已经让用户停用了，却还在执行插件的代码、还能碰凭据」。
+     */
     suspend fun authState(context: Context, pluginId: String): AuthState {
         val appContext = context.applicationContext
         val plugin = PluginLoader.find(pluginId) ?: return AuthState.LoggedOut
+        if (!plugin.trusted) return AuthState.LoggedOut
         return runCatching {
             plugin.plugin.authState(HostPluginContext(pluginId, appContext))
         }.getOrElse { AuthState.LoggedOut }
     }
 
-    /** 让插件清理自己名下的凭据 */
+    /**
+     * 让插件清理自己名下的凭据。
+     *
+     * 未信任时同样不调用插件：用户要的是「别再用它了」，
+     * 这时候再跑它的登出逻辑，等于让一个已被停用的插件继续接触凭据。
+     * 真要清干净，走详情页的「清除凭据」，那是宿主直接删库。
+     */
     suspend fun logout(context: Context, pluginId: String) {
         val appContext = context.applicationContext
         val plugin = PluginLoader.find(pluginId) ?: return
+        if (!plugin.trusted) return
         runCatching { plugin.plugin.logout(HostPluginContext(pluginId, appContext)) }
+    }
+
+    // ---- 详情页 ----
+
+    /**
+     * 插件自己在详情页要展示的内容。
+     *
+     * 插件未加载、未信任或抛异常时返回空列表：详情页还有宿主固定的通用信息与通用操作，
+     * 不该因为插件自己出错就整页打不开；未信任的更不该再被调用。
+     */
+    suspend fun detailUi(context: Context, pluginId: String): List<UiBlock> {
+        val appContext = context.applicationContext
+        val plugin = PluginLoader.find(pluginId) ?: return emptyList()
+        if (!plugin.trusted) return emptyList()
+        return runCatching {
+            plugin.plugin.detailUi(HostPluginContext(pluginId, appContext))
+        }.getOrElse { emptyList() }
+    }
+
+    /**
+     * 用户在详情页点了插件自己的按钮。
+     *
+     * [ActionResult.TriggerSync] 由本类接管：插件拿不到数据库入口，手动同步必须走
+     * 宿主既有的采集链路（`DailyAggregateWorker` → `SourceProviderRegistry` → `metric` 表），
+     * 否则健康度、去重与量纲校验都会被绕过。
+     *
+     * 用 [DailyAggregateWorker.collectNow] 而不是 `runNow`：后者只是入队，
+     * 写库完成时间不确定，用户点完按钮立刻读库会拿到旧值，表现为「点一次没反应」。
+     * 写完后再重新问一次 [detailUi]，插件返回的区块就能反映最新数据。
+     */
+    suspend fun onAction(context: Context, pluginId: String, actionId: String): ActionResult {
+        val appContext = context.applicationContext
+        val plugin = PluginLoader.find(pluginId)
+            ?: return ActionResult.ShowMessage("插件未加载，请重新扫描")
+
+        if (!plugin.trusted) {
+            return ActionResult.ShowMessage("插件已停止使用，请先信任再操作")
+        }
+
+        val result = runCatching {
+            plugin.plugin.onAction(HostPluginContext(pluginId, appContext), actionId)
+        }.getOrElse { e ->
+            // 第三方插件未必守规矩，异常不能打到 UI 上
+            ActionResult.ShowMessage("插件处理操作时出错：${e.message ?: e::class.simpleName}")
+        }
+
+        if (result !is ActionResult.TriggerSync) return result
+
+        val ok = DailyAggregateWorker.collectNow(appContext)
+        val fresh = detailUi(appContext, pluginId)
+        return if (ok) {
+            // 采集成功：优先用插件自己刚算好的区块，它最清楚该显示什么
+            ActionResult.RefreshUi(fresh)
+        } else {
+            ActionResult.ShowMessage("同步未完成，请稍后再试")
+        }
     }
 }
