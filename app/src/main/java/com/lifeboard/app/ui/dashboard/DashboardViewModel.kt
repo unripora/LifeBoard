@@ -76,6 +76,8 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
      * 观察某个页签的卡片。
      *
      * 未就绪时由调用方决定是否用默认卡片顶上，这里只如实返回库里的内容。
+     * **关掉的卡片也在这里返回**：界面要能把它画成一条「已隐藏」的占位行，
+     * 否则用户关掉之后就再也找不到重新打开它的入口了。
      */
     fun observeCards(tabId: String): kotlinx.coroutines.flow.Flow<List<DashboardCardEntity>> =
         db.dashboardCardDao().observeByTab(tabId)
@@ -85,12 +87,40 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
      *
      * 未就绪时返回默认卡片，避免首帧空着；就绪后即使为空也如实返回空，
      * 因为「用户把卡片删光了」和「还没读出来」是两件事，前者不该被默认值填回。
+     *
+     * 这里**过滤掉 enabled = false 的卡**：这是「隐藏」真正生效的地方，
+     * 而 [observeCards] 保留全部行供编辑态列出。
      */
     fun cardsFor(tabId: String, ready: Boolean, cards: List<DashboardCardEntity>): List<CardType> {
         if (!ready && cards.isEmpty() && tabId == com.lifeboard.server.dashboard.BuiltinTabs.TAB_ID_PANEL) {
             return DashboardDefaults.panelCards
         }
-        return cards.mapNotNull { runCatching { CardType.valueOf(it.type) }.getOrNull() }
+        return cards.filter { it.enabled }
+            .mapNotNull { runCatching { CardType.valueOf(it.type) }.getOrNull() }
+    }
+
+    /**
+     * 切换一张卡的显示状态。
+     *
+     * 只改 `enabled`，不动 `order`：关掉再打开时卡片应该回到原来的位置，
+     * 而不是跳到末尾——用户点的是「暂时不显示」，不是「挪到最后」。
+     */
+    fun setCardEnabled(cardId: String, enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            db.dashboardCardDao().setEnabled(cardId, enabled)
+        }
+    }
+
+    /**
+     * 切换一个页签的显示状态。
+     *
+     * 内置页签同样允许关掉：删是不能删的（会失去唯一入口），
+     * 但「不想在顶部看到它」是合理需求，所以给一条不破坏数据的退路。
+     */
+    fun setTabEnabled(tabId: String, enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            db.dashboardTabDao().setEnabled(tabId, enabled)
+        }
     }
 
     /**
@@ -167,6 +197,33 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
             tabs.add(target, tabs.removeAt(from))
             db.withTransaction {
                 tabs.forEachIndexed { index, tab ->
+                    if (tab.order != index) db.dashboardTabDao().setOrder(tab.tabId, index)
+                }
+            }
+        }
+    }
+
+    /**
+     * 长按拖动松手时把页签挪到第 [to] 个位置。
+     *
+     * 与 [moveTab] 的差别：那个接收的是「相对当前位置的目标下标」，由界面按
+     * 上移/下移算好；这里接收的是**拖动过程中算出来的目标槽位**，
+     * 可能越过好几行。两者最终都落到「按 id 重新定位再整体重写 order」，
+     * 所以不合并成两个入口，避免拖动时下标含义被误读。
+     *
+     * 目标越界时夹紧：拖动期间页签表可能刚被别处改过（删了一个页签）。
+     */
+    fun moveTabTo(tabId: String, to: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val tabs = db.dashboardTabDao().getAll()
+            val from = tabs.indexOfFirst { it.tabId == tabId }
+            if (from < 0) return@launch
+            val target = to.coerceIn(0, tabs.lastIndex)
+            if (from == target) return@launch
+            val reordered = tabs.toMutableList()
+            reordered.add(target, reordered.removeAt(from))
+            db.withTransaction {
+                reordered.forEachIndexed { index, tab ->
                     if (tab.order != index) db.dashboardTabDao().setOrder(tab.tabId, index)
                 }
             }
