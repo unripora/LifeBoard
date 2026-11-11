@@ -4,6 +4,10 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.lifeboard.core.model.DailyRecord
+import com.lifeboard.app.ui.chart.ChartAxisSlot
+import com.lifeboard.app.ui.chart.ChartRenderModel
+import com.lifeboard.app.ui.chart.RequestedSeries
+import com.lifeboard.app.ui.chart.buildChartRenderModel
 import com.lifeboard.core.model.RemindLevel
 import com.lifeboard.core.model.StreakInfo
 import com.lifeboard.core.model.TaskConfig
@@ -15,6 +19,13 @@ import com.lifeboard.server.metric.MetricQueryService
 import com.lifeboard.server.metric.MetricResult
 import com.lifeboard.server.metric.readCard
 import com.lifeboard.server.dashboard.CardType
+import com.lifeboard.server.dashboard.ChartAxis
+import com.lifeboard.server.dashboard.ChartConfigCodec
+import com.lifeboard.server.dashboard.ChartType
+import com.lifeboard.server.chart.CategoryBreakdown
+import com.lifeboard.server.chart.ChartQueryService
+import com.lifeboard.server.chart.readCategoryBreakdown
+import com.lifeboard.server.chart.resolveRingTarget
 import com.lifeboard.server.notice.toRuleSchedule
 import com.lifeboard.server.panel.TaskRepository
 import kotlinx.coroutines.Dispatchers
@@ -62,6 +73,27 @@ data class MetricCardState(
     val cardId: String,
     val tabId: String,
     val result: MetricResult,
+)
+
+/**
+ * 面板上的一张图表卡的渲染输入。
+ *
+ * 与 [MetricCardState] 并列而不是合并：图表读的是整段时间窗，
+ * 指标卡读的是单点值，两者的失败模式与刷新时机都不同。
+ *
+ * @property model 已经整形好的渲染模型；null 表示配置损坏，无法绘制
+ */
+data class ChartCardState(
+    val cardId: String,
+    val tabId: String,
+    val model: ChartRenderModel?,
+    /** 图表形态。渲染器据此决定用哪套画法 */
+    val chartType: ChartType = ChartType.LINE,
+    /** 分类占比，仅饼图使用 */
+    val categories: CategoryBreakdown? = null,
+    /** 环形进度的目标值；null 表示没有可用目标 */
+    val ringTarget: Double? = null,
+    val configError: Boolean = false,
 )
 
 /**
@@ -113,6 +145,13 @@ class PanelViewModel(app: Application) : AndroidViewModel(app) {
      */
     private val _metricStates = MutableStateFlow<List<MetricCardState>>(emptyList())
     val metricStates: StateFlow<List<MetricCardState>> = _metricStates.asStateFlow()
+
+    /**
+     * 图表卡的渲染输入。与 [metricStates] 一样独立于 [state]：
+     * 图表要读整段时间窗，比单个读数重得多，不能让整页 Combine 跟着重算。
+     */
+    private val _chartStates = MutableStateFlow<List<ChartCardState>>(emptyList())
+    val chartStates: StateFlow<List<ChartCardState>> = _chartStates.asStateFlow()
 
     private val today get() = Dates.todayString()
 
@@ -288,6 +327,102 @@ class PanelViewModel(app: Application) : AndroidViewModel(app) {
             // 切回去时不用再等一次采集
             _metricStates.value = _metricStates.value.filterNot { it.tabId == tabId } + states
         }
+    }
+
+    /**
+     * 读一遍某个页签里的图表卡。
+     *
+     * 每张卡按自己的配置取时间窗与序列，读取失败（源没了、配置坏了）不抛，
+     * 折成 [ChartCardState] 里的状态让卡片自己说明原因。
+     */
+    fun loadCharts(tabId: String, cards: List<DashboardCardEntity>) {
+        val chartCards = cards.filter { it.type == CardType.CHART.name }
+        if (chartCards.isEmpty()) {
+            _chartStates.value = _chartStates.value.filterNot { it.tabId == tabId }
+            return
+        }
+        viewModelScope.launch {
+            val today = Dates.todayString()
+            val states = withContext(Dispatchers.IO) {
+                chartCards.map { card -> readChartCard(tabId, card, today) }
+            }
+            _chartStates.value = _chartStates.value.filterNot { it.tabId == tabId } + states
+        }
+    }
+
+    /**
+     * 读一张图表卡。
+     *
+     * 配置解析失败与数据读取失败分开处理：前者是「这张卡坏了，需要改配置」，
+     * 后者是「源没了或没数据」，用户要做的动作不一样。
+     */
+    private suspend fun readChartCard(
+        tabId: String,
+        card: DashboardCardEntity,
+        today: String,
+    ): ChartCardState {
+        val config = ChartConfigCodec.decode(card.configJson)
+            ?: return ChartCardState(cardId = card.cardId, tabId = tabId, model = null, configError = true)
+
+        // 饼图读分类数据，不走时间序列：两者是不同的查询路径
+        if (config.chartType == ChartType.PIE) {
+            val categories = readCategoryBreakdown(
+                context = getApplication(),
+                sourceKey = config.categorySourceKey.orEmpty(),
+                topN = config.topN ?: 5,
+                days = config.timeWindowDays,
+                today = today,
+            )
+            return ChartCardState(
+                cardId = card.cardId,
+                tabId = tabId,
+                model = null,
+                chartType = ChartType.PIE,
+                categories = categories,
+            )
+        }
+
+        val loaded = config.series.map { series ->
+            ChartQueryService.readConfiguredSeries(
+                context = getApplication(),
+                sourceKey = series.sourceKey,
+                metricKey = series.metricKey,
+                label = series.label,
+                unit = series.unit,
+                days = config.timeWindowDays,
+                today = today,
+                taskId = series.taskId,
+            )
+        }
+        // 顺序必须与 loaded 一一对应：渲染模型按顺序配对轴，
+        // 同一个指标可以带不同任务、挂不同轴各出现一次
+        val requested = config.series.map {
+            RequestedSeries(
+                label = it.label,
+                unit = it.unit,
+                axis = if (it.axis == ChartAxis.RIGHT) ChartAxisSlot.RIGHT else ChartAxisSlot.LEFT,
+            )
+        }
+        // 环形进度要目标值：复用任务规则里的阈值。只有单序列形态才需要，
+        // 多序列各自一个目标没有可比性
+        val ringTarget = if (config.chartType == ChartType.RING) {
+            val first = config.series.firstOrNull()
+            if (first == null) {
+                null
+            } else {
+                val tasks = LifeBoardDatabase.get(getApplication()).taskDao().getAll()
+                resolveRingTarget(first.sourceKey, first.metricKey, tasks)
+            }
+        } else {
+            null
+        }
+        return ChartCardState(
+            cardId = card.cardId,
+            tabId = tabId,
+            model = buildChartRenderModel(requested, loaded, showLegend = config.showLegend),
+            chartType = config.chartType,
+            ringTarget = ringTarget,
+        )
     }
 
     /**

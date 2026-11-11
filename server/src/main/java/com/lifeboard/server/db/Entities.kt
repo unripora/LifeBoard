@@ -98,7 +98,29 @@ data class DailyRecordEntity(
     val value: Double,
     val completed: Boolean,
     val score: Double,
+    /**
+     * 这条记录的来源：自动判定 / 用户手动打卡。
+     *
+     * 为什么现在才加：图表要画「手动打卡次数」，而在此之前两种写法的记录
+     * 完全无法区分。**历史数据一律是 [RecordOrigin.UNKNOWN]**——
+     * 迁移时无从判断当初是点的还是自动判的，猜一个值等于编造统计。
+     * 所以「手动打卡」类图表只能准确反映迁移之后的数据，
+     * 界面必须在时间窗内存在 UNKNOWN 记录时说明这一点。
+     */
+    val origin: String = RecordOrigin.AUTO,
 )
+
+/** [DailyRecordEntity.origin] 的取值。 */
+object RecordOrigin {
+    /** 系统按判定逻辑自动写入 */
+    const val AUTO = "AUTO"
+
+    /** 用户在待办卡上手动勾选 */
+    const val MANUAL = "MANUAL"
+
+    /** 迁移前写入，真实来源已不可考 */
+    const val UNKNOWN = "UNKNOWN"
+}
 
 /**
  * 原始指标表。按 源 + 日期 + 分桶 聚合，全年粒度设计以便后续做年度总结时不改库。
@@ -360,6 +382,16 @@ data class DashboardCardEntity(
     val metricKey: String? = null,
     val order: Int,
     val tabId: String,
+    /**
+     * 图表卡的完整配置（JSON），仅 `CardType.CHART` 使用。
+     *
+     * 为什么是 nullable 而不是加一堆列：配置是「一组序列 + 若干展示选项」，
+     * 拆成列会变成 series1Source、series1Metric、series2Source……，
+     * 序列数一改就要迁移表结构。存 JSON 只增一列，解析规则由代码版本控制。
+     *
+     * 其余五种卡片该字段恒为 null，行为完全不变。
+     */
+    val configJson: String? = null,
 )
 
 /**

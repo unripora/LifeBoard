@@ -43,6 +43,7 @@ object DashboardCards {
         CardType.WEEK,
         CardType.SOURCE_HEALTH,
         CardType.METRIC,
+        CardType.CHART,
     )
 
     /** 卡片类型的展示名。放这里而不是界面层：弹窗与卡片标题要用同一个称呼 */
@@ -52,6 +53,7 @@ object DashboardCards {
         CardType.WEEK -> "本周得分"
         CardType.SOURCE_HEALTH -> "数据源状态"
         CardType.METRIC -> "指标"
+        CardType.CHART -> "自定义图表"
     }
 
     /**
@@ -67,7 +69,17 @@ object DashboardCards {
      * @param existing 该页签已有的卡片类型（未能识别的类型应已被过滤掉）
      */
     fun addableTo(existing: List<CardType>): List<CardType> =
-        OFFERABLE.filter { it == CardType.METRIC || it !in existing }
+        OFFERABLE.filter { it.repeatable() || it !in existing }
+
+    /**
+     * 这类卡片能否在同一个页签里出现多张。
+     *
+     * 指标卡绑的是「某个源的具体指标」，图表卡绑的是一整份配置——
+     * 两者都要能摆多张（「步数 / 睡眠 / 屏幕使用」是正常需求）。
+     * 其余类型读固定位置的数据，一张就够。
+     */
+    private fun CardType.repeatable(): Boolean =
+        this == CardType.METRIC || this == CardType.CHART
 
     /**
      * 这张卡是否与页签里已有的某张卡重复。
@@ -91,6 +103,10 @@ object DashboardCards {
         metricKey: String?,
         existing: List<DashboardCardEntity>,
     ): Boolean {
+        // 图表卡的身份在 configJson 里，这里拿不到配置就无从比较。
+        // 不按类型一刀切禁止：两张「步数折线」和「步数+睡眠折线」外观可能相同，
+        // 但用户确实可能想并排看，误拦比多放一张更让人困惑。
+        if (type == CardType.CHART) return false
         if (type != CardType.METRIC) {
             return existing.any { parseType(it.type) == type }
         }

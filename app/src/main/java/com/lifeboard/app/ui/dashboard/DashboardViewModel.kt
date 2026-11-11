@@ -5,6 +5,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.room.withTransaction
 import com.lifeboard.server.dashboard.CardType
+import com.lifeboard.server.dashboard.ChartCardConfig
+import com.lifeboard.server.dashboard.ChartConfigCodec
 import com.lifeboard.server.dashboard.DashboardCards
 import com.lifeboard.server.dashboard.DashboardLayout
 import com.lifeboard.server.db.DashboardCardEntity
@@ -197,6 +199,8 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
         type: CardType,
         sourceKey: String? = null,
         metricKey: String? = null,
+        /** 图表卡的配置；仅 [CardType.CHART] 使用 */
+        chartConfig: ChartCardConfig? = null,
         onAdded: (Boolean) -> Unit = {},
     ) {
         viewModelScope.launch {
@@ -205,6 +209,11 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
                 if (type !in DashboardCards.OFFERABLE) return@withContext false
                 // 指标卡没有源就是一张永远显示「源不存在」的卡，不如不加
                 if (type == CardType.METRIC && sourceKey.isNullOrBlank()) return@withContext false
+                // 图表卡没有可用配置同理：加进去只会显示「配置已损坏」
+                if (type == CardType.CHART) {
+                    if (chartConfig == null) return@withContext false
+                    if (!chartConfig.isRenderable()) return@withContext false
+                }
                 val existing = db.dashboardCardDao().getByTab(tabId)
                 if (DashboardCards.isDuplicate(type, sourceKey, metricKey, existing)) {
                     return@withContext false
@@ -219,10 +228,42 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
                     metricKey = metricKey.takeIf { type == CardType.METRIC },
                     order = (existing.maxOfOrNull { it.order } ?: -1) + 1,
                     tabId = tabId,
+                    configJson = chartConfig?.takeIf { type == CardType.CHART }
+                        ?.let { ChartConfigCodec.encode(it) },
                 )
                 runCatching { db.dashboardCardDao().insert(card) > 0 }.getOrDefault(false)
             }
             onAdded(ok)
+        }
+    }
+
+    /**
+     * 改一张已存在的图表卡的配置。
+     *
+     * 与指标卡的换绑同理：改配置应该保留卡片在页签里的位置。
+     * 配置无效时整条放弃——把坏配置写进库只会让卡片显示「配置已损坏」。
+     */
+    fun updateChartConfig(
+        tabId: String,
+        cardId: String,
+        config: ChartCardConfig,
+        onDone: (Boolean) -> Unit = {},
+    ) {
+        viewModelScope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                if (!config.isRenderable()) return@withContext false
+                val card = db.dashboardCardDao().getByTab(tabId)
+                    .firstOrNull { it.cardId == cardId } ?: return@withContext false
+                if (card.type != CardType.CHART.name) return@withContext false
+                val encoded = ChartConfigCodec.encode(config) ?: return@withContext false
+                // 必须用 upsert 而不是 insert：dao.insert 是 IGNORE 语义，
+                // 主键已存在时静默返回 -1 且不抛异常，于是「改了配置」会看起来成功、
+                // 实际什么都没写，用户下次打开还是旧图
+                runCatching {
+                    db.dashboardCardDao().upsert(card.copy(configJson = encoded))
+                }.isSuccess
+            }
+            onDone(ok)
         }
     }
 

@@ -41,6 +41,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.lifeboard.app.ui.chart.ChartRenderer
 import com.lifeboard.app.ui.dashboard.DashboardViewModel
 import com.lifeboard.app.ui.theme.GlassCard
 import com.lifeboard.app.ui.theme.GlassProgress
@@ -48,6 +49,7 @@ import com.lifeboard.core.model.RemindLevel
 import com.lifeboard.core.util.Dates
 import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.server.dashboard.CardType
+import com.lifeboard.server.dashboard.ChartConfigCodec
 import com.lifeboard.server.dashboard.DashboardCards
 import com.lifeboard.server.db.DashboardCardEntity
 import com.lifeboard.server.health.SourceHealthChecker
@@ -105,7 +107,11 @@ fun PanelScreen(
     val metricStates by vm.metricStates.collectAsStateWithLifecycle()
     LaunchedEffect(tabId, storedCards, refreshKey) {
         vm.loadMetrics(tabId, storedCards)
+        // 图表卡与指标卡在同一个时机拉取：都依赖采集结果，
+        // 分开挂两个 Effect 只会让它们各自触发一遍重算
+        vm.loadCharts(tabId, storedCards)
     }
+    val chartStates by vm.chartStates.collectAsStateWithLifecycle()
 
     // 编辑态：显示每张卡的操作按钮与底部「添加卡片」。
     // 不做默认常驻的拖拽手柄——这个页面天天用，常驻的编辑控件会把
@@ -116,6 +122,12 @@ fun PanelScreen(
     // 指标卡的第二层选择（先选源，再选指标）。与 adding 分开：
     // 第一层关掉之后再开这一层，两个弹窗不会同时存在
     var pickingMetric by remember(tabId) { mutableStateOf(false) }
+
+    // 添加图表卡时的配置弹窗。与 adding / pickingMetric 并列，三者互斥
+    var configuringChart by remember(tabId) { mutableStateOf(false) }
+
+    // 正在编辑配置的那张图表卡。null 表示不在编辑
+    var editingChartCard by remember(tabId) { mutableStateOf<DashboardCardEntity?>(null) }
 
     // 正在换绑数据源的那张指标卡。null 表示不在换绑。
     // 与 pickingMetric 分开：换绑针对一张已存在的卡，加卡针对「将要新增的卡」，
@@ -191,6 +203,12 @@ fun PanelScreen(
                         onMoveDown = { row?.let { dashVm.moveCard(tabId, it.cardId, 1) } },
                         onDelete = { row?.let { dashVm.deleteCard(tabId, it.cardId) } },
                         enabled = row != null,
+                        // 只有图表卡有「形态 / 指标 / 时间窗」可调，其余卡的配置是固定的
+                        onEditConfig = if (type == CardType.CHART) {
+                            { row?.let { editingChartCard = it } }
+                        } else {
+                            null
+                        },
                     )
                 }
                 CardHost(
@@ -198,6 +216,8 @@ fun PanelScreen(
                     state = state,
                     metricReading = storedCards.getOrNull(index)
                         ?.let { row -> metricStates.firstOrNull { it.cardId == row.cardId } },
+                    chartState = storedCards.getOrNull(index)
+                        ?.let { row -> chartStates.firstOrNull { it.cardId == row.cardId } },
                     // 指标卡可以点开换数据源（M6b2c）。其他类型传 null：
                     // 它们读的是固定位置的数据，没有「换源」这回事
                     onChangeMetricSource = if (type == CardType.METRIC) {
@@ -245,6 +265,11 @@ fun PanelScreen(
                     // 先把当前弹窗关掉，否则两层叠在一起，返回键的退栈顺序会很怪
                     adding = false
                     pickingMetric = true
+                } else if (type == CardType.CHART) {
+                    // 图表卡要配形态、指标与时间窗。同样先关掉本层，
+                    // 避免两层弹窗叠在一起
+                    adding = false
+                    configuringChart = true
                 } else {
                     dashVm.addCard(tabId, type) { ok ->
                         // 失败（撞唯一索引或被策略挡下）时把弹窗留在原地：
@@ -264,6 +289,32 @@ fun PanelScreen(
                     if (ok) pickingMetric = false
                 }
             },
+        )
+    }
+
+    if (configuringChart) {
+        ChartConfigDialog(
+            onDismiss = { configuringChart = false },
+            onConfirm = { config ->
+                dashVm.addCard(tabId, CardType.CHART, chartConfig = config) { ok ->
+                    // 失败时留在弹窗里，让用户改完再存，而不是丢掉他刚配的内容
+                    if (ok) configuringChart = false
+                }
+            },
+        )
+    }
+
+    // 编辑已有图表卡的配置。与「添加」分开，因为落点不同：
+    // 添加是插入新行，编辑是更新同一行的 configJson，卡片位置不变
+    editingChartCard?.let { card ->
+        ChartConfigDialog(
+            onDismiss = { editingChartCard = null },
+            onConfirm = { config ->
+                dashVm.updateChartConfig(tabId, card.cardId, config) { ok ->
+                    if (ok) editingChartCard = null
+                }
+            },
+            initial = ChartConfigCodec.decode(card.configJson),
         )
     }
 
@@ -323,6 +374,8 @@ private fun CardHost(
     type: CardType,
     state: PanelUiState,
     metricReading: MetricCardState?,
+    /** 图表卡的渲染输入；非图表卡为 null */
+    chartState: ChartCardState?,
     /** 指标卡的「换数据源」入口；非指标卡为 null */
     onChangeMetricSource: (() -> Unit)?,
     onRefresh: () -> Unit,
@@ -363,6 +416,90 @@ private fun CardHost(
             reading = metricReading,
             onChangeSource = onChangeMetricSource,
         )
+
+        // 图表卡：数据与渲染都在 5.1 接入。配置损坏与「无数据」分开说明——
+        // 前者要用户去改配置，后者只是这个时间窗内还没有数据
+        CardType.CHART -> ChartCard(state = chartState)
+    }
+}
+
+/**
+ * 自定义图表卡。
+ *
+ * 三种情况必须分开说，因为用户要做的事完全不同：
+ * - 配置坏了：这张卡需要重新配置，光等不会好
+ * - 读到了但没有可画的序列：时间窗内没数据，或者源全没了（具体原因在 warnings 里）
+ * - 正常：画图，并把 warnings 以说明的形式挂在图下面
+ *
+ * 不用空白卡代替任何一种：空白卡让用户无法判断是「没数据」还是「功能没做好」。
+ */
+@Composable
+private fun ChartCard(state: ChartCardState?) {
+    GlassCard(modifier = Modifier.fillMaxWidth()) {
+        Text("自定义图表", style = MaterialTheme.typography.titleSmall)
+
+        when {
+            state == null -> {
+                // 还没读完。给一句正在进行，避免在读数到达前闪一下「无数据」
+                Text(
+                    "正在读取…",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            state.configError -> {
+                Text(
+                    "图表配置已损坏，请重新配置这张卡",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+
+            state.model == null && state.categories == null -> {
+                Text(
+                    "所选时间窗内没有可显示的数据",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            else -> {
+                ChartRenderer(
+                    type = state.chartType,
+                    model = state.model,
+                    categories = state.categories,
+                    ringTarget = state.ringTarget,
+                )
+                // 部分序列失败时仍然画其余的，但必须说明少了什么，
+                // 否则用户会以为那条线本来就不存在
+                state.model?.warnings?.forEach { warning ->
+                    Text(
+                        warning,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                // 饼图与分类数据没有 warnings 通道，直接看状态说明
+                state.categories?.let { breakdown ->
+                    when (val status = breakdown.status) {
+                        is com.lifeboard.server.chart.SeriesStatus.SourceUnavailable ->
+                            Text(
+                                status.reason,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        is com.lifeboard.server.chart.SeriesStatus.NoData ->
+                            Text(
+                                "所选时间窗内没有分类数据",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        else -> Unit
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -835,6 +972,8 @@ private fun CardEditBar(
     onMoveDown: () -> Unit,
     onDelete: () -> Unit,
     enabled: Boolean,
+    /** 「编辑配置」入口；只有需要额外配置的卡型（图表）才传，其余为 null */
+    onEditConfig: (() -> Unit)? = null,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -849,6 +988,11 @@ private fun CardEditBar(
         )
         TextButton(onClick = onMoveUp, enabled = enabled && canMoveUp) { Text("上移") }
         TextButton(onClick = onMoveDown, enabled = enabled && canMoveDown) { Text("下移") }
+        if (enabled && onEditConfig != null) {
+            // 图表卡的数据源与形态要能改，但不该「删了再加」——
+            // 那会让卡片跳到页签末尾
+            TextButton(onClick = onEditConfig) { Text("配置") }
+        }
         if (enabled) {
             TextButton(onClick = onDelete) { Text("移除") }
         }

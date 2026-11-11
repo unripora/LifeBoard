@@ -1,12 +1,18 @@
 [versions]
-agp = "8.11.0"
-kotlin = "2.0.21"
-ksp = "2.0.21-1.0.28"
+agp = "8.12.3"
+kotlin = "2.3.21"
+ksp = "2.3.10"
 coreKtx = "1.15.0"
 lifecycle = "2.8.7"
 activityCompose = "1.9.3"
+# Vico 3.2.3 依赖 Compose Multiplatform 1.9.0（Android 侧重定向到 AndroidX Compose）。
+# Kotlin 2.3.21 + KSP 2.3.10 要求 AGP ≥8.12，故同步升 AGP。
+# BOM 暂不抬升，先看实测是否有 Compose 版本冲突。
 composeBom = "2024.12.01"
-room = "2.6.1"
+vico = "3.2.3"
+# Room 2.7.x 才支持 KSP 2.x；2.6.1 在 KSP 2.3 下会在 Room 编译器里抛
+# "unexpected jvm signature V"。升 Room 是本次工具链升级的硬依赖，不是顺手更新。
+room = "2.7.1"
 work = "2.10.0"
 coroutines = "1.9.0"
 # LSPosed / libxposed API（实机 Vector v2.1.1，API 102）
@@ -52,6 +58,16 @@ junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-test-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxTestJunit" }
 androidx-test-runner = { group = "androidx.test", name = "runner", version.ref = "androidxTestRunner" }
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
+
+# org.json 的官方 JVM 实现。Android 上 org.json 由框架提供，但 JVM 单测跑的是
+# android.jar 里的 stub，调用会抛 "Stub!"——不引这个依赖，任何用 org.json 的
+# 纯逻辑都无法做 JVM 单测。**只加 testImplementation，不进 APK。**
+org-json = { group = "org.json", name = "json", version = "20240303" }
+
+# 图表引擎：折线/柱状/面积原生，饼图实验性，散点用折线仅点实现。
+# 雷达图官方不支持，本任务不做雷达。
+vico-compose = { group = "com.patrykandpatrick.vico", name = "compose", version.ref = "vico" }
+vico-compose-m3 = { group = "com.patrykandpatrick.vico", name = "compose-m3", version.ref = "vico" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

@@ -21,6 +21,14 @@ enum class CardType {
 
     /** 单个指标卡：绑 sourceKey + metricKey，M6b 实现 */
     METRIC,
+
+    /**
+     * 自定义图表卡：可叠多条序列，配置全部存在 `DashboardCardEntity.configJson`。
+     *
+     * 不复用 `sourceKey + metricKey`——那两个字段只能表达一条序列，
+     * 而图表卡要能同时画「步数 + 睡眠」，语义对不上。见 [ChartCardConfig]。
+     */
+    CHART,
 }
 
 /**

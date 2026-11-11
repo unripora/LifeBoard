@@ -110,6 +110,24 @@ interface MetricDao {
     suspend fun getRange(from: String, to: String): List<MetricEntity>
 
     /**
+     * 某个源某个量纲在闭区间内**有数据的**全部行，按日期升序。
+     *
+     * 图表一次取整窗数据，而不是逐天调用 [getOne]：30 天 × 3 条序列就是 90 次
+     * 数据库往返，而这里只需要 3 次。缺失的日期不会出现在结果里，
+     * 由上层决定怎么表达（不补 0）。
+     */
+    @Query(
+        "SELECT * FROM metric WHERE sourceType = :source AND bucket = :bucket " +
+            "AND date BETWEEN :from AND :to ORDER BY date ASC",
+    )
+    suspend fun getOneSourceRange(
+        source: String,
+        bucket: String,
+        from: String,
+        to: String,
+    ): List<MetricEntity>
+
+    /**
      * 某个源某个量纲在最近 [days] 天里**有数据的**最晚一天，没有返回 null。
      *
      * 指标卡要往前找「最近一次」的值（今天还没采集到 vs 今天真的是 0 是两回事），
@@ -275,7 +293,33 @@ interface AppUsageDao {
      */
     @Query("DELETE FROM app_usage WHERE date < :keepFrom")
     suspend fun trimBefore(keepFrom: String)
+
+    /**
+     * 闭区间内按应用汇总的用量，按时长降序。
+     *
+     * 饼图要看的是「这段时间里各个应用占多少」，不是某一天。
+     * 所以在 SQL 里就按包名聚合，避免把整段区间的原始行都拉进内存再分组。
+     *
+     * @return 每项为 `包名、展示名、分钟数`。展示名取区间内任一非空值即可
+     */
+    @Query(
+        """
+        SELECT packageName, MAX(label) AS label, SUM(minutes) AS minutes
+        FROM app_usage
+        WHERE date BETWEEN :from AND :to
+        GROUP BY packageName
+        ORDER BY minutes DESC
+        """,
+    )
+    suspend fun sumByRange(from: String, to: String): List<AppUsageSumRow>
 }
+
+/** [AppUsageDao.sumByRange] 的投影行 */
+data class AppUsageSumRow(
+    val packageName: String,
+    val label: String,
+    val minutes: Double,
+)
 
 @Dao
 interface DashboardTabDao {
