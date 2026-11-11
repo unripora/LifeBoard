@@ -16,6 +16,7 @@ import com.lifeboard.core.schedule.TimeWindow
 import com.lifeboard.core.util.Dates
 import com.lifeboard.server.db.DailyRecordEntity
 import com.lifeboard.server.db.LifeBoardDatabase
+import com.lifeboard.server.db.RecordOrigin
 import com.lifeboard.server.db.StreakEntity
 import com.lifeboard.server.db.TaskEntity
 import com.lifeboard.server.remind.ConditionEvaluator
@@ -133,6 +134,8 @@ class TaskRepository(private val context: Context) {
                     value = task.threshold,
                     completed = true,
                     score = task.weight,
+                    // 这是唯一的人工写入点；其余全由 ConditionEvaluator 自动写
+                    origin = RecordOrigin.MANUAL,
                 ),
             )
             // 只维护连击，不重算记录：上面写的这条就是最终结果

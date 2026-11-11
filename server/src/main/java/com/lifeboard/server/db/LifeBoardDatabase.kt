@@ -28,7 +28,7 @@ import androidx.room.RoomDatabase.Callback
         PluginRawRecordEntity::class,
         PluginMetricQueryEntity::class,
     ],
-    version = 16,
+    version = 17,
     exportSchema = true,
 )
 abstract class LifeBoardDatabase : RoomDatabase() {
@@ -377,6 +377,27 @@ abstract class LifeBoardDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v16 → v17：支持自定义图表卡。
+         *
+         * 两处改动：
+         * 1. `dashboard_card` 加 `configJson`（图表配置），旧卡片保持 NULL，行为不变
+         * 2. `daily_record` 加 `origin`（记录来源）
+         *
+         * **`origin` 的历史值一律写 UNKNOWN，不写 AUTO**：迁移时无从判断
+         * 老记录当初是用户点的还是判定逻辑写的，填 AUTO 会把「手动打卡次数」
+         * 这类统计直接变成假数据。UNKNOWN 明确表示「不可考」，
+         * 查询层据此排除或提示，而不是拿猜测当事实。
+         */
+        internal val MIGRATION_16_17 = object : Migration(16, 17) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE dashboard_card ADD COLUMN configJson TEXT")
+                db.execSQL(
+                    "ALTER TABLE daily_record ADD COLUMN origin TEXT NOT NULL DEFAULT 'UNKNOWN'",
+                )
+            }
+        }
+
         @Volatile
         private var instance: LifeBoardDatabase? = null
 
@@ -398,6 +419,7 @@ abstract class LifeBoardDatabase : RoomDatabase() {
                     MIGRATION_13_14,
                     MIGRATION_14_15,
                     MIGRATION_15_16,
+                    MIGRATION_16_17,
                 )
                     // 外键约束在 SQLite 里默认不生效，必须显式打开。
                     // 不打开时 dashboard_card 的 ON DELETE CASCADE 只是摆设：

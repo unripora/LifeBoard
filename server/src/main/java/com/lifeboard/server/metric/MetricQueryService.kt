@@ -142,7 +142,7 @@ object MetricQueryService {
      * @throws SourceUnresolvable 源已经不存在了（自建源被删、插件被卸）。
      *   不用返回值表达：这是三种源共同的失败点，用异常能让调用链只在这一处判断
      */
-    private suspend fun resolveBucket(
+    internal suspend fun resolveBucket(
         context: Context,
         sourceKey: String,
         metricKey: String?,
@@ -210,7 +210,7 @@ object MetricQueryService {
      * @property metricLabel 指标在标题里的名字。插件给的是它自己声明的
      *   displayName（「步数」），内置源与自建源没有声明过，用量的中文名
      */
-    private data class Resolved(
+    internal data class Resolved(
         val displayName: String,
         val bucket: MetricBucket,
         val unit: String = bucket.unit,

@@ -67,8 +67,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
+    kotlin {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        }
     }
 
     buildFeatures {
@@ -113,6 +115,11 @@ dependencies {
     ksp(libs.androidx.room.compiler)
 
     implementation(libs.kotlinx.coroutines.android)
+
+    // 图表引擎。雷达图官方不支持（本任务不做），饼图属实验性 API，
+    // 因此图表适配层必须隔离，避免其破坏性变更扩散到卡片代码。
+    implementation(libs.vico.compose)
+    implementation(libs.vico.compose.m3)
 
     // 纯逻辑（页签名归一化、布局状态判定）在 JVM 单测里验证，
     // 不必为了跑几个纯函数上真机

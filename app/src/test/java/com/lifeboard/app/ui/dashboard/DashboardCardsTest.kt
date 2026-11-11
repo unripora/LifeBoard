@@ -40,11 +40,15 @@ class DashboardCardsTest {
         )
 
     @Test
-    fun metricCardIsOfferableButLast() {
-        // M6b2b 起指标卡可以加。排在最后：它不是「选了就完」的选项，
-        // 还要再选一次数据源与指标
+    fun metricAndChartAreOfferableAndLast() {
+        // 指标卡与图表卡都可以加，且都不是「选了就完」的选项：
+        // 前者要再选数据源与指标，后者要再配图表，所以排在最后两位
         assertTrue(CardType.METRIC in DashboardCards.OFFERABLE)
-        assertEquals(CardType.METRIC, DashboardCards.OFFERABLE.last())
+        assertTrue(CardType.CHART in DashboardCards.OFFERABLE)
+        assertEquals(
+            listOf(CardType.METRIC, CardType.CHART),
+            DashboardCards.OFFERABLE.takeLast(2),
+        )
     }
 
     @Test
@@ -57,17 +61,20 @@ class DashboardCardsTest {
     fun addableExcludesAlreadyPresent() {
         val existing = listOf(CardType.SCORE, CardType.WEEK)
         assertEquals(
-            listOf(CardType.TODO, CardType.SOURCE_HEALTH, CardType.METRIC),
+            listOf(CardType.TODO, CardType.SOURCE_HEALTH, CardType.METRIC, CardType.CHART),
             DashboardCards.addableTo(existing),
         )
     }
 
     @Test
-    fun metricStaysAddableAfterOneIsPlaced() {
-        // 指标卡绑的是具体指标，一个页签里可以摆多张（步数 + 睡眠 + 屏幕使用）。
-        // 之前按类型排除，导致加了一张之后再也加不了第二张
+    fun metricAndChartStayAddableAfterOneIsPlaced() {
+        // 指标卡绑的是具体指标，图表卡绑的是一整份配置，同一个页签里都可以摆多张
+        // （步数 + 睡眠 + 屏幕使用）。之前按类型排除，导致加了一张之后再也加不了第二张
         val existing = DashboardCards.OFFERABLE
-        assertEquals(listOf(CardType.METRIC), DashboardCards.addableTo(existing))
+        assertEquals(
+            listOf(CardType.METRIC, CardType.CHART),
+            DashboardCards.addableTo(existing),
+        )
     }
 
     @Test
@@ -80,6 +87,14 @@ class DashboardCardsTest {
     fun addableNeverFullyEmptyBecauseMetricAlwaysAvailable() {
         // 加卡按钮的显示条件是 addable.isNotEmpty()，指标卡恒在意味着入口不会消失
         assertTrue(DashboardCards.addableTo(DashboardCards.OFFERABLE).isNotEmpty())
+    }
+
+    @Test
+    fun chartCardIsNeverTreatedAsDuplicate() {
+        // 图表卡的身份在 configJson 里，这一层拿不到配置就无从比较。
+        // 不按类型一刀切禁止：用户可能确实想并排看两张不同的图表
+        val existing = listOf(card(CardType.CHART))
+        assertFalse(DashboardCards.isDuplicate(CardType.CHART, null, null, existing))
     }
 
     @Test
