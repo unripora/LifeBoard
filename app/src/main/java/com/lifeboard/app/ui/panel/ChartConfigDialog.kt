@@ -36,6 +36,7 @@ import com.lifeboard.server.dashboard.ChartType
 import com.lifeboard.server.dashboard.CHART_TIME_WINDOWS_DAYS
 import com.lifeboard.server.metric.MetricCandidate
 import com.lifeboard.server.metric.MetricQueryService
+import com.lifeboard.server.metric.SOURCE_GROUP_NATIVE
 import com.lifeboard.server.metric.candidates
 import com.lifeboard.server.metric.sourceKeyFor
 
@@ -69,7 +70,6 @@ fun ChartConfigDialog(
     var options by remember { mutableStateOf<List<SeriesOption>>(emptyList()) }
     var tasks by remember { mutableStateOf<List<TaskEntity>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
-
     var chartType by remember { mutableStateOf(initial?.chartType ?: ChartType.LINE) }
     var series by remember { mutableStateOf(initial?.series.orEmpty()) }
     var timeWindow by remember { mutableStateOf(initial?.timeWindowDays ?: 30) }
@@ -84,6 +84,10 @@ fun ChartConfigDialog(
     // 正在换任务的那条已选序列的下标；null 表示不在换任务。
     // 与 picking 分开是因为它改的是已有序列，而不是新增一条
     var editingTaskIndex by remember { mutableStateOf<Int?>(null) }
+    // 指标选择器里展开着的插件分组名。空集 = 全部收起。
+    // 默认收起是有意的：分组就是「先看有哪些插件，再挑指标」，
+    // 一进来全展开等于没分组，还是要在一整屏里翻
+    var expandedGroups by remember { mutableStateOf(emptySet<String>()) }
 
     LaunchedEffect(Unit) {
         // 采集源与内置序列一起列出来：对用户来说它们都是「能画的指标」，
@@ -94,6 +98,10 @@ fun ChartConfigDialog(
         }.getOrDefault(emptyList())
         loading = false
     }
+
+    // 按来源分组。分组键在降级时复用 SeriesOption.group 的默认值，
+    // 这样即使某天数据源没带分组名，也不会出现一个标题为空的分组
+    val groups = remember(options) { groupOptions(options) }
 
     val usesCategory = chartType == ChartType.PIE
     val singleSeriesOnly = chartType == ChartType.RING
@@ -184,12 +192,20 @@ fun ChartConfigDialog(
                         DataSection(
                             loading = loading,
                             series = series,
-                            options = options,
+                            groups = groups,
                             tasks = tasks,
                             browsing = browsing,
                             picking = picking,
                             maxSeries = maxSeries,
                             singleSeriesOnly = singleSeriesOnly,
+                            expandedGroups = expandedGroups,
+                            onToggleGroup = { name ->
+                                expandedGroups = if (name in expandedGroups) {
+                                    expandedGroups - name
+                                } else {
+                                    expandedGroups + name
+                                }
+                            },
                             onBrowse = { browsing = it },
                             onPick = { picking = it },
                             onRemove = { index ->
@@ -246,12 +262,14 @@ fun ChartConfigDialog(
 private fun DataSection(
     loading: Boolean,
     series: List<ChartSeriesConfig>,
-    options: List<SeriesOption>,
+    groups: List<SeriesGroup>,
     tasks: List<TaskEntity>,
     browsing: Boolean,
     picking: SeriesOption?,
     maxSeries: Int,
     singleSeriesOnly: Boolean,
+    expandedGroups: Set<String>,
+    onToggleGroup: (String) -> Unit,
     onBrowse: (Boolean) -> Unit,
     onPick: (SeriesOption?) -> Unit,
     onRemove: (Int) -> Unit,
@@ -270,9 +288,11 @@ private fun DataSection(
     if (browsing) {
         PickerBody(
             option = picking,
-            options = options,
+            groups = groups,
             tasks = tasks,
             series = series,
+            expandedGroups = expandedGroups,
+            onToggleGroup = onToggleGroup,
             onPick = onPick,
             onAdd = onAdd,
             onCancel = {
@@ -320,7 +340,7 @@ private fun DataSection(
     // 已满上限时不再显示添加入口：Vico 只有两根 Y 轴，
     // 第三条不可比序列只能被丢弃，不如在这里就说清楚
     if (series.size < maxSeries) {
-        if (options.isEmpty()) {
+        if (groups.isEmpty()) {
             Text(
                 "没有可用的数据源",
                 style = MaterialTheme.typography.bodySmall,
@@ -347,13 +367,18 @@ private fun DataSection(
 }
 
 /**
- * 指标选择器：一屏滚动列出所有可选项。
+ * 指标选择器：按来源分组、可展开收起的列表。
  *
- * ## 为什么是滚动列表而不是下拉
+ * ## 为什么按插件分组
  *
- * 可选项来自三处：内置源/自建源、已装插件（每个插件还会展开多个指标）、
- * 以及内置业务序列。加起来通常超过一屏，下拉菜单会变成一条长长的浮层，
- * 在手机上既不好滚也不好点。用一个占满可用高度的滚动列表更稳。
+ * 装了两个插件之后，可选项变成「小米健康 · 步数 / 小米健康 · 睡眠 / …」一长串，
+ * 每行都得念一遍来源名才知道自己跳到了哪个插件。分组之后第一屏只有
+ * 「原生」「小米健康」这两行，点开才看到组里的指标。
+ *
+ * ## 为什么分组标题也是可点的
+ *
+ * 收起状态下点标题只做展开，不替用户选第一个指标：一组的指标可能有七八个，
+ * 替用户点第一个等于替他做了选择。
  *
  * ## 需要任务的两步
  *
@@ -365,9 +390,11 @@ private fun DataSection(
 @Composable
 private fun PickerBody(
     option: SeriesOption?,
-    options: List<SeriesOption>,
+    groups: List<SeriesGroup>,
     tasks: List<TaskEntity>,
     series: List<ChartSeriesConfig>,
+    expandedGroups: Set<String>,
+    onToggleGroup: (String) -> Unit,
     onPick: (SeriesOption?) -> Unit,
     onAdd: (SeriesOption, TaskEntity?) -> Unit,
     onCancel: () -> Unit,
@@ -383,40 +410,97 @@ private fun PickerBody(
     }
 
     val takenKeys = series.map { "${it.sourceKey}|${it.metricKey}" }.toSet()
-    if (options.isEmpty()) {
+    if (groups.isEmpty()) {
         Text(
             "没有可用的数据源",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     } else {
-        ScrollableRows(rowCount = options.size) {
-            options.forEach { current ->
-                val alreadyAdded = current.optionKey in takenKeys
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable(enabled = !alreadyAdded) {
-                            if (current.needsTask) onPick(current) else onAdd(current, null)
+        // 行数 = 分组标题 + 已展开分组里的指标，都算进去才不会被限高截断
+        val rowCount = groups.sumOf { group ->
+            1 + if (group.name in expandedGroups) group.options.size else 0
+        }
+        ScrollableRows(rowCount = rowCount) {
+            groups.forEach { group ->
+                val expanded = group.name in expandedGroups
+                GroupHeader(
+                    name = group.name,
+                    count = group.options.size,
+                    expanded = expanded,
+                    onClick = { onToggleGroup(group.name) },
+                )
+                if (expanded) {
+                    group.options.forEach { current ->
+                        val alreadyAdded = current.optionKey in takenKeys
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable(enabled = !alreadyAdded) {
+                                    if (current.needsTask) onPick(current) else onAdd(current, null)
+                                }
+                                // 组内缩进一格，视觉上归属清楚
+                                .padding(start = 16.dp, top = 8.dp, bottom = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                if (alreadyAdded) "${current.label}（已添加）" else current.label,
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                current.unit,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
-                        .padding(vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        if (alreadyAdded) "${current.label}（已添加）" else current.label,
-                        style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.weight(1f),
-                    )
-                    Text(
-                        current.unit,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    }
                 }
             }
         }
     }
     TextButton(onClick = onCancel) { Text("取消") }
+}
+
+/**
+ * 一个分组的标题行：图标（展开 / 收起）+ 名称 + 指标条数。
+ *
+ * 用文字箭头而不是旋转动画：这一行只在弹窗里出现几十毫秒内被点一次，
+ * 加动画只会让展开看起来比实际慢。
+ */
+@Composable
+private fun GroupHeader(
+    name: String,
+    count: Int,
+    expanded: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            if (expanded) "▾" else "▸",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            name,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            // 收起时也要说明里面有多少项，否则用户不知道值不值得展开
+            "$count 个指标",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }
 
 /**
@@ -554,6 +638,8 @@ private const val BUILTIN_SOURCE_KEY = "BUILTIN"
  * @property sourceKey 写进配置的数据源键
  * @property metricKey 写进配置的指标键
  * @property needsTask 该序列是否必须再选一条任务
+ * @property group 选择器里的分组名。插件源显示插件名（「小米健康」），
+ *   其余归到「原生」（见 [GROUP_NATIVE]）
  */
 private data class SeriesOption(
     val optionKey: String,
@@ -562,6 +648,7 @@ private data class SeriesOption(
     val label: String,
     val unit: String,
     val needsTask: Boolean = false,
+    val group: String = GROUP_NATIVE,
 ) {
     /** 选中后写进配置的序列。轴由调用方按顺序决定 */
     fun toSeriesConfig(axis: ChartAxis, taskId: Long?, taskLabel: String?): ChartSeriesConfig =
@@ -576,12 +663,43 @@ private data class SeriesOption(
         )
 }
 
+/** 选择器里的一个分组。名字用来做展开状态的键，同一份数据里不会重名 */
+private data class SeriesGroup(
+    val name: String,
+    val options: List<SeriesOption>,
+)
+
+/**
+ * 把可选项按 [SeriesOption.group] 聚成组。
+ *
+ * 分组顺序 = 首次出现的顺序。`flattenCandidates` 已经按「内置/自建 → 插件」
+ * 排过，`builtinOptions` 接在后面，所以「原生」一定排在最前，
+ * 插件之间按加载顺序——与它们在插件列表页里的顺序一致，用户不用重新认一遍。
+ *
+ * 用 LinkedHashMap 而不是 `groupBy`：后者返回的 Map 也是插入有序的，
+ * 但分组名到列表的映射关系不如直接写清楚好读。
+ */
+private fun groupOptions(options: List<SeriesOption>): List<SeriesGroup> {
+    val byName = linkedMapOf<String, MutableList<SeriesOption>>()
+    options.forEach { option ->
+        byName.getOrPut(option.group) { mutableListOf() }.add(option)
+    }
+    return byName.map { (name, items) -> SeriesGroup(name, items) }
+}
+
+/** 非插件来源（内置源、自建源、内置业务序列）在图表数据源里的分组名 */
+private val GROUP_NATIVE = SOURCE_GROUP_NATIVE
+
 /**
  * 把所有数据源的**每一个指标**摊平成可选项。
  *
  * 为什么不按源只取第一项：一个插件可以声明多个指标（小米健康的步数与睡眠），
  * 只取 `metrics[0]` 会让其余指标在图表里永远选不到。
  * 内置源与自建源只有一个指标，摊平后自然还是一行。
+ *
+ * 分组名取自 `MetricCandidate.groupName`：插件源是插件展示名，
+ * 内置/自建源是「原生」。标签不再带来源前缀——前缀已经由分组标题说了，
+ * 每行再重复一遍只会把真正要看的指标名挤到后面。
  */
 private fun flattenCandidates(candidates: List<MetricCandidate>): List<SeriesOption> =
     candidates.flatMap { candidate ->
@@ -592,13 +710,11 @@ private fun flattenCandidates(candidates: List<MetricCandidate>): List<SeriesOpt
                 optionKey = "$sourceKey|$metricKey",
                 sourceKey = sourceKey,
                 metricKey = metricKey,
-                // 多指标的源要把指标名也显示出来，否则第一屏全是「小米健康」
-                label = if (candidate.metrics.size > 1) {
-                    "${candidate.displayName} · ${option.label}"
-                } else {
-                    candidate.displayName
-                },
+                // 只有一个指标的源直接用源名（「屏幕时间」），
+                // 与它作为指标卡时的叫法一致；多指标的源用指标名
+                label = if (candidate.metrics.size > 1) option.label else candidate.displayName,
                 unit = option.unit,
+                group = candidate.groupName,
             )
         }
     }

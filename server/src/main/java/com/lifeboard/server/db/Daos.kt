@@ -351,6 +351,9 @@ interface DashboardTabDao {
 
     @Query("UPDATE dashboard_tab SET `order` = :order WHERE tabId = :tabId")
     suspend fun setOrder(tabId: String, order: Int)
+
+    @Query("UPDATE dashboard_tab SET enabled = :enabled WHERE tabId = :tabId")
+    suspend fun setEnabled(tabId: String, enabled: Boolean)
 }
 
 @Dao
@@ -393,6 +396,9 @@ interface DashboardCardDao {
 
     @Query("UPDATE dashboard_card SET `order` = :order WHERE cardId = :cardId")
     suspend fun setOrder(cardId: String, order: Int)
+
+    @Query("UPDATE dashboard_card SET enabled = :enabled WHERE cardId = :cardId")
+    suspend fun setEnabled(cardId: String, enabled: Boolean)
 
     @Query("UPDATE dashboard_card SET tabId = :tabId WHERE cardId = :cardId")
     suspend fun moveToTab(cardId: String, tabId: String)

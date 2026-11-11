@@ -319,6 +319,10 @@ data class AppUsageEntity(
  *   用户新建的用 UUID。**不能用自增主键**：页签被卡片引用（卡片的 tabId），
  *   自增 id 在重建布局时会漂移
  * @param isBuiltin 内置页签不允许删除/改名，只能调顺序
+ * @param enabled 是否在顶部页签行里显示。**内置页签同样可以关掉**——
+ *   关掉不等于删除：route 分发、卡片、以及「管理页签」里的那一行都还在，
+ *   只是主界面不画它。这是内置页签唯一能「退出视线」的方式，
+ *   因为删掉它会让内置页面失去唯一入口
  */
 @Entity(tableName = "dashboard_tab")
 data class DashboardTabEntity(
@@ -326,6 +330,7 @@ data class DashboardTabEntity(
     val name: String,
     val order: Int,
     val isBuiltin: Boolean = false,
+    val enabled: Boolean = true,
 )
 
 /**
@@ -340,6 +345,9 @@ data class DashboardTabEntity(
  * @param sourceKey 仅 METRIC 卡使用，绑定 SourceRef.key
  * @param metricKey 仅 METRIC 卡使用，配合 MetricSpec 反查 bucket/单位/展示名
  * @param tabId 所属页签，删除页签时级联清理
+ * @param enabled 是否在页签里显示。关掉的卡片留在库里、位置也被占着，
+ *   重新打开就回到原处；之所以不删掉，是因为「这张卡我先不看了」和
+ *   「这张卡我不要了」是两件事，后者有专门的删除按钮
  */
 @Entity(
     tableName = "dashboard_card",
@@ -392,6 +400,8 @@ data class DashboardCardEntity(
      * 其余五种卡片该字段恒为 null，行为完全不变。
      */
     val configJson: String? = null,
+    /** 是否显示。见类注释；关掉的卡片仍然占着它的 order */
+    val enabled: Boolean = true,
 )
 
 /**

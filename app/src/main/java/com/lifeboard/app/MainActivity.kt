@@ -136,6 +136,8 @@ private data class TabItem(
     val kind: TabKind,
     /** 内置页签的原始定义；用户页签为 null。管理弹窗据此决定能不能删 */
     val builtin: BuiltinTab? = null,
+    /** 是否在顶部页签行里显示。关掉的页签仍在列表里，只是不画 */
+    val enabled: Boolean = true,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -179,11 +181,15 @@ private fun MainScaffold(appearance: AppearanceState) {
 
     // 未就绪时用内存默认布局顶一帧：这里有顺序敏感的场景——
     // 冷启动第一帧如果用空列表，ScrollableTabRow 会闪一下空白再出现页签
-    val tabs = if (dashState.ready) {
+    val allTabs = if (dashState.ready) {
         dashState.tabs.map { it.toTabItem() }
     } else {
         DashboardDefaults.tabs.map { it.toTabItem() }
     }
+    // 关掉的页签不进顶部页签行。过滤放在这里而不是渲染时：下面的
+    // selectedIndex 回退逻辑要按「实际看得见的页签」算，否则选中一个
+    // 关掉的页签会显示成第一个可见页签却没写回偏好
+    val tabs = allTabs.filter { it.enabled }
 
     fun selectTab(tabId: String) {
         selectedTabId = tabId
@@ -373,7 +379,15 @@ private fun MainScaffold(appearance: AppearanceState) {
 
         if (showTabManager) {
             TabManagerDialog(
-                tabs = tabs.map { TabRowUi(tabId = it.tabId, label = it.label, builtin = it.builtin) },
+                // 管理弹窗列出**全部**页签（含已关掉的），否则关掉之后再也没法打开
+                tabs = allTabs.map {
+                    TabRowUi(
+                        tabId = it.tabId,
+                        label = it.label,
+                        builtin = it.builtin,
+                        enabled = it.enabled,
+                    )
+                },
                 onDismiss = { showTabManager = false },
                 onCreate = { name ->
                     dashVm.createTab(name) { newId -> selectTab(newId) }
@@ -386,6 +400,14 @@ private fun MainScaffold(appearance: AppearanceState) {
                     if (tab.tabId == selectedTabId) selectTab(BuiltinTabs.TAB_ID_PANEL)
                 },
                 onMove = { tabId, to -> dashVm.moveTab(tabId, to) },
+                onToggleEnabled = { tab, enabled ->
+                    dashVm.setTabEnabled(tab.tabId, enabled)
+                    // 关掉的正好是当前页：立刻切回面板。留在原页会变成
+                    // 「顶部没有选中项、下面却在画它的内容」的割裂状态
+                    if (!enabled && tab.tabId == selectedTabId) {
+                        selectTab(BuiltinTabs.TAB_ID_PANEL)
+                    }
+                },
             )
         }
 
@@ -488,6 +510,7 @@ private fun DashboardTabEntity.toTabItem(): TabItem {
         route = builtin?.route ?: "",
         kind = if (isBuiltin) TabKind.BUILTIN else TabKind.USER,
         builtin = builtin,
+        enabled = enabled,
     )
 }
 

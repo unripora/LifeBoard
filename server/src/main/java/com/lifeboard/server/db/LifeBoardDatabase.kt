@@ -28,7 +28,7 @@ import androidx.room.RoomDatabase.Callback
         PluginRawRecordEntity::class,
         PluginMetricQueryEntity::class,
     ],
-    version = 17,
+    version = 18,
     exportSchema = true,
 )
 abstract class LifeBoardDatabase : RoomDatabase() {
@@ -398,6 +398,24 @@ abstract class LifeBoardDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v17 → v18：页签与卡片都能单独关掉显示。
+         *
+         * 两列都带 `DEFAULT 1`：老数据升级后一律当作「全部显示」，
+         * 与升级前的界面完全一致。不写 0 是有意的——如果默认关掉，
+         * 用户一升级就会发现页签少了一半，而「管理页签」里又要一条条打开。
+         */
+        internal val MIGRATION_17_18 = object : Migration(17, 18) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE dashboard_tab ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
+                )
+                db.execSQL(
+                    "ALTER TABLE dashboard_card ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
+                )
+            }
+        }
+
         @Volatile
         private var instance: LifeBoardDatabase? = null
 
@@ -420,6 +438,7 @@ abstract class LifeBoardDatabase : RoomDatabase() {
                     MIGRATION_14_15,
                     MIGRATION_15_16,
                     MIGRATION_16_17,
+                    MIGRATION_17_18,
                 )
                     // 外键约束在 SQLite 里默认不生效，必须显式打开。
                     // 不打开时 dashboard_card 的 ON DELETE CASCADE 只是摆设：

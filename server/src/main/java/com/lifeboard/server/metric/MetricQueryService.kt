@@ -237,12 +237,21 @@ class SourceUnresolvable(val key: String) : Exception("数据源已不存在：$
  *
  * @property metrics 这个源能读的指标。内置源与自建源各只有一个（就是它自己的量纲），
  *   插件源可能有多个
+ * @property groupName 选择器里的分组名。
+ *   - 插件源：插件的展示名（「小米健康」）。**必须由这里给出而不是界面按
+ *     pluginId 反查**——[PluginManager.loaded] 拿得到 `SourcePlugin.displayName`，
+ *     而界面只拿到一个 `PLUGIN_{id}:{metric}` 键，反查要靠解析键再猜名字
+ *   - 内置源、自建源：`SOURCE_GROUP_NATIVE`（「原生」）
  */
 data class MetricCandidate(
     val sourceKey: String,
     val displayName: String,
     val metrics: List<MetricOption>,
+    val groupName: String = SOURCE_GROUP_NATIVE,
 )
+
+/** 非插件来源（内置源、自建源）在选择器里的分组名。内置业务序列在界面侧归到同一组 */
+const val SOURCE_GROUP_NATIVE: String = "原生"
 
 /**
  * 可选的一个指标。
@@ -320,6 +329,7 @@ private fun pluginCandidates(): List<MetricCandidate> =
                 sourceKey = SourceRef.pluginKey(loaded.pluginId, options.first().metricKey!!),
                 displayName = loaded.plugin.displayName,
                 metrics = options,
+                groupName = loaded.plugin.displayName,
             )
         }
 

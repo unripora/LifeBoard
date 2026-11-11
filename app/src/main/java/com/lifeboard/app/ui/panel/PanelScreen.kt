@@ -18,6 +18,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -141,9 +142,11 @@ fun PanelScreen(
     }
     val addable = DashboardCards.addableTo(existingTypes)
 
-    // 拖拽排序（M6.8）。只在编辑态生效，松手时一次性把结果写回库里
+    // 拖拽排序（M6.8）。只在编辑态生效，松手时一次性把结果写回库里。
+    // 下标按 storedCards 算而不是按 cards：cards 已经滤掉了关闭的卡，
+    // 用它会让「拖到第 3 张」落到一个和库里对不上的行上
     val drag = rememberCardDrag(
-        count = cards.size,
+        count = storedCards.size,
         onDrop = { from, to ->
             // 用「把这张卡挪到目标下标」而不是两两交换：
             // 从 0 拖到 3 是三个位置的关系，交换会让中间两张卡平白换位
@@ -152,6 +155,14 @@ fun PanelScreen(
             }
         },
     )
+
+    // 编辑态要连关掉的卡一起列出来，否则用户关掉之后就再也找不到开关了。
+    // 非编辑态只画启用的卡——这一条是「隐藏」对用户可见的全部含义
+    val rows = if (editing) storedCards else storedCards.filter { it.enabled }
+    // 认不出类型的历史行不该占位：否则会画成一行空白操作栏
+    val visibleRows = remember(rows) {
+        rows.filter { DashboardCards.parseType(it.type) != null }
+    }
 
     Column(
         modifier = Modifier
@@ -169,7 +180,9 @@ fun PanelScreen(
             }
         }
 
-        if (cards.isEmpty()) {
+        // 空态只在「一张卡都看不见」时出现。编辑态下即使全部关掉，
+        // 上面也还列着那些行与开关，再压一句「还没有卡片」会自相矛盾
+        if (cards.isEmpty() && !editing) {
             // 只有确实读完了才显示空态：未就绪时上面已经用默认卡片兜住
             EmptyTabHint(
                 onAdd = { adding = true },
@@ -178,62 +191,57 @@ fun PanelScreen(
             )
         }
 
-        cards.forEachIndexed { index, type ->
+        visibleRows.forEachIndexed { index, card ->
+            val type = DashboardCards.parseType(card.type) ?: return@forEachIndexed
             Column(
                 Modifier
                     .fillMaxWidth()
                     .dragHandle(
                         enabled = editing,
                         index = index,
-                        count = cards.size,
+                        count = visibleRows.size,
                         drag = drag,
                     ),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 if (editing) {
-                    // 卡片 id 从库里按顺序取：渲染列表和卡片行是同一个 order 排序的，
-                    // 所以下标能对上。对不上（库里有一条认不出的类型）时不给操作按钮，
-                    // 免得「上移」动到的是另一张卡
-                    val row = storedCards.getOrNull(index)
                     CardEditBar(
                         title = DashboardCards.labelOf(type),
-                        canMoveUp = index > 0,
-                        canMoveDown = index < cards.lastIndex,
-                        onMoveUp = { row?.let { dashVm.moveCard(tabId, it.cardId, -1) } },
-                        onMoveDown = { row?.let { dashVm.moveCard(tabId, it.cardId, 1) } },
-                        onDelete = { row?.let { dashVm.deleteCard(tabId, it.cardId) } },
-                        enabled = row != null,
-                        // 只有图表卡有「形态 / 指标 / 时间窗」可调，其余卡的配置是固定的
+                        enabled = card.enabled,
+                        onToggleEnabled = { dashVm.setCardEnabled(card.cardId, it) },
                         onEditConfig = if (type == CardType.CHART) {
-                            { row?.let { editingChartCard = it } }
+                            { editingChartCard = card }
                         } else {
                             null
                         },
+                        onDelete = { dashVm.deleteCard(tabId, card.cardId) },
                     )
                 }
-                CardHost(
-                    type = type,
-                    state = state,
-                    metricReading = storedCards.getOrNull(index)
-                        ?.let { row -> metricStates.firstOrNull { it.cardId == row.cardId } },
-                    chartState = storedCards.getOrNull(index)
-                        ?.let { row -> chartStates.firstOrNull { it.cardId == row.cardId } },
-                    // 指标卡可以点开换数据源（M6b2c）。其他类型传 null：
-                    // 它们读的是固定位置的数据，没有「换源」这回事
-                    onChangeMetricSource = if (type == CardType.METRIC) {
-                        { storedCards.getOrNull(index)?.let { rebindingCard = it } }
-                    } else {
-                        null
-                    },
-                    onRefresh = { vm.reevaluate() },
-                    onMarkDone = { vm.markDone(it) },
-                    onEditTask = onEditTask,
-                    onNewTask = onNewTask,
-                    onToggle = { vm.toggleEnabled(it) },
-                    onDelete = { pendingDelete = it },
-                    // 只有系统权限类数据源会带 actionKey，宿主直接跳系统设置页
-                    onOpenSourceSettings = { vm.openSourceSettings(it) },
-                )
+                // 关掉的卡不渲染内容，只留上面那条操作栏。
+                // 保留这一行而不是整条藏起来：它是重新打开的入口
+                if (card.enabled) {
+                    CardHost(
+                        type = type,
+                        state = state,
+                        metricReading = metricStates.firstOrNull { it.cardId == card.cardId },
+                        chartState = chartStates.firstOrNull { it.cardId == card.cardId },
+                        // 指标卡可以点开换数据源（M6b2c）。其他类型传 null：
+                        // 它们读的是固定位置的数据，没有「换源」这回事
+                        onChangeMetricSource = if (type == CardType.METRIC) {
+                            { rebindingCard = card }
+                        } else {
+                            null
+                        },
+                        onRefresh = { vm.reevaluate() },
+                        onMarkDone = { vm.markDone(it) },
+                        onEditTask = onEditTask,
+                        onNewTask = onNewTask,
+                        onToggle = { vm.toggleEnabled(it) },
+                        onDelete = { pendingDelete = it },
+                        // 只有系统权限类数据源会带 actionKey，宿主直接跳系统设置页
+                        onOpenSourceSettings = { vm.openSourceSettings(it) },
+                    )
+                }
             }
         }
 
@@ -960,18 +968,23 @@ private fun EmptyTabHint(onAdd: () -> Unit, canAdd: Boolean) {
  *
  * 放在卡片外面而不是塞进 `GlassCard` 里：卡片内部的排版是 M6a 定死的，
  * 掺进编辑控件会让它在非编辑态也跟着变高，视觉上就不再和改造前一致。
- * 用「上移 / 下移」而不是拖拽：拖拽要做到能用（判定区、滚动冲突、边缘吸附）
- * 是 6.8 的独立任务，按钮是它之前唯一不会误导人的排序手段。
+ *
+ * ## 排序为什么改成长按拖动
+ *
+ * 「上移 / 下移」在卡片多了以后要点很多次，而且每点一次列表就重排一次、
+ * 按钮跟着挪位置，手指很容易误点到「移除」上。现在排序靠长按整张卡片拖动
+ * （见 [dragHandle]），这条栏只留下与「这张卡要不要」有关的开关与按钮。
+ * 拖动手势挂在整个卡片列上，所以这里不必再放一个拖把图标。
+ *
+ * @param enabled 卡片当前的显示状态。关掉的卡在编辑态仍然占一行，
+ *   只画这一条栏——它是重新打开的入口
  */
 @Composable
 private fun CardEditBar(
     title: String,
-    canMoveUp: Boolean,
-    canMoveDown: Boolean,
-    onMoveUp: () -> Unit,
-    onMoveDown: () -> Unit,
-    onDelete: () -> Unit,
     enabled: Boolean,
+    onToggleEnabled: (Boolean) -> Unit,
+    onDelete: () -> Unit,
     /** 「编辑配置」入口；只有需要额外配置的卡型（图表）才传，其余为 null */
     onEditConfig: (() -> Unit)? = null,
 ) {
@@ -986,16 +999,13 @@ private fun CardEditBar(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.weight(1f),
         )
-        TextButton(onClick = onMoveUp, enabled = enabled && canMoveUp) { Text("上移") }
-        TextButton(onClick = onMoveDown, enabled = enabled && canMoveDown) { Text("下移") }
+        Switch(checked = enabled, onCheckedChange = onToggleEnabled)
         if (enabled && onEditConfig != null) {
             // 图表卡的数据源与形态要能改，但不该「删了再加」——
             // 那会让卡片跳到页签末尾
             TextButton(onClick = onEditConfig) { Text("配置") }
         }
-        if (enabled) {
-            TextButton(onClick = onDelete) { Text("移除") }
-        }
+        TextButton(onClick = onDelete) { Text("移除") }
     }
 }
 
