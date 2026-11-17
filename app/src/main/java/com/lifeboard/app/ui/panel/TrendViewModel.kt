@@ -1,12 +1,12 @@
 package com.lifeboard.app.ui.panel
 
-import android.app.Application
-import androidx.lifecycle.AndroidViewModel
+import android.content.Context
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.lifeboard.core.model.StreakInfo
 import com.lifeboard.core.model.TaskConfig
 import com.lifeboard.core.util.Dates
-import com.lifeboard.server.panel.TaskRepository
+import com.lifeboard.server.platform.AndroidPanelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -56,9 +56,10 @@ data class TrendUiState(
  * 只读不写。跨度切换时重新按区间查库，不缓存——数据量最多 30 行，
  * 缓存反而会带来"改了任务但图表没更新"的困惑。
  */
-class TrendViewModel(app: Application) : AndroidViewModel(app) {
+class TrendViewModel(context: Context) : ViewModel() {
 
-    private val repo = TaskRepository(app)
+    private val repo =
+        com.lifeboard.shared.panel.TaskRepository(AndroidPanelScope(context.applicationContext))
 
     private val _state = MutableStateFlow(TrendUiState())
     val state: StateFlow<TrendUiState> = _state.asStateFlow()

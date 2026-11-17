@@ -1,11 +1,11 @@
 package com.lifeboard.app.ui.dashboard
 
-import com.lifeboard.server.dashboard.BuiltinTabs
-import com.lifeboard.server.dashboard.CardType
-import com.lifeboard.server.dashboard.DashboardCards
-import com.lifeboard.server.dashboard.DashboardLayout
-import com.lifeboard.server.db.DashboardCardEntity
-import com.lifeboard.server.db.DashboardTabEntity
+import com.lifeboard.shared.dashboard.BuiltinTabs
+import com.lifeboard.shared.dashboard.CardType
+import com.lifeboard.shared.dashboard.DashboardCards
+import com.lifeboard.shared.dashboard.DashboardLayout
+import com.lifeboard.shared.repository.model.DashboardCard
+import com.lifeboard.shared.repository.model.DashboardTab
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -22,7 +22,7 @@ import org.junit.Test
 class DashboardCardsTest {
 
     private fun card(type: CardType, tabId: String = "user_1", order: Int = 0) =
-        DashboardCardEntity(
+        DashboardCard(
             cardId = "c_${type.name}_$order",
             type = type.name,
             order = order,
@@ -30,13 +30,21 @@ class DashboardCardsTest {
         )
 
     private fun metricCard(sourceKey: String, metricKey: String?, tabId: String = "user_1") =
-        DashboardCardEntity(
+        DashboardCard(
             cardId = "c_METRIC_$sourceKey",
             type = CardType.METRIC.name,
             sourceKey = sourceKey,
             metricKey = metricKey,
             order = 0,
             tabId = tabId,
+        )
+
+    private fun tab(tabId: String, name: String, order: Int, isBuiltin: Boolean) =
+        DashboardTab(
+            tabId = tabId,
+            name = name,
+            order = order,
+            isBuiltin = isBuiltin,
         )
 
     @Test
@@ -146,11 +154,11 @@ class DashboardCardsTest {
 
     @Test
     fun userTabContentKeepsStoredOrderAndDropsGarbage() {
-        val tab = DashboardTabEntity(tabId = "user_1", name = "我的", order = 1, isBuiltin = false)
+        val tab = tab(tabId = "user_1", name = "我的", order = 1, isBuiltin = false)
         val cards = listOf(
             card(CardType.WEEK, order = 0),
             // 认不出的类型（升级/降级留下的行）要跳过而不是整页报错
-            DashboardCardEntity("x", "GONE_TYPE", order = 1, tabId = "user_1"),
+            DashboardCard("x", "GONE_TYPE", order = 1, tabId = "user_1"),
             card(CardType.TODO, order = 2),
         )
         assertEquals(
@@ -161,7 +169,7 @@ class DashboardCardsTest {
 
     @Test
     fun builtinPanelContentComesFromDefaultLayout() {
-        val panel = DashboardTabEntity(
+        val panel = tab(
             tabId = BuiltinTabs.TAB_ID_PANEL,
             name = "面板",
             order = 0,
@@ -173,7 +181,7 @@ class DashboardCardsTest {
 
     @Test
     fun builtinPageTabHasNoCardContent() {
-        val rules = DashboardTabEntity(
+        val rules = tab(
             tabId = "builtin_rules",
             name = "规则",
             order = 1,

@@ -1,0 +1,21 @@
+-- v14 -> v15：新增插件原始条目快照表。
+--
+-- 纯新建表，不动任何已有数据。这张表存「上次同步拿到的原始条目」，
+-- 只是展示用，丢了也不影响任何判定与计分——所以没有回填历史的需求。
+--
+-- **必须显式迁移**：不挂破坏性重建，缺迁移会让应用起不来。
+CREATE TABLE IF NOT EXISTS `plugin_raw_record` (
+    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    `pluginId` TEXT NOT NULL,
+    `date` TEXT NOT NULL,
+    `metricKey` TEXT NOT NULL,
+    `timestamp` INTEGER NOT NULL,
+    `value` REAL NOT NULL,
+    `detail` TEXT NOT NULL,
+    `seq` INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS `index_plugin_raw_record_pluginId_date`
+    ON `plugin_raw_record` (`pluginId`, `date`);
+CREATE INDEX IF NOT EXISTS `index_plugin_raw_record_pluginId_date_metricKey`
+    ON `plugin_raw_record` (`pluginId`, `date`, `metricKey`);

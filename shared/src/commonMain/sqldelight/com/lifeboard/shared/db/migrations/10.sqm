@@ -1,0 +1,26 @@
+-- v10 -> v11：新增仪表盘布局两张表。
+--
+-- 只是加表，不动已有结构。**必须显式迁移**：
+-- 落到破坏性重建会把任务、规则、凭据全部清空，对用户来说是「升级后所有配置都没了」。
+--
+-- 表建好之后是空的，内置页签与默认卡片由 DashboardLayout 在首次读取时写入，
+-- 不在迁移里插数据——迁移只改结构，不碰业务内容。
+CREATE TABLE IF NOT EXISTS `dashboard_tab` (
+    `tabId` TEXT NOT NULL,
+    `name` TEXT NOT NULL,
+    `order` INTEGER NOT NULL,
+    `isBuiltin` INTEGER NOT NULL,
+    PRIMARY KEY(`tabId`)
+);
+
+CREATE TABLE IF NOT EXISTS `dashboard_card` (
+    `cardId` TEXT NOT NULL,
+    `type` TEXT NOT NULL,
+    `sourceKey` TEXT,
+    `metricKey` TEXT,
+    `order` INTEGER NOT NULL,
+    `tabId` TEXT NOT NULL,
+    PRIMARY KEY(`cardId`)
+);
+
+CREATE INDEX IF NOT EXISTS `index_dashboard_card_tabId` ON `dashboard_card` (`tabId`);

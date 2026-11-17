@@ -1,0 +1,12 @@
+-- v17 -> v18：页签与卡片都能单独关掉显示。
+--
+-- 两列都带 `DEFAULT 1`：老数据升级后一律当作「全部显示」，
+-- 与升级前的界面完全一致。不写 0 是有意的——如果默认关掉，
+-- 用户一升级就会发现页签少了一半，而「管理页签」里又要一条条打开。
+--
+-- 关掉不等于删除：route 分发、卡片、以及「管理页签」里的那一行都还在，
+-- 只是主界面不画它。这是内置页签唯一能「退出视线」的方式，
+-- 因为删掉它会让内置页面失去唯一入口。
+ALTER TABLE `dashboard_tab` ADD COLUMN `enabled` INTEGER NOT NULL DEFAULT 1;
+
+ALTER TABLE `dashboard_card` ADD COLUMN `enabled` INTEGER NOT NULL DEFAULT 1;

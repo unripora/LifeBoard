@@ -1,0 +1,16 @@
+-- v9 -> v10：新增插件凭据表。
+--
+-- 只是加一张新表，不动已有结构。**必须显式迁移**：
+-- 凭据是有状态的数据，落到破坏性重建会静默清空，
+-- 表现为「用户昨天刚登录，升级后又要重登」且毫无报错。
+--
+-- 落库的是密文：cipherText 为 Keystore 加密后的 IV + GCM 密文，Base64 存储。
+CREATE TABLE IF NOT EXISTS `plugin_credential` (
+    `pluginId` TEXT NOT NULL,
+    `slot` TEXT NOT NULL,
+    `cipherText` TEXT NOT NULL,
+    `updatedAt` INTEGER NOT NULL,
+    PRIMARY KEY(`pluginId`, `slot`)
+);
+
+CREATE INDEX IF NOT EXISTS `index_plugin_credential_pluginId` ON `plugin_credential` (`pluginId`);

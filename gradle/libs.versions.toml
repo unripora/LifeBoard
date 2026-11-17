@@ -1,18 +1,19 @@
 [versions]
 agp = "8.12.3"
 kotlin = "2.3.21"
-ksp = "2.3.10"
 coreKtx = "1.15.0"
 lifecycle = "2.8.7"
 activityCompose = "1.9.3"
 # Vico 3.2.3 依赖 Compose Multiplatform 1.9.0（Android 侧重定向到 AndroidX Compose）。
-# Kotlin 2.3.21 + KSP 2.3.10 要求 AGP ≥8.12，故同步升 AGP。
-# BOM 暂不抬升，先看实测是否有 Compose 版本冲突。
+# Kotlin 2.3.21 要求 AGP ≥8.12，故同步升 AGP。
+# BOM 保持 2024.12.01：Android 侧的 Compose 版本由 CMP 1.12.2 统一约束，
+# 显式 BOM 只用于给未参与 CMP 对齐的 androidx 组件（activity/lifecycle）兜底，
+# 抬高它会与 CMP 的传递版本打架，且 1.12.1 之后的 compose 要求 compileSdk 37。
 composeBom = "2024.12.01"
+# 图标集是独立发布的，不受 CMP 约束，得自己钉版本。
+# 取与 BOM 2024.12.01 对齐的 1.7.6：再高就会连带要求更新的 compose runtime。
+composeIcons = "1.7.6"
 vico = "3.2.3"
-# Room 2.7.x 才支持 KSP 2.x；2.6.1 在 KSP 2.3 下会在 Room 编译器里抛
-# "unexpected jvm signature V"。升 Room 是本次工具链升级的硬依赖，不是顺手更新。
-room = "2.7.1"
 work = "2.10.0"
 coroutines = "1.9.0"
 # LSPosed / libxposed API（实机 Vector v2.1.1，API 102）
@@ -25,6 +26,24 @@ junit = "4.13.2"
 androidxTestJunit = "1.2.1"
 androidxTestRunner = "1.6.2"
 okhttp = "4.12.0"
+# === 桌面端（M0 验证结论） ===
+# Compose Multiplatform 稳定版。Vico 3.2.3 要求 compose 1.11.0，故不低于 1.11。
+# 与本项目 Kotlin 2.3.21 的兼容性由 M0 子任务 0.1 实测确认。
+composeMultiplatform = "1.12.2"
+# SQLDelight 2.x：一套 .sq 双端生成，替代 Room（用户指定「一套 SQL」）
+sqldelight = "2.4.1"
+# JNA：桌面侧调用 quickjs-ng .dll 与 Windows DPAPI
+jna = "5.19.1"
+# 桌面 SQLite 驱动，固定版本避免随 JDK/系统漂移
+sqliteJdbc = "3.54.1.0"
+# kotlinx-serialization：一套 JSON 编解码放 commonMain。
+# 不用 org.json —— 那是 Android 框架类，桌面端没有实现。
+# 1.7.3 与缓存里已有的 core/bom 版本一致，避免被 BOM 提级后重新解析。
+serialization = "1.7.3"
+# Lifecycle 的 KMP 坐标版本。必须与 CMP 1.12.2 传递进来的
+# lifecycle-runtime-compose 完全一致（2.9.6），否则同一张依赖图里会出现
+# 两个 lifecycle-common，ViewModel 的 scope 与界面生命周期对不上。
+composeLifecycle = "2.9.6"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -41,16 +60,13 @@ androidx-compose-material3 = { group = "androidx.compose.material3", name = "mat
 # 官方核心图标集（约 100KB，含 Filled/Outlined 常用图标）。
 # 注意：不要换成 material-icons-extended（七千多个图标约 40MB，会把 APK 撑到 57MB，
 # 见 docs/postmortem_lsposed_injection.md）。
-androidx-compose-material-icons-core = { group = "androidx.compose.material", name = "material-icons-core" }
-
-androidx-room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "room" }
-androidx-room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "room" }
-androidx-room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "room" }
-androidx-room-testing = { group = "androidx.room", name = "room-testing", version.ref = "room" }
+androidx-compose-material-icons-core = { group = "androidx.compose.material", name = "material-icons-core", version.ref = "composeIcons" }
 
 androidx-work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "work" }
 
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+kotlinx-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "coroutines" }
+kotlinx-coroutines-swing = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-swing", version.ref = "coroutines" }
 
 libxposed-api = { group = "io.github.libxposed", name = "api", version.ref = "libxposedApi" }
 legacy-xposed-api = { group = "de.robv.android.xposed", name = "api", version.ref = "legacyXposedApi" }
@@ -69,9 +85,28 @@ org-json = { group = "org.json", name = "json", version = "20240303" }
 vico-compose = { group = "com.patrykandpatrick.vico", name = "compose", version.ref = "vico" }
 vico-compose-m3 = { group = "com.patrykandpatrick.vico", name = "compose-m3", version.ref = "vico" }
 
+# === 桌面端依赖 ===
+sqldelight-runtime = { group = "app.cash.sqldelight", name = "runtime", version.ref = "sqldelight" }
+sqldelight-coroutines = { group = "app.cash.sqldelight", name = "coroutines-extensions", version.ref = "sqldelight" }
+sqldelight-android-driver = { group = "app.cash.sqldelight", name = "android-driver", version.ref = "sqldelight" }
+sqldelight-sqlite-driver = { group = "app.cash.sqldelight", name = "sqlite-driver", version.ref = "sqldelight" }
+jna = { group = "net.java.dev.jna", name = "jna", version.ref = "jna" }
+sqlite-jdbc = { group = "org.xerial", name = "sqlite-jdbc", version.ref = "sqliteJdbc" }
+kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "serialization" }
+# Lifecycle 的 KMP 版本（org.jetbrains.androidx.lifecycle）。
+# 版本必须与 CMP 1.12.2 传递进来的 lifecycle-runtime-compose 完全一致（2.9.6），
+# 否则同一张图里会出现两个 lifecycle-common，ViewModel 的 scope 与界面生命周期对不上。
+#
+# **这里必须钉版本**：这些坐标不在 CMP 的对齐表里（不钉的话 version 是空字符串，
+# 解析直接报 "Could not find ...:."），与上面那三个 androidx-lifecycle-* 不是一回事。
+compose-lifecycle-viewmodel = { group = "org.jetbrains.androidx.lifecycle", name = "lifecycle-viewmodel-compose", version.ref = "composeLifecycle" }
+
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 android-library = { id = "com.android.library", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
-ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
+kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+compose-multiplatform = { id = "org.jetbrains.compose", version.ref = "composeMultiplatform" }
+sqldelight = { id = "app.cash.sqldelight", version.ref = "sqldelight" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }

@@ -1,0 +1,9 @@
+-- v7 -> v8：任务表新增「时间来源」。
+--
+-- 老任务全部按 FOLLOW_RULE 处理，行为与升级前完全一致；
+-- 想自己定时间的新任务才改成 INDEPENDENT。
+--
+-- 为什么要有它：采集窗口和提醒时机是两个不同的问题。
+-- 「每天喝 8 杯水」这类任务与规则采集窗口无关，规则只是数据来源，
+-- 提醒时间该由任务自己说了算。
+ALTER TABLE `task` ADD COLUMN `timeSource` TEXT NOT NULL DEFAULT 'FOLLOW_RULE';

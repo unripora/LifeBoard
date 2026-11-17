@@ -49,10 +49,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.lifeboard.app.ui.rules.AppIcon
+import androidx.lifecycle.viewmodel.viewModelFactory
+import com.lifeboard.shared.rules.AppIcon
 import com.lifeboard.plugin.api.MetricBucket
+import com.lifeboard.shared.panel.PanelViewModel
 import com.lifeboard.core.model.RemindLevel
 import com.lifeboard.core.model.builtinRef
 import com.lifeboard.plugin.api.SourceRef
@@ -75,7 +79,14 @@ import com.lifeboard.core.model.TimeSource
 fun TaskEditScreen(
     taskId: Long,
     onDone: () -> Unit,
-    vm: TaskEditViewModel = viewModel(),
+    vm: TaskEditViewModel = viewModel(
+        factory = viewModelFactory {
+            initializer {
+                val app = checkNotNull(this[APPLICATION_KEY]) { "缺少 Application，无法构造任务编辑" }
+                TaskEditViewModel(app)
+            }
+        },
+    ),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     val rules by vm.rules.collectAsStateWithLifecycle()

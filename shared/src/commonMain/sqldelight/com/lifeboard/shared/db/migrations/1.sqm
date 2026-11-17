@@ -1,0 +1,19 @@
+-- v1 -> v2：新增原始通知流水表。
+--
+-- 说明：v1 之前没有任何已发布的迁移链，1.sqm 是链的起点。
+-- 它必须在「v1 结构的空库」上也成立，因此这里只做 v2 相对 v1 的增量：
+-- 新建 raw_notification 及其两个索引。
+--
+-- 为什么要这张表：M4 关键词校准需要真实通知原文可看，
+-- 「某应用到底发不发通知、文案是什么」只有实机能回答，不能靠猜。
+CREATE TABLE IF NOT EXISTS `raw_notification` (
+    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    `packageName` TEXT NOT NULL,
+    `title` TEXT NOT NULL,
+    `text` TEXT NOT NULL,
+    `matchedSources` TEXT NOT NULL,
+    `postedAt` INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS `index_raw_notification_postedAt` ON `raw_notification` (`postedAt`);
+CREATE INDEX IF NOT EXISTS `index_raw_notification_packageName` ON `raw_notification` (`packageName`);

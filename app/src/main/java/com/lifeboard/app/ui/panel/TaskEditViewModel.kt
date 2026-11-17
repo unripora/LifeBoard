@@ -1,7 +1,7 @@
 package com.lifeboard.app.ui.panel
 
-import android.app.Application
-import androidx.lifecycle.AndroidViewModel
+import android.content.Context
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.core.model.RemindLevel
@@ -13,10 +13,9 @@ import com.lifeboard.core.model.TaskConfig
 import com.lifeboard.core.model.TimeSource
 import com.lifeboard.core.schedule.ScheduleRule
 import com.lifeboard.core.schedule.TimeWindow
-import com.lifeboard.server.panel.TaskRepository
-import com.lifeboard.server.db.LifeBoardDatabase
-import com.lifeboard.server.notice.toRuleSchedule
-import com.lifeboard.server.source.SourceRegistry
+import com.lifeboard.server.platform.AndroidPanelScope
+import com.lifeboard.server.db.DatabaseProviders
+import com.lifeboard.shared.repository.SourceKeys
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -30,12 +29,6 @@ import kotlinx.coroutines.withContext
 /** 每个数据源一期的可用分桶，避免用户选出采集不到的组合 */
 private val SOURCE_BUCKETS: Map<SourceType, List<MetricBucket>> = mapOf(
     SourceType.SCREEN_TIME to listOf(MetricBucket.DURATION_MINUTES),
-    SourceType.FEISHU_ATTENDANCE to listOf(MetricBucket.FLAG, MetricBucket.COUNT),
-    SourceType.DUOLINGO to listOf(MetricBucket.COUNT, MetricBucket.FLAG),
-    SourceType.MI_HEALTH to listOf(MetricBucket.STEPS, MetricBucket.SLEEP_MINUTES),
-    SourceType.LEGADO to listOf(MetricBucket.DURATION_MINUTES),
-    SourceType.READEST to listOf(MetricBucket.DURATION_MINUTES),
-    SourceType.QC_BOOK_LOG to listOf(MetricBucket.DURATION_MINUTES),
     SourceType.MANUAL to listOf(MetricBucket.FLAG),
 )
 
@@ -143,9 +136,11 @@ data class AppRuleGroup(
  *
  * 切换数据源时自动把分桶纠正到该源支持的选项，否则会存出"读不到数据的任务"。
  */
-class TaskEditViewModel(app: Application) : AndroidViewModel(app) {
+class TaskEditViewModel(
+    private val context: Context,
+) : ViewModel() {
 
-    private val repo = TaskRepository(app)
+    private val repo = com.lifeboard.shared.panel.TaskRepository(AndroidPanelScope(context))
 
     private val _state = MutableStateFlow(TaskEditUiState())
     val state: StateFlow<TaskEditUiState> = _state.asStateFlow()
@@ -161,9 +156,8 @@ class TaskEditViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         viewModelScope.launch {
-            val context = getApplication<Application>()
             val list = withContext(Dispatchers.IO) {
-                LifeBoardDatabase.get(context).captureRuleDao().getEnabled().map { rule ->
+                DatabaseProviders.ruleStore(context).getEnabledRules().map { rule ->
                     RuleOption(
                         id = rule.id,
                         packageName = rule.packageName,
@@ -173,7 +167,7 @@ class TaskEditViewModel(app: Application) : AndroidViewModel(app) {
                         }.getOrDefault(rule.packageName),
                         sourceName = rule.sourceName,
                         bucketName = rule.bucketName,
-                        summary = rule.toRuleSchedule().summary(),
+                        summary = rule.schedule.summary(),
                         keywords = rule.includeKeywords,
                     )
                 }
@@ -213,7 +207,7 @@ class TaskEditViewModel(app: Application) : AndroidViewModel(app) {
         _state.value = if (option == null) {
             current.copy(ruleId = 0L, error = "")
         } else {
-            val resolved = SourceRegistry.resolveSyncOrNull(getApplication(), option.sourceName)
+            val resolved = SourceKeys.resolveBuiltin(option.sourceName)
             current.copy(
                 ruleId = option.id,
                 source = resolved ?: current.source,
@@ -253,7 +247,7 @@ class TaskEditViewModel(app: Application) : AndroidViewModel(app) {
             // 旧任务可能存有与规则不一致的量纲（导致任务永远为 0），加载时按规则纠正
             val corrected = if (task.ruleId != 0L) {
                 val rule = withContext(Dispatchers.IO) {
-                    LifeBoardDatabase.get(getApplication()).captureRuleDao().getById(task.ruleId)
+                    DatabaseProviders.ruleStore(context).getRule(task.ruleId)
                 }
                 loaded.copy(
                     metricBucket = rule?.let {

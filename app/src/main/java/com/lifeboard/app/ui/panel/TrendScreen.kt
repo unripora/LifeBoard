@@ -25,8 +25,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import com.lifeboard.app.ui.screen.ScreenTimeContent
 import com.lifeboard.core.util.Dates
 
@@ -38,7 +41,16 @@ import com.lifeboard.core.util.Dates
  * 而不是先看某一天的具体数字。
  */
 @Composable
-fun TrendScreen(vm: TrendViewModel = viewModel()) {
+fun TrendScreen(
+    vm: TrendViewModel = viewModel(
+        factory = viewModelFactory {
+            initializer {
+                val app = checkNotNull(this[APPLICATION_KEY]) { "缺少 Application，无法构造趋势页" }
+                TrendViewModel(app)
+            }
+        },
+    ),
+) {
     val state by vm.state.collectAsStateWithLifecycle()
 
     Column(

@@ -1,5 +1,9 @@
 package com.lifeboard.app.ui.dashboard
 
+import com.lifeboard.shared.dashboard.DashboardDefaults
+import com.lifeboard.shared.dashboard.DashboardUiState
+import com.lifeboard.shared.dashboard.MAX_TAB_NAME_LENGTH
+import com.lifeboard.shared.dashboard.validateTabName
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -85,7 +89,7 @@ class TabNameValidationTest {
         // 首帧兜底用的默认页签必须和落库时的内置页签一一对应，
         // 否则冷启动会先画一批页签、就绪后突然换一批
         assertEquals(
-            com.lifeboard.server.dashboard.BuiltinTabs.ALL.map { it.tabId },
+            com.lifeboard.shared.dashboard.BuiltinTabs.ALL.map { it.tabId },
             DashboardDefaults.tabs.map { it.tabId },
         )
         assertEquals(

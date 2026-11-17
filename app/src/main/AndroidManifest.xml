@@ -29,6 +29,11 @@
         android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
 
+    <!-- 跨应用数据只读出口的准入权限：signature 级，只有同签名应用能调 -->
+    <permission
+        android:name="com.lifeboard.permission.ACCESS_PROVIDER"
+        android:protectionLevel="signature" />
+
     <application
         android:name="com.lifeboard.app.LifeBoardApp"
         android:allowBackup="true"
@@ -75,6 +80,22 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <!-- 跨应用只读数据出口（原 :server 清单，M3-3.6 并入）。
+             权限 signature 级：不声明它能被任意应用读取全量个人数据 -->
+        <provider
+            android:name="com.lifeboard.server.provider.LifeBoardProvider"
+            android:authorities="com.lifeboard.provider"
+            android:exported="true"
+            android:permission="com.lifeboard.permission.ACCESS_PROVIDER"
+            android:multiprocess="false" />
+
+        <!-- AndroidScheduler 的到点接收器。
+             exported=false：只接收本应用 AlarmManager 发出的广播，
+             外部应用不该能伪造一次「定时到了」。 -->
+        <receiver
+            android:name="com.lifeboard.server.platform.SchedulerReceiver"
+            android:exported="false" />
 
         <!-- 强提醒：前台服务播闹钟铃声。specialUse 需声明子类型原因 -->
         <service

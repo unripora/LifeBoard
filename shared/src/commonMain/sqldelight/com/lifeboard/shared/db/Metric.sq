@@ -1,0 +1,108 @@
+-- 原始指标表。按 源 + 日期 + 分桶 聚合，全年粒度设计以便后续做年度总结时不改库。
+CREATE TABLE `metric` (
+    `sourceType` TEXT NOT NULL,
+    `date` TEXT NOT NULL,
+    `bucket` TEXT NOT NULL,
+    `value` REAL NOT NULL,
+    PRIMARY KEY(`sourceType`, `date`, `bucket`)
+);
+
+CREATE INDEX IF NOT EXISTS `index_metric_date` ON `metric` (`date`);
+
+-- 数据源健康度表，面板据此提示断源降级。
+CREATE TABLE `source_health` (
+    `sourceType` TEXT NOT NULL,
+    `healthy` INTEGER NOT NULL,
+    `lastSuccessAt` INTEGER NOT NULL,
+    `message` TEXT NOT NULL,
+    PRIMARY KEY(`sourceType`)
+);
+
+-- 分应用屏幕使用时长。
+--
+-- 为什么单独一张表：metric 的主键是 (sourceType, date, bucket)，没有应用这个维度，
+-- 而「屏幕使用总时长」与「各应用各用多久」是两种粒度，塞进同一张表会破坏主键语义。
+-- 这里用 (date, packageName) 做主键，同一天同一应用重复采集直接覆盖，天然幂等。
+CREATE TABLE `app_usage` (
+    `date` TEXT NOT NULL,
+    `packageName` TEXT NOT NULL,
+    `minutes` REAL NOT NULL,
+    `label` TEXT NOT NULL,
+    PRIMARY KEY(`date`, `packageName`)
+);
+
+-- ============ 查询 ============
+
+selectMetricsByDate:
+SELECT * FROM `metric` WHERE `date` = ?;
+
+selectMetric:
+SELECT * FROM `metric` WHERE `sourceType` = ? AND `date` = ? AND `bucket` = ?;
+
+selectMetricsInRange:
+SELECT * FROM `metric` WHERE `date` BETWEEN ? AND ? ORDER BY `date` ASC;
+
+-- 一次取整窗数据，而不是逐天调用：30 天 × 3 条序列 = 90 次往返，这里只要 3 次。
+-- 缺失的日期不会出现在结果里，补不补零由图表层决定
+selectSourceRange:
+SELECT * FROM `metric`
+WHERE `sourceType` = ? AND `bucket` = ? AND `date` BETWEEN ? AND ?
+ORDER BY `date` ASC;
+
+-- 往前找「最近一次」的值。必须在 SQL 里做：逐天把日期字符串减一天，跨月会出错。
+-- 按 bucket 而不是整个源过滤：一个源同时有步数与睡眠时，
+-- 读「睡眠」卡不该拿到只有步数的日期
+latestDateWithBucket:
+SELECT MAX(`date`) AS latestDate FROM `metric`
+WHERE `sourceType` = ? AND `bucket` = ? AND `date` BETWEEN ? AND ?;
+
+insertMetric:
+INSERT OR REPLACE INTO `metric`(`sourceType`, `date`, `bucket`, `value`) VALUES (?, ?, ?, ?);
+
+deleteMetricsBySource:
+DELETE FROM `metric` WHERE `sourceType` = ?;
+
+-- ---- 数据源健康度 ----
+
+observeSourceHealth:
+SELECT * FROM `source_health`;
+
+selectAllSourceHealth:
+SELECT * FROM `source_health`;
+
+insertSourceHealth:
+INSERT OR REPLACE INTO `source_health`(`sourceType`, `healthy`, `lastSuccessAt`, `message`)
+VALUES (?, ?, ?, ?);
+
+deleteSourceHealthBySource:
+DELETE FROM `source_health` WHERE `sourceType` = ?;
+
+-- ---- 分应用用量 ----
+
+observeAppUsageByDate:
+SELECT * FROM `app_usage` WHERE `date` = ? ORDER BY `minutes` DESC;
+
+selectAppUsageByDate:
+SELECT * FROM `app_usage` WHERE `date` = ? ORDER BY `minutes` DESC;
+
+insertAppUsage:
+INSERT OR REPLACE INTO `app_usage`(`date`, `packageName`, `minutes`, `label`)
+VALUES (?, ?, ?, ?);
+
+deleteAppUsageByDate:
+DELETE FROM `app_usage` WHERE `date` = ?;
+
+trimAppUsageBefore:
+DELETE FROM `app_usage` WHERE `date` < ?;
+
+-- 在 SQL 里按包名聚合，避免把整段区间的原始行拉进内存再分组。
+-- label 取 MAX 而不是任意值：同一应用在不同日期可能有空串，
+-- MAX 能稳定挑到非空的那个（空串字典序最小）
+sumAppUsageInRange:
+SELECT `packageName` AS packageName,
+       MAX(`label`) AS label,
+       SUM(`minutes`) AS minutes
+FROM `app_usage`
+WHERE `date` BETWEEN ? AND ?
+GROUP BY `packageName`
+ORDER BY minutes DESC;

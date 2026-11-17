@@ -29,12 +29,17 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import com.lifeboard.server.collect.SettingsNavigator
-import com.lifeboard.server.db.CaptureRuleEntity
 import com.lifeboard.server.notice.CaptureRuleMatcher
 import com.lifeboard.server.notice.ScreenCaptureAccessibilityService
+import com.lifeboard.server.platform.AndroidRulesBackend
+import com.lifeboard.server.db.DatabaseProviders
+import com.lifeboard.shared.repository.model.CaptureRuleRecord
 
 /**
  * 采集规则与流水的调试页。
@@ -46,11 +51,20 @@ import com.lifeboard.server.notice.ScreenCaptureAccessibilityService
  * 3. 原始流水 + 匹配测试（规则写错时靠它定位）
  */
 @Composable
-fun NoticeDebugScreen(vm: NoticeDebugViewModel = viewModel()) {
+fun NoticeDebugScreen(
+    vm: NoticeDebugViewModel = viewModel(
+        factory = viewModelFactory {
+            initializer {
+                val app = checkNotNull(this[APPLICATION_KEY]) { "缺少 Application，无法构造调试页" }
+                NoticeDebugViewModel(DatabaseProviders.ruleStore(app), AndroidRulesBackend(app))
+            }
+        },
+    ),
+) {
     val state by vm.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     // null = 列表页；否则为正在编辑的规则（id=0 表示新建）
-    var editing by remember { mutableStateOf<CaptureRuleEntity?>(null) }
+    var editing by remember { mutableStateOf<CaptureRuleRecord?>(null) }
 
     val current = editing
     if (current != null) {
@@ -87,7 +101,7 @@ fun NoticeDebugScreen(vm: NoticeDebugViewModel = viewModel()) {
         RulesCard(
             rules = state.rules,
             counts = state.counts,
-            onAdd = { editing = CaptureRuleEntity(packageName = "", sourceName = "") },
+            onAdd = { editing = CaptureRuleRecord(packageName = "", sourceName = "") },
             onEdit = { editing = it },
             onToggle = vm::toggleRule,
             onClearToday = vm::clearToday,
@@ -190,11 +204,11 @@ private fun PermissionRow(
 
 @Composable
 private fun RulesCard(
-    rules: List<CaptureRuleEntity>,
+    rules: List<CaptureRuleRecord>,
     counts: Map<String, Double>,
     onAdd: () -> Unit,
-    onEdit: (CaptureRuleEntity) -> Unit,
-    onToggle: (CaptureRuleEntity) -> Unit,
+    onEdit: (CaptureRuleRecord) -> Unit,
+    onToggle: (CaptureRuleRecord) -> Unit,
     onClearToday: () -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
@@ -325,7 +339,7 @@ private fun RawCard(raws: List<RawItem>, onClear: () -> Unit) {
 
 @Composable
 private fun MatchCard(
-    rules: List<CaptureRuleEntity>,
+    rules: List<CaptureRuleRecord>,
     samplePackage: String,
     sampleContent: String,
     matchResult: MatchResult?,

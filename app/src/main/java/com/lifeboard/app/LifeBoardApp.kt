@@ -3,7 +3,8 @@ package com.lifeboard.app
 import android.app.Application
 import android.content.Context
 import com.lifeboard.server.collect.DailyAggregateWorker
-import com.lifeboard.server.log.AppLogger
+import com.lifeboard.server.log.AndroidAppLogger
+import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.server.mihealth.MiHealthMigration
 import com.lifeboard.server.plugin.PluginManager
 import kotlinx.coroutines.CoroutineScope
@@ -20,7 +21,7 @@ import kotlinx.coroutines.launch
  * 表现为后台明明在执行、数据却一直不更新。
  *
  * 所以插件的注册与调度都收敛到这里：进程一起来先注册插件，再注册周期任务。
- * 放在后台协程里做，读 APK 元数据和实例化 dex 都是 IO，不能卡启动；
+ * 放在后台协程里做，解压插件包与启动 JS 运行时都是 IO，不能卡启动；
  * 失败也不影响应用启动，插件是可选能力。
  */
 class LifeBoardApp : Application() {
@@ -30,7 +31,7 @@ class LifeBoardApp : Application() {
 
         // 日志通道必须最先起来：后面的初始化即使失败，原因也得留在库里，
         // 否则用户遇到的只有「打不开」，没有任何可查的线索
-        AppLogger.init(this)
+        AndroidAppLogger.init(this)
         AppLogger.info("应用启动，版本 ${versionText()}")
 
         // SupervisorJob：一个初始化失败不该把其余的也一起取消
@@ -38,7 +39,7 @@ class LifeBoardApp : Application() {
             runCatching { PluginManager.refresh(this@LifeBoardApp) }
                 .onFailure { AppLogger.error("启动时扫描插件失败", it) }
 
-            // 小米健康从内置源改成 .ext 插件后，内置实现产出的历史行已无生产者。
+            // 小米健康从内置源改成插件后，内置实现产出的历史行已无生产者。
             // 不清掉的话面板会留一张永远不更新的卡片；标记过就不再重复执行
             runCatching { MiHealthMigration.cleanupLegacyRows(this@LifeBoardApp) }
                 .onFailure { AppLogger.warn("清理小米历史数据失败：${it.message.orEmpty()}") }
@@ -72,8 +73,8 @@ class LifeBoardApp : Application() {
         /**
          * 应用级协程作用域。
          *
-         * 用 [Dispatchers.Default] 而不是 IO：实例化插件要跑 DexClassLoader，
-         * 属于 CPU + class loading 的混合负载，Default 的线程池语义更贴切。
+         * 用 [Dispatchers.Default] 而不是 IO：插件注册会解压包、启动 JS 运行时并
+         * 解析 manifest，属于 CPU 与 IO 的混合负载，Default 的线程池语义更贴切。
          * 它是进程级单例，与 Application 同生命周期，不需要取消。
          */
         private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)

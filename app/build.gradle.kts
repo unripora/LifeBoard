@@ -2,7 +2,9 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
-    alias(libs.plugins.ksp)
+    // CMP 插件：让 :app 与 :shared/:desktop 共用同一份 Compose 依赖解析结果。
+    // 不加它就只能吃 AndroidX BOM 的版本，两边 Compose 会出现两套版本号。
+    alias(libs.plugins.compose.multiplatform)
 }
 
 android {
@@ -13,7 +15,7 @@ android {
         applicationId = "com.lifeboard.app"
         minSdk = 29
         targetSdk = 36
-        // 版本号规则（与 :mihealth-plugin 一致，别再手工维护 versionCode）：
+        // 版本号规则（别再手工维护 versionCode）：
         //
         // - versionName 由人决定，改功能时手动提升，用来在设备上认出「装的是哪一版」
         // - versionCode 由构建时间自动生成，**每次构建必然递增**
@@ -26,7 +28,10 @@ android {
         // 起点 10000 保证高于历史上手工填的 1、2，避免降级。
         val buildStamp = ((System.currentTimeMillis() / 60_000L) % 10_000L).toInt()
         versionCode = 10_000 + buildStamp
-        versionName = "0.3.3"
+        versionName = "0.3.9"
+        // 原 :server 的 androidTest 已并入本模块（M3-3.6）。
+        // CredentialVault 依赖 Android Keystore / GCM，JVM 单测覆盖不到，只能真机跑。
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     // 内测分发用的签名：复用 AGP 自带的 debug 证书，这样 release 包也能直接安装，
@@ -86,13 +91,73 @@ android {
     }
 }
 
-ksp {
-    arg("room.schemaLocation", "$projectDir/schemas")
+// Vico 3.2.3 的 Android 产物把 androidx.compose.* 传递到 1.12.1，
+// 而 1.12.1 起 AAR 元数据要求 compileSdk >= 37，当前 AGP 8.12.3 上限是 36，
+// 于是 checkDebugAarMetadata 直接失败。
+//
+// 这里统一压回 1.8.3（CMP 1.12.2 在 Android 侧对应的 androidx compose 线），
+// 而不是把 compileSdk 抬到 37：AGP 8.12.3 官方支持到 36，
+// 强上 37 属于未验证组合，且会影响真机安装的 targetSdk 语义。
+// 若将来升级 AGP 到支持 37 的版本，这段约束可以一并删掉。
+//
+// 只压「androidx.compose 主线编号」的模块，且逐个点名而不是按 group 前缀：
+// - material-icons / material3 各自独立版本线，没有 1.8.3；
+// - runtime-retain 是 1.9 才有的新模块，1.8.3 也没有。
+// 用 group 前缀一刀切会让这些模块被强制套上不存在的版本，直接解析失败。
+// 这里枚举的是「Vico 传递上来、且确实有 1.8.3 版本」的那几个。
+val composePinnedModules = setOf(
+    "androidx.compose.ui:ui",
+    "androidx.compose.ui:ui-graphics",
+    "androidx.compose.ui:ui-text",
+    "androidx.compose.ui:ui-unit",
+    "androidx.compose.ui:ui-geometry",
+    "androidx.compose.ui:ui-util",
+    "androidx.compose.foundation:foundation",
+    "androidx.compose.foundation:foundation-layout",
+    "androidx.compose.animation:animation",
+    "androidx.compose.animation:animation-core",
+    "androidx.compose.runtime:runtime",
+    "androidx.compose.runtime:runtime-saveable",
+    "androidx.compose.material:material-ripple",
+    // tooling 系列只在 debugImplementation 里，但 AAR 元数据检查对 debug 变体同样生效
+    "androidx.compose.ui:ui-tooling",
+    "androidx.compose.ui:ui-tooling-data",
+    "androidx.compose.ui:ui-tooling-preview",
+)
+configurations.configureEach {
+    resolutionStrategy.eachDependency {
+        if ("${requested.group}:${requested.name}" in composePinnedModules) {
+            useVersion("1.8.3")
+            because("高于 1.9 的 compose AAR 要求 compileSdk 37，AGP 8.12.3 不支持")
+        }
+    }
 }
 
 dependencies {
-    implementation(project(":core"))
-    implementation(project(":server"))
+    implementation(project(":core")) {
+        // :core 已改为 KMP 双目标，Android 侧必须显式取 androidJvm 变体
+        attributes {
+            attribute(
+                org.jetbrains.kotlin.gradle.plugin.KotlinPlatformType.attribute,
+                org.jetbrains.kotlin.gradle.plugin.KotlinPlatformType.androidJvm,
+            )
+        }
+    }
+    // 原 :server 已并入本模块（M3-3.6）：Android 平台实现不再单独成库。
+    // 这么做不是为了少一个 Gradle 模块，而是因为「:server」这个名字已经名不副实——
+    // 里面没有任何服务端逻辑，只有 Android 侧实现；而它与 :app 之间那条
+    // implementation 边界从未被真正使用过（两者永远同时打包进同一个 APK）。
+    // JS 插件运行时：提供 QuickJS 引擎，JS 插件适配器基于它实现 SourcePlugin
+    implementation(project(":js-engine"))
+    // 共享层：平台接口（RemindBackend 等）来自这里，M1 起 ViewModel 用构造注入而非 AndroidViewModel
+    implementation(project(":shared")) {
+        attributes {
+            attribute(
+                org.jetbrains.kotlin.gradle.plugin.KotlinPlatformType.attribute,
+                org.jetbrains.kotlin.gradle.plugin.KotlinPlatformType.androidJvm,
+            )
+        }
+    }
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -100,19 +165,25 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.activity.compose)
 
-    implementation(platform(libs.androidx.compose.bom))
-    implementation(libs.androidx.compose.ui)
-    implementation(libs.androidx.compose.ui.graphics)
-    implementation(libs.androidx.compose.ui.tooling.preview)
-    implementation(libs.androidx.compose.material3)
+    // 以下三项随原 :server 一并并进来：
+    // - work-runtime-ktx：DailyAggregateWorker 等后台聚合
+    // - okhttp：小米健康插件客户端与 JS 插件的 HTTP 桥
+    // - org.json：插件清单与 JS 侧的数据交换
+    implementation(libs.androidx.work.runtime.ktx)
+    implementation(libs.okhttp)
+
+    // Compose 由 CMP 插件统一提供（compose.ui / compose.material3 等 dsl 访问器）。
+    // 不再叠加 AndroidX BOM：CMP 1.12.2 已经把它依赖的 androidx compose 全部
+    // 传递进来并锁定版本，再叠一份 BOM 会在「谁赢」上产生不可控的版本仲裁，
+    // 而且 BOM 一旦抬到 compose 1.12.1+ 就要求 compileSdk 37（AGP 8.12.3 上限 36）。
+    implementation(compose.ui)
+    implementation(compose.foundation)
+    implementation(compose.material3)
+    implementation(compose.components.resources)
     // 官方核心图标集：体积约 100KB，用于按钮/状态标识。
     // 不要引入 material-icons-extended：七千多个矢量图标约 40MB，会把 APK 从 25MB 撑到 57MB。
     implementation(libs.androidx.compose.material.icons.core)
-    debugImplementation(libs.androidx.compose.ui.tooling)
-
-    implementation(libs.androidx.room.runtime)
-    implementation(libs.androidx.room.ktx)
-    ksp(libs.androidx.room.compiler)
+    debugImplementation(compose.uiTooling)
 
     implementation(libs.kotlinx.coroutines.android)
 
@@ -124,6 +195,12 @@ dependencies {
     // 纯逻辑（页签名归一化、布局状态判定）在 JVM 单测里验证，
     // 不必为了跑几个纯函数上真机
     testImplementation(libs.junit)
+    // 插件清单与 JS 桥的单测要解析 JSON
+    testImplementation(libs.org.json)
+
+    // 真机测试：CredentialVault 依赖 Android Keystore / GCM，JVM 单测无法覆盖
+    androidTestImplementation(libs.androidx.test.junit)
+    androidTestImplementation(libs.androidx.test.runner)
 
     // Legacy Xposed API 桩：compileOnly，运行时由 LSPosed 注入
     compileOnly(libs.legacy.xposed.api)

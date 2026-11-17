@@ -1,0 +1,20 @@
+-- v2 -> v3：新增用户自建识别规则表。
+--
+-- 打卡成功的文案因应用、版本、企业而异，写死在代码里必然出现
+-- 「关键词对不上、数据悄悄为 0」。让用户自己选应用、填关键词、划时段才可持续。
+CREATE TABLE IF NOT EXISTS `capture_rule` (
+    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    `packageName` TEXT NOT NULL,
+    `sourceName` TEXT NOT NULL,
+    `bucketName` TEXT NOT NULL,
+    `includeKeywords` TEXT NOT NULL,
+    `excludeKeywords` TEXT NOT NULL,
+    `timeRegex` TEXT NOT NULL,
+    `windowStartMinute` INTEGER NOT NULL,
+    `windowEndMinute` INTEGER NOT NULL,
+    `dailyOnce` INTEGER NOT NULL,
+    `enabled` INTEGER NOT NULL,
+    `createdAt` INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS `index_capture_rule_packageName` ON `capture_rule` (`packageName`);

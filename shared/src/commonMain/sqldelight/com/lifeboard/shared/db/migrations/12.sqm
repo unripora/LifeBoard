@@ -1,0 +1,14 @@
+-- v12 -> v13：新增应用内日志表。
+--
+-- 纯新建表，不动任何已有数据；日志可丢，所以没有回填历史记录的需求。
+CREATE TABLE IF NOT EXISTS `app_log` (
+    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    `level` TEXT NOT NULL,
+    `tag` TEXT NOT NULL,
+    `location` TEXT NOT NULL,
+    `message` TEXT NOT NULL,
+    `time` INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS `index_app_log_time` ON `app_log` (`time`);
+CREATE INDEX IF NOT EXISTS `index_app_log_level` ON `app_log` (`level`);

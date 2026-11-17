@@ -32,7 +32,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.lifeboard.core.model.SourceType
-import com.lifeboard.server.db.CaptureRuleEntity
+import com.lifeboard.shared.repository.model.CaptureRuleRecord
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -47,8 +47,8 @@ private data class AppItem(val packageName: String, val label: String)
  */
 @Composable
 fun RuleEditScreen(
-    rule: CaptureRuleEntity,
-    onSave: (CaptureRuleEntity) -> Unit,
+    rule: CaptureRuleRecord,
+    onSave: (CaptureRuleRecord) -> Unit,
     onCancel: () -> Unit,
     onDelete: (Long) -> Unit,
 ) {
@@ -392,6 +392,6 @@ private fun parseMinute(text: String): Int? {
 
 /** 选定数据源时给一个合理的默认量纲 */
 private fun defaultBucketFor(source: SourceType): String = when (source) {
-    SourceType.DUOLINGO -> "COUNT"
-    else -> "FLAG"
+    SourceType.SCREEN_TIME -> "DURATION_MINUTES"
+    SourceType.MANUAL -> "FLAG"
 }
