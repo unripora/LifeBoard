@@ -38,16 +38,24 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.lifeboard.app.ui.theme.GlassCard
-import com.lifeboard.app.ui.theme.GlassPill
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
+import com.lifeboard.shared.ui.theme.GlassCard
+import com.lifeboard.shared.ui.theme.GlassPill
+import com.lifeboard.shared.platform.LocalPlatform
+import com.lifeboard.shared.rules.AppIcon
 import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.server.collect.SettingsNavigator
-import com.lifeboard.server.db.CaptureRuleEntity
 import com.lifeboard.server.notice.ScreenCaptureAccessibilityService
-import com.lifeboard.server.notice.toRuleSchedule
-import com.lifeboard.server.source.SourceRegistry
+import com.lifeboard.server.platform.AndroidRulesBackend
+import com.lifeboard.server.db.DatabaseProviders
+import com.lifeboard.shared.log.AppLogger
+import com.lifeboard.shared.repository.SourceKeys
+import com.lifeboard.shared.repository.sqldelight.SqldelightMappers.toRef
+import com.lifeboard.shared.repository.model.CaptureRuleRecord
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -62,18 +70,45 @@ import kotlinx.coroutines.withContext
  * 藏在「自检」类的页面里，用户根本找不到。
  */
 @Composable
-fun RulesScreen(vm: RulesViewModel = viewModel()) {
+fun RulesScreen(
+    vm: RulesViewModel = viewModel(
+        factory = viewModelFactory {
+            initializer {
+                val app = checkNotNull(this[APPLICATION_KEY]) { "缺少 Application，无法构造规则页" }
+                RulesViewModel(
+                    ruleStore = DatabaseProviders.ruleStore(app),
+                    backend = AndroidRulesBackend(app),
+                )
+            }
+        },
+    ),
+) {
     val state by vm.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     // null = 列表；非 null = 正在编辑
     var editing by remember { mutableStateOf<RuleEditUiState?>(null) }
     // 编辑已有规则时需要异步解析它绑定的数据源
-    var pendingRule by remember { mutableStateOf<CaptureRuleEntity?>(null) }
+    var pendingRule by remember { mutableStateOf<CaptureRuleRecord?>(null) }
 
     LaunchedEffect(pendingRule, state.sources) {
         val rule = pendingRule ?: return@LaunchedEffect
-        val resolved = withContext(Dispatchers.IO) { SourceRegistry.resolve(context, rule.sourceName) }
-        editing = buildEditState(rule, resolved)
+        val ref: SourceRef? = withContext(Dispatchers.IO) {
+            // 自建源要查库：把「怎么查」缝进 SourceKeys 的策略里，
+            // 判定顺序（内置 → 自建 → 插件 → 兜底）留在 shared 与桌面端共用
+            val lookup = SourceKeys.CustomSourceLookup { id ->
+                DatabaseProviders.ruleStore(context).getCustomSource(id)?.toRef()
+            }
+            // 读路径要「尽量给个能显示的」：Fallback 也带着可用的 ref，
+            // 只在日志里记下原因（数字一直为 0 时靠这句才能查出根因）
+            when (val resolved = SourceKeys.resolve(rule.sourceName, lookup)) {
+                is SourceKeys.Resolved.Ok -> resolved.ref
+                is SourceKeys.Resolved.Fallback -> {
+                    AppLogger.warn("编辑规则时数据源解析失败：${resolved.reason}")
+                    resolved.ref
+                }
+            }
+        }
+        editing = buildEditState(rule, ref)
         pendingRule = null
     }
 
@@ -83,7 +118,7 @@ fun RulesScreen(vm: RulesViewModel = viewModel()) {
             initial = current,
             sources = state.sources,
             onSave = {
-                vm.saveRule(it.toEntity())
+                vm.saveRule(it.toRecord())
                 editing = null
             },
             onCancel = { editing = null },
@@ -276,11 +311,11 @@ private fun ChannelRow(
 @Composable
 private fun AppRuleGroup(
     packageName: String,
-    rules: List<CaptureRuleEntity>,
+    rules: List<CaptureRuleRecord>,
     sources: List<SourceRef>,
     counts: Map<String, Double>,
-    onEdit: (CaptureRuleEntity) -> Unit,
-    onToggle: (CaptureRuleEntity) -> Unit,
+    onEdit: (CaptureRuleRecord) -> Unit,
+    onToggle: (CaptureRuleRecord) -> Unit,
     onAdd: () -> Unit,
 ) {
     var expanded by rememberSaveable(packageName) { mutableStateOf(false) }
@@ -304,7 +339,7 @@ private fun AppRuleGroup(
                     if (packageName.isBlank()) {
                         "（未选应用）"
                     } else {
-                        InstalledApps.label(LocalContext.current, packageName)
+                        rememberAppLabel(packageName)
                     },
                     style = MaterialTheme.typography.bodyLarge,
                     fontWeight = FontWeight.Medium,
@@ -377,7 +412,7 @@ private fun AppRuleGroup(
 /** 分组内的一条规则：数据源、时段摘要、今日计数、开关 */
 @Composable
 private fun RuleRow(
-    rule: CaptureRuleEntity,
+    rule: CaptureRuleRecord,
     sourceName: String,
     todayCount: Double?,
     onEdit: () -> Unit,
@@ -400,7 +435,7 @@ private fun RuleRow(
                 }
             }
             Text(
-                rule.toRuleSchedule().summary(),
+                rule.schedule.summary(),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -455,3 +490,19 @@ private fun CustomSourceCard(sources: List<SourceRef.Custom>, vm: RulesViewModel
 
 private fun formatCount(value: Double): String =
     if (value == value.toInt().toDouble()) value.toInt().toString() else "%.1f".format(value)
+
+/**
+ * 取应用的显示名。
+ *
+ * 规则记录里只存包名，列表要展示人类可读的名称就得向平台问一次。
+ * 查不到时回落成包名本身——显示一串包名总比显示空白好排查。
+ */
+@Composable
+private fun rememberAppLabel(key: String): String {
+    val catalog = LocalPlatform.current.appCatalog
+    var label by remember(key) { mutableStateOf(key) }
+    LaunchedEffect(key) {
+        label = runCatching { catalog.label(key) }.getOrDefault(key)
+    }
+    return label
+}

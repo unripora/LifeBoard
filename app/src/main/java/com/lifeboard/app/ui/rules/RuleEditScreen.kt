@@ -20,20 +20,26 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.lifeboard.app.ui.theme.GlassCard
 import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.schedule.TimeWindow
+import com.lifeboard.shared.platform.AppCatalog.AppEntry
+import com.lifeboard.shared.rules.AppList
+import com.lifeboard.shared.ui.theme.GlassCard
+// 时段滚轮与周期/日期选择已迁入 shared（M4-4.6），Android 端直接复用同一份实现
+import com.lifeboard.shared.rules.DateField
+import com.lifeboard.shared.rules.RepeatSelector
+import com.lifeboard.shared.rules.SelectedAppSummary
+import com.lifeboard.shared.rules.WindowEditorRow
+import com.lifeboard.shared.rules.rememberAppCatalogEntries
 
 /**
  * 规则编辑页。
@@ -52,25 +58,21 @@ fun RuleEditScreen(
     onDelete: (Long) -> Unit,
     onCreateSource: (String, MetricBucket) -> Unit,
 ) {
-    val context = LocalContext.current
     var draft by remember(initial.id) { mutableStateOf(initial) }
     var showAppPicker by remember { mutableStateOf(false) }
     var showNewSource by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
 
-    var apps by remember { mutableStateOf<List<AppItem>>(emptyList()) }
-    LaunchedEffect(Unit) {
-        if (apps.isEmpty()) apps = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            InstalledApps.query(context)
-        }
-    }
+    // 应用清单由平台侧注入（Android 查已装 App、桌面端查已装程序），
+    // 编辑页本身不再直接摸 PackageManager
+    val apps = rememberAppCatalogEntries()
 
     if (showAppPicker) {
         AppPickerDialog(
             apps = apps,
-            selectedPackage = draft.packageName,
+            selectedKey = draft.packageName,
             onPick = {
-                draft = draft.copy(packageName = it.packageName, error = "")
+                draft = draft.copy(packageName = it.key, error = "")
                 showAppPicker = false
             },
             onDismiss = { showAppPicker = false },
@@ -360,9 +362,9 @@ private fun SectionTitle(text: String) {
 /** 应用选择弹窗：带搜索的完整列表 */
 @Composable
 private fun AppPickerDialog(
-    apps: List<AppItem>,
-    selectedPackage: String,
-    onPick: (AppItem) -> Unit,
+    apps: List<AppEntry>,
+    selectedKey: String,
+    onPick: (AppEntry) -> Unit,
     onDismiss: () -> Unit,
 ) {
     var query by remember { mutableStateOf("") }
@@ -371,7 +373,7 @@ private fun AppPickerDialog(
             apps
         } else {
             val q = query.trim().lowercase()
-            apps.filter { it.label.lowercase().contains(q) || it.packageName.lowercase().contains(q) }
+            apps.filter { it.label.lowercase().contains(q) || it.key.lowercase().contains(q) }
         }
     }
 
@@ -383,13 +385,13 @@ private fun AppPickerDialog(
                 OutlinedTextField(
                     value = query,
                     onValueChange = { query = it },
-                    label = { Text("搜索名称或包名") },
+                    label = { Text("搜索名称或标识符") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
                 AppList(
-                    apps = filtered,
-                    selectedPackage = selectedPackage,
+                    entries = filtered,
+                    selectedKey = selectedKey,
                     onPick = onPick,
                     modifier = Modifier.height(420.dp),
                 )

@@ -1,0 +1,11 @@
+-- v8 -> v9：新增分应用屏幕用量表。
+--
+-- 只是加一张新表，不动已有结构，老数据完全不受影响。
+-- 用 (date, packageName) 做主键：同一天同一应用重复采集直接覆盖，天然幂等。
+CREATE TABLE IF NOT EXISTS `app_usage` (
+    `date` TEXT NOT NULL,
+    `packageName` TEXT NOT NULL,
+    `minutes` REAL NOT NULL,
+    `label` TEXT NOT NULL,
+    PRIMARY KEY(`date`, `packageName`)
+);

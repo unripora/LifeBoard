@@ -1,0 +1,13 @@
+-- v16 -> v17：支持自定义图表卡 + 记录来源。
+--
+-- 两处改动各有各的坑，都不报错、只静默改行为：
+--
+-- 1. `configJson` 可为 NULL —— 老卡片（METRIC / TEXT 等）就该是 NULL。
+--    若给个 '' 默认值，ChartConfigCodec.decode('') 会走「配置损坏」分支，
+--    界面把老卡片显示成坏卡。**所以这一列不加 DEFAULT**
+-- 2. `origin` NOT NULL DEFAULT 'UNKNOWN' —— 升级前的记录来源不可考，
+--    必须落到 UNKNOWN 而不是猜成 AUTO，否则统计会把它们当成自动采集。
+--    这也是「手动打卡」类图表只能准确反映迁移之后数据的原因。
+ALTER TABLE `dashboard_card` ADD COLUMN `configJson` TEXT;
+
+ALTER TABLE `daily_record` ADD COLUMN `origin` TEXT NOT NULL DEFAULT 'UNKNOWN';

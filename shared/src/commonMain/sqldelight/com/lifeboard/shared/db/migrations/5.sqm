@@ -1,0 +1,6 @@
+-- v5 -> v6：任务表新增完成提醒两个字段。
+--
+-- 不能靠破坏性重建——任务和规则是用户手工配的，清空等于让人重新配一遍。
+-- ALTER 加列带默认值，老任务行为保持不变（完成不提醒、浮窗开）。
+ALTER TABLE `task` ADD COLUMN `doneRemindLevel` INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE `task` ADD COLUMN `doneToastEnabled` INTEGER NOT NULL DEFAULT 1;

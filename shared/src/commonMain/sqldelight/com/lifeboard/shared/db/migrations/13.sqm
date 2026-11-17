@@ -1,0 +1,25 @@
+-- v13 -> v14：去掉「同一页签同类型只能一张卡」的唯一约束。
+--
+-- ## 为什么要去掉
+--
+-- v12 的唯一索引不区分卡片类型，导致一个页签里只能有一张指标卡。
+-- 而指标卡才是用户真正会想放多张的东西——同一个页签里摆「步数 / 睡眠」，
+-- 或者把「屏幕使用」和「背单词次数」并排放，都是正常需求。
+-- 表现是：加了一张指标卡之后，加卡选择器里就再也点不出第二张，界面上看是「点了没反应」。
+--
+-- ## 为什么不是「只对非指标卡唯一」
+--
+-- 那需要 SQLite 的局部索引 `... WHERE type <> 'METRIC'`，但 Room 的 @Index
+-- 表达不了 WHERE 子句：实体生成的建表语句是整表唯一索引，迁移建的是局部索引，
+-- 两者 SQL 文本对不上，schema 校验会报「Migration didn't properly handle」并崩溃。
+-- 迁移里的索引必须与目标 schema 逐字对齐，所以这里改成普通索引。
+--
+-- 去重改由 DashboardCards.isDuplicate 保证，它比索引更精确（指标卡能细到「源 + 指标」）。
+--
+-- ## 必须先 DROP 再 CREATE
+--
+-- 索引名与 v12 完全相同。`CREATE INDEX IF NOT EXISTS` 遇到同名索引会直接跳过，
+-- 那样唯一约束会悄悄留着，老的「加不了第二张指标卡」bug 就复现了。
+DROP INDEX IF EXISTS `index_dashboard_card_tabId_type`;
+
+CREATE INDEX IF NOT EXISTS `index_dashboard_card_tabId_type` ON `dashboard_card` (`tabId`, `type`);

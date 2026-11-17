@@ -1,0 +1,6 @@
+-- v6 -> v7：任务表新增未达成提醒的时段偏移（分钟，相对每个时段的结束时刻）。
+--
+-- 老任务默认 +5，语义为「时段结束后 5 分钟判定」——
+-- 比原来的「结束前 5 分钟」晚，给读屏窗口留出缓冲。
+-- 允许负数：-5 表示时段结束前 5 分钟判定。
+ALTER TABLE `task` ADD COLUMN `windowOffsetMinutes` INTEGER NOT NULL DEFAULT 5;

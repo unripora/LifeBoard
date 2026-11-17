@@ -1,17 +1,12 @@
 package com.lifeboard.app.ui.notice
 
-import android.app.Application
-import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.lifeboard.core.model.SourceType
-import com.lifeboard.core.util.Dates
-import com.lifeboard.server.db.CaptureRuleEntity
-import com.lifeboard.server.db.LifeBoardDatabase
-import com.lifeboard.server.db.MetricEntity
 import com.lifeboard.server.notice.CaptureRuleMatcher
-import com.lifeboard.server.notice.NoticeListenerService
-import com.lifeboard.server.notice.NoticeSourceStatus
-import com.lifeboard.server.notice.ScreenCaptureAccessibilityService
+import com.lifeboard.shared.platform.RulesBackend
+import com.lifeboard.shared.repository.RuleStore
+import com.lifeboard.shared.repository.model.CaptureRuleRecord
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -39,7 +34,7 @@ data class RawItem(
 data class NoticeDebugUiState(
     val listenerEnabled: Boolean = false,
     val accessibilityEnabled: Boolean = false,
-    val rules: List<CaptureRuleEntity> = emptyList(),
+    val rules: List<CaptureRuleRecord> = emptyList(),
     val counts: Map<String, Double> = emptyMap(),
     val raws: List<RawItem> = emptyList(),
     val samplePackage: String = "",
@@ -54,18 +49,19 @@ data class NoticeDebugUiState(
  * 规则全部来自用户配置（`capture_rule` 表），不再有代码里写死的关键词。
  * 这个页面负责三件事：看授权状态、看真实流水、把真实文案粘进来验证规则。
  */
-class NoticeDebugViewModel(app: Application) : AndroidViewModel(app) {
+class NoticeDebugViewModel(
+    private val ruleStore: RuleStore,
+    private val backend: RulesBackend,
+) : ViewModel() {
 
     private val _state = MutableStateFlow(NoticeDebugUiState())
     val state: StateFlow<NoticeDebugUiState> = _state.asStateFlow()
-
-    private val db get() = LifeBoardDatabase.get(getApplication())
 
     init {
         refresh()
         viewModelScope.launch {
             // 流水与规则都用 Flow 观察，改完规则立刻能验证，不用手动刷新
-            db.rawNotificationDao().observeRecent().collect { list ->
+            ruleStore.observeRecentRawNotifications().collect { list ->
                 _state.value = _state.value.copy(
                     raws = list.map {
                         RawItem(
@@ -83,7 +79,7 @@ class NoticeDebugViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         viewModelScope.launch {
-            db.captureRuleDao().observeAll().collect { list ->
+            ruleStore.observeRules().collect { list ->
                 _state.value = _state.value.copy(rules = list)
                 refreshCounts()
             }
@@ -92,14 +88,11 @@ class NoticeDebugViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 只刷新今日计数，不动授权状态（开销小，可随流水变化频繁调用） */
     private suspend fun refreshCounts() {
-        val context = getApplication<Application>()
         val counts = withContext(Dispatchers.IO) {
-            val rules = db.captureRuleDao().getAll()
-            rules.map { it.sourceName to it.bucketName }
+            ruleStore.getAllRules()
+                .map { it.sourceName to it.bucketName }
                 .distinct()
-                .associate { (source, bucket) ->
-                    source to NoticeSourceStatus.todayCount(context, source, bucket)
-                }
+                .associate { (source, bucket) -> source to backend.todayCount(source, bucket) }
         }
         _state.value = _state.value.copy(counts = counts)
     }
@@ -107,17 +100,16 @@ class NoticeDebugViewModel(app: Application) : AndroidViewModel(app) {
     /** 清空原始流水（只影响校准数据，不动今日计数） */
     fun clearRaws() {
         viewModelScope.launch {
-            withContext(Dispatchers.IO) { runCatching { db.rawNotificationDao().clear() } }
+            withContext(Dispatchers.IO) { runCatching { ruleStore.clearRawNotifications() } }
             _state.value = _state.value.copy(message = "已清空原始流水")
         }
     }
 
     fun refresh() {
         viewModelScope.launch {
-            val context = getApplication<Application>()
             _state.value = _state.value.copy(
-                listenerEnabled = NoticeListenerService.isEnabled(context),
-                accessibilityEnabled = ScreenCaptureAccessibilityService.isEnabled(context),
+                listenerEnabled = backend.isNotificationListenerEnabled(),
+                accessibilityEnabled = backend.isCaptureServiceEnabled(),
             )
             refreshCounts()
         }
@@ -136,7 +128,7 @@ class NoticeDebugViewModel(app: Application) : AndroidViewModel(app) {
         val s = _state.value
         viewModelScope.launch {
             val rules = withContext(Dispatchers.IO) {
-                db.captureRuleDao().getEnabledByPackage(s.samplePackage)
+                ruleStore.getEnabledRulesByPackage(s.samplePackage)
             }
             val now = LocalDateTime.now()
             val hits = CaptureRuleMatcher.match(rules, s.sampleContent, now)
@@ -159,22 +151,12 @@ class NoticeDebugViewModel(app: Application) : AndroidViewModel(app) {
     /** 清空某源今日计数，便于反复测试 */
     fun clearToday() {
         viewModelScope.launch {
-            val date = Dates.todayString()
             val msg = withContext(Dispatchers.IO) {
                 runCatching {
-                    val rules = db.captureRuleDao().getAll()
-                    rules.map { it.sourceName to it.bucketName }
+                    ruleStore.getAllRules()
+                        .map { it.sourceName to it.bucketName }
                         .distinct()
-                        .forEach { (source, bucket) ->
-                            db.metricDao().upsert(
-                                MetricEntity(
-                                    sourceType = source,
-                                    date = date,
-                                    bucket = bucket,
-                                    value = 0.0,
-                                ),
-                            )
-                        }
+                        .forEach { (source, bucket) -> backend.clearTodayCount(source, bucket) }
                     "已清空今日计数"
                 }.getOrElse { "清空失败：${it.message}" }
             }
@@ -185,12 +167,12 @@ class NoticeDebugViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- 规则增删改 ----
 
-    fun saveRule(rule: CaptureRuleEntity) {
+    fun saveRule(rule: CaptureRuleRecord) {
         viewModelScope.launch {
-            withContext(Dispatchers.IO) { db.captureRuleDao().upsert(rule) }
+            withContext(Dispatchers.IO) { ruleStore.saveRule(rule) }
             // 无障碍服务把规则缓存在内存里（rulesByPackage），不通知它就一直用旧的。
             // 漏掉这一步的后果是：删掉的规则仍在命中、改了的关键词不生效。
-            ScreenCaptureAccessibilityService.notifyRulesChanged()
+            backend.notifyRulesChanged()
             _state.value = _state.value.copy(message = "规则已保存")
             refresh()
         }
@@ -198,15 +180,15 @@ class NoticeDebugViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteRule(id: Long) {
         viewModelScope.launch {
-            withContext(Dispatchers.IO) { db.captureRuleDao().deleteById(id) }
+            withContext(Dispatchers.IO) { ruleStore.deleteRule(id) }
             // 同上：不同步的话，已删除的规则会在无障碍通道里继续匹配。
-            ScreenCaptureAccessibilityService.notifyRulesChanged()
+            backend.notifyRulesChanged()
             _state.value = _state.value.copy(message = "规则已删除")
             refresh()
         }
     }
 
-    fun toggleRule(rule: CaptureRuleEntity) {
+    fun toggleRule(rule: CaptureRuleRecord) {
         saveRule(rule.copy(enabled = !rule.enabled))
     }
 

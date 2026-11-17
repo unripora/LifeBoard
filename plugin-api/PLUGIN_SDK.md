@@ -1,61 +1,20 @@
-# 插件构建约定
+# 插件契约说明
 
-本文写给两类读者：写宿主加载逻辑的人，和写 `.ext` 插件的人。核心只有一句——**插件不打包 `:plugin-api`，靠宿主提供**。
+本文写给**写插件的人**与**改宿主的人**。
 
-## 为什么 `:plugin-api` 必须是 compileOnly
+前提：宿主只跑 JS 插件。历史上的 Android APK 插件轨（`.ext` + `DexClassLoader`）已于 M6b 移除，
+本文不再涉及那一套。参考实现是 `js-plugins/mihealth/`——真实的登录、验证码、多指标采集链路都在里面。
 
-`:plugin-api` 里全是接口、数据类、sealed class。插件和宿主必须在**同一份实现**上相遇：
+## `:plugin-api` 是什么
 
-- 如果插件把 `:plugin-api` 打进自己的 dex，那它会有自己的一份 `SourcePlugin`、`MetricSpec`。
-  加载时 `instance is SourcePlugin` 判的是宿主那份，插件的类不满足，`instanceof` 直接返回 false，
-  加载器只能报「入口类未实现 SourcePlugin」——而插件作者看着自己的代码明明是实现了的。
-- 更隐蔽的是 `sealed class` 与 `data class`：即便绕过类型检查，插件构造的 `PluginHealth.Broken`
-  也是另一个类，宿主的 `when` 分支走不到，表现为「状态永远对不上」。
+`:plugin-api` 是宿主与插件的契约模块，只有接口、数据类、sealed class，没有依赖、没有实现。
 
-因此宿主在 `PluginLoader` 里把 `DexClassLoader` 的父加载器设成 `context.classLoader`，
-插件里所有 `com.lifeboard.plugin.api.*` 的符号在运行期都解析到宿主已加载的那份。
+JS 插件在运行期并不加载它（JS 没有 Kotlin 类型）。它对 JS 插件的意义是**权威定义**：
+`ctx.*` 注入的函数、manifest 里的字段、`fetch` 的返回结构，都由这里的类型描述和约束。
+改这里就是改契约，JS 插件要跟着改。
 
-## 插件的 build.gradle 写法
-
-```kotlin
-dependencies {
-    // 必须是 compileOnly：只在编译期提供符号，不打进 dex
-    compileOnly(project(":plugin-api"))
-
-    // 插件自己的依赖（网络、序列化等）按需 implementation，
-    // 会被打进插件 dex，随 .ext 一起分发
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-}
-```
-
-用 `implementation` 或 `api` 包 `:plugin-api` 都会导致上面说的类型不匹配，**没有运行期补救办法**。
-
-## 插件包的目录约定
-
-`.ext` 是改了后缀的标准 APK。除了正常的 `AndroidManifest.xml` 和 `classes.dex`，
-加载器还要求：
-
-```
-META-INF/lifeboard-plugin.properties
-```
-
-内容至少包含入口类：
-
-```properties
-entryClass=dev.foo.demo.DemoPlugin
-```
-
-这个文件是加载器定位入口的唯一依据。读不到就判 `BROKEN` 并给出明确原因，
-**不会扫描全包类名去猜**——猜错会把一个无关的类实例化，错误信息也更难懂。
-
-## 不需要做到的、以及必须诚实说明的
-
-- **没有沙箱**：插件与宿主同进程、同 UID、同权限，可以读宿主数据目录，可以反射访问宿主内部。
-  签名校验只解决「包有没有被替换」，不解决「作者是否作恶」。产品文案不得写「隔离」「安全沙箱」。
-- **没有进程隔离**：插件 OOM 或 native crash 会连同宿主一起被杀。加载器的 `try/catch`
-  只能兜住受控异常（构造抛错、类型不符、契约版本不一致），兜不住致命崩溃。
-- **契约版本单版本策略**：`apiVersion` 与宿主不一致直接拒绝加载，不做多代并存。
-  这意味着宿主升契约版本时，旧插件必须跟着升。
+宿主侧 `JsSourcePlugin` 实现了 `SourcePlugin` 接口，把 JS 的返回值翻译成这些类型。
+所以契约改动会在宿主这一侧表现为编译错误，不会静默漏过。
 
 ## 契约要点
 
@@ -68,7 +27,7 @@ entryClass=dev.foo.demo.DemoPlugin
 就会出现同一份数据被两种口径解读。宿主遇到未声明的 `metricKey` 会丢弃并记告警，不会猜测补一个量纲。
 
 `metricKey` 与插件 `id` 都不得为空、不得含 `:`（`:` 是 `PLUGIN_{id}:{metricKey}` 的分隔符）。
-三者的冲突校验由 `PluginMetrics.validate()` 提供，插件可以在自己的测试里先跑一遍。
+冲突校验由 `PluginMetrics.validate()` 提供，插件可以在自己的测试里先跑一遍。
 
 ### 登录态与健康度
 
@@ -86,7 +45,38 @@ entryClass=dev.foo.demo.DemoPlugin
 
 `CredentialSpec.slots` 只用于 UI 展示「清除凭据会影响哪些项」，宿主不校验插件是否只用了声明的槽位。
 
+### 契约版本
+
+两套版本号，不要混用：
+
+| 版本号 | 管什么 | 位置 |
+|---|---|---|
+| `PluginApi.VERSION` | 编译期契约：插件实现了哪些方法、类型长什么样 | `plugin-api` |
+| `JsPluginApi.CURRENT` | 运行期函数集：宿主注入了哪些 `ctx.*` 函数 | `shared/jvmMain` |
+
+JS 插件读的是后者。宿主少一个注入函数、或某个函数的参数形态变了，插件就会在运行期
+以 `undefined is not a function` 炸在业务代码中间，报错点离真正原因很远——所以用独立版本号在加载前拦住。
+
+契约版本是**单版本策略**：`apiVersion` 与宿主不一致直接拒绝加载，不做多代并存。
+宿主升契约版本时，旧插件必须跟着升。
+
+## 必须诚实说明的
+
+- **没有进程隔离**：JS 插件跑在宿主进程的 QuickJS 运行时里。脚本 OOM 会连同宿主一起受影响，
+  加载器的 `try/catch` 只能兜住受控异常（脚本抛错、manifest 不合法、契约版本不一致），兜不住致命问题。
+- **JS 沙箱提供的屏障是 API 面，不是权限**：脚本只能通过宿主显式注入的 `ctx.*` 触达外部能力，
+  拿不到文件系统与网络 API。但这不等于安全隔离——宿主注入的每个函数都是脚本可用能力的上限，
+  而注入面由宿主决定。产品文案不得写「安全沙箱」。
+- **信任指纹是内容哈希，不是签名**：`.jsplugin` 的指纹来自包内文件的 SHA-256。
+  它能证明「包没被换过」，不能证明「作者是谁」。首次安装时的信任由用户手动确认。
+
 ## 示例
 
-`demo-plugin/` 是一个最小可用的插件模块，可作为模板参考。
-它不联网、不需登录，只产出固定值，用来验证「加载 → 信任 → 采集 → 入库」这条链。
+```
+js-plugins/
+└── mihealth/
+    ├── manifest.json   # 声明 id / metrics / credentialSpec / apiVersion
+    └── main.js         # 实现 fetch / authState / health
+```
+
+读之前先看 `manifest.json` 的 `credentialSpec` 与 `main.js` 的 `fetch` 实现。

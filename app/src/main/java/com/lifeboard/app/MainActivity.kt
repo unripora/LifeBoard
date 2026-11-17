@@ -2,10 +2,12 @@ package com.lifeboard.app
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -23,7 +25,6 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
@@ -33,6 +34,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -46,36 +48,52 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.lifeboard.app.ui.dashboard.DashboardDefaults
-import com.lifeboard.app.ui.dashboard.DashboardViewModel
-import com.lifeboard.app.ui.dashboard.MAX_TAB_NAME_LENGTH
-import com.lifeboard.app.ui.dashboard.TabManagerDialog
-import com.lifeboard.app.ui.dashboard.TabRowUi
-import com.lifeboard.app.ui.dashboard.validateTabName
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
+import com.lifeboard.shared.dashboard.DashboardDefaults
+import com.lifeboard.shared.dashboard.DashboardViewModel
+import com.lifeboard.app.platform.AndroidAppIconProvider
+import com.lifeboard.app.platform.AndroidTextFileExporter
+import com.lifeboard.shared.dashboard.NewTabDialog
+import com.lifeboard.shared.dashboard.TabManagerDialog
+import com.lifeboard.shared.dashboard.TabRowUi
 import com.lifeboard.app.ui.debug.IpcDebugScreen
-import com.lifeboard.app.ui.log.LogScreen
+import com.lifeboard.app.ui.rules.RulesScreen
+import com.lifeboard.shared.log.LogViewModel
 import com.lifeboard.app.ui.notice.NoticeDebugScreen
-import com.lifeboard.app.ui.panel.PanelScreen
+import com.lifeboard.shared.panel.PanelScreen
 import com.lifeboard.app.ui.panel.TaskEditScreen
 import com.lifeboard.app.ui.panel.TrendScreen
 import com.lifeboard.app.ui.plugin.PluginScreen
-import com.lifeboard.app.ui.plugin.detail.PluginDetailScreen
+import com.lifeboard.shared.ui.plugin.detail.PluginDetailScreen
+import com.lifeboard.shared.ui.plugin.detail.PluginDetailViewModel
 import com.lifeboard.app.ui.remind.RemindTestScreen
-import com.lifeboard.app.ui.rules.RulesScreen
-import com.lifeboard.app.ui.settings.AboutScreen
-import com.lifeboard.app.ui.settings.AppearanceState
-import com.lifeboard.app.ui.settings.SettingsScreen
-import com.lifeboard.app.ui.task.TaskIndicatorButton
-import com.lifeboard.app.ui.task.TaskListDialog
-import com.lifeboard.app.ui.theme.GlassBackground
-import com.lifeboard.app.ui.theme.LifeBoardTheme
-import com.lifeboard.server.dashboard.BuiltinTab
-import com.lifeboard.server.dashboard.BuiltinTabs
-import com.lifeboard.server.dashboard.TabKind
-import com.lifeboard.server.db.DashboardTabEntity
+import com.lifeboard.shared.settings.AppearanceState
+import com.lifeboard.shared.settings.SettingsScreen
+import com.lifeboard.shared.task.TaskIndicatorButton
+import com.lifeboard.shared.task.TaskListDialog
+import com.lifeboard.shared.ui.theme.GlassBackground
+import com.lifeboard.shared.ui.theme.LifeBoardTheme
+import com.lifeboard.shared.platform.LocalPlatform
+import com.lifeboard.shared.platform.PlatformDependencies
+import com.lifeboard.shared.platform.PlatformProvider
+import com.lifeboard.shared.dashboard.BuiltinTab
+import com.lifeboard.shared.dashboard.BuiltinTabs
+import com.lifeboard.shared.dashboard.TabKind
+import com.lifeboard.server.platform.AndroidDashboardBackend
+import com.lifeboard.server.platform.AndroidNotifier
+import com.lifeboard.server.platform.AndroidPlatformDependencies
 import com.lifeboard.server.remind.RemindScheduler
+import com.lifeboard.server.db.DatabaseProviders
+import com.lifeboard.shared.navigation.MissingPageNotice
+import com.lifeboard.shared.navigation.PageCatalog
+import com.lifeboard.shared.navigation.PageHost
+import com.lifeboard.shared.navigation.PageRoute
+import com.lifeboard.shared.navigation.PageSlot
+import com.lifeboard.shared.repository.model.DashboardTab
 
 /**
  * 应用主界面。
@@ -86,9 +104,33 @@ import com.lifeboard.server.remind.RemindScheduler
  */
 class MainActivity : ComponentActivity() {
 
+    /**
+     * 本次 Activity 实例装配好的依赖（M12）。
+     *
+     * 只用 `onNewIntent` 派发通知点击。Activity 重建时会重新赋值，
+     * 旧实例随之被回收，不会泄漏。
+     */
+    private var assembledDeps: PlatformDependencies? = null
+
     /** 通知权限申请结果回调，结果由系统写回权限表，这里无需额外处理 */
     private val requestNotification =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    /**
+     * 文件选择器的回调挂点。
+     *
+     * `registerForActivityResult` 必须在 Activity 进入 RESUMED 之前调用，
+     * 所以这里是字段而不是在 `setContent` 里注册。`AndroidFilePicker`
+     * 需要「弹窗 + 收结果」这一对动作，就把本字段的 launcher 传给它。
+     */
+    private var pendingPickCallback: ((android.net.Uri?) -> Unit)? = null
+
+    private val pickDocument =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            val callback = pendingPickCallback
+            pendingPickCallback = null
+            callback?.invoke(uri)
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -100,14 +142,53 @@ class MainActivity : ComponentActivity() {
         // WorkManager 也会在没有 Activity 的情况下拉起进程，放在这里会让那种进程拿不到插件
         // 闹钟在进程被杀或跨天后会失效，每次打开应用都重排一次
         runCatching { RemindScheduler.rescheduleAll(this) }
+        // 全应用唯一的依赖装配点：之后所有页面通过 LocalPlatform 取能力，
+        // 不再各自 new 平台实现
+        val deps = buildPlatformDependencies()
+        // 存到字段上供 `onNewIntent` 使用：那时拿不到局部变量，
+        // 而通过 CompositionLocal 取又需要已经建立好的 Composition
+        assembledDeps = deps
+        // 通知点击的回调（M12）。Android 侧的「唤回界面」由系统完成
+        // （PendingIntent 会把 Activity 拉到前台），这里只需要记下点击了哪条。
+        // 与桌面端注册的是同一个契约方法，两端行为语义一致
+        (deps.notifier as? AndroidNotifier)?.setOnNotificationClick { payload ->
+            android.util.Log.i("LifeBoard", "用户点击了提醒通知，payload=$payload")
+        }
+        // 冷启动时通知带来的 payload：`onCreate` 之后没有 `onNewIntent`，
+        // 不在这里读就永远收不到
+        handleNotificationIntent(intent)
         setContent {
-            // 外观状态提到 Activity 级：设置页改动后主界面立即重组换色，无需重启
-            val appearance = remember { AppearanceState(this) }
+            // 外观状态提到 Activity 级：设置页改动后主界面立即重组换色，无需重启。
+            // 存储走注入的 SettingsStore（键名仍是 theme_mode / color_palette），
+            // 老用户的既有偏好照常读得到
+            val appearance = remember { AppearanceState(deps.settings) }
             LifeBoardTheme(palette = appearance.palette, mode = appearance.mode) {
-                MainScaffold(appearance)
+                PlatformProvider(deps) {
+                    MainScaffold(appearance)
+                }
             }
         }
     }
+
+    /**
+     * 构造本 Activity 的依赖。
+     *
+     * 只在 Activity 创建时算一次；`Activity` 重建（旋屏、改语言）会重新装配，
+     * 这是对的——旧实例可能已经被回收。依赖内部持有的都是 applicationContext，
+     * 所以重建不会泄漏 Activity。
+     */
+    private fun buildPlatformDependencies() = AndroidPlatformDependencies.forActivity(
+        context = this,
+        launcher = { mimeTypes, onResult ->
+            pendingPickCallback = onResult
+            pickDocument.launch(mimeTypes)
+        },
+        // 「关于」页的应用图标。实现在 :app 里：需要 android.graphics 绘图，
+        // 而 :server 没有也不该有画图逻辑
+        appIcon = AndroidAppIconProvider(this),
+        // 日志导出：写 cache/logs 后走 FileProvider 弹分享面板
+        textExporter = AndroidTextFileExporter(this),
+    )
 
     private fun ensureNotificationPermission() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
@@ -116,6 +197,34 @@ class MainActivity : ComponentActivity() {
             Manifest.permission.POST_NOTIFICATIONS,
         ) == PackageManager.PERMISSION_GRANTED
         if (!granted) requestNotification.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
+    /**
+     * Activity 已在前台时用户点了通知（M12）。
+     *
+     * `Intent.FLAG_ACTIVITY_SINGLE_TOP` 会让这种情况走这里而不是 `onCreate`，
+     * 所以两处都要读——只写 `onCreate` 的话「App 开着时点通知」就没有任何反馈。
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        // 必须更新 Activity 持有的 Intent，否则后续 `getIntent()` 读到的还是旧的
+        setIntent(intent)
+        handleNotificationIntent(intent)
+    }
+
+    /**
+     * 把通知点击带来的 payload 转交给 [AndroidNotifier] 上注册的回调。
+     *
+     * 这里只做派发，不直接打开某个页面：按当前产品决策（方案 A），
+     * 点击通知的落地行为是「把 App 带到前台」，不做深链到具体任务。
+     */
+    private fun handleNotificationIntent(intent: Intent?) {
+        val payload = intent?.getStringExtra(AndroidNotifier.EXTRA_PAYLOAD) ?: return
+        // 依赖可能还没装配（冷启动时 `handleNotificationIntent` 在 `setContent` 之前跑）。
+        // 那种情况下系统已经把界面拉到前台了，方案 A 的语义已经达成，直接跳过即可
+        (assembledDeps?.notifier as? AndroidNotifier)?.dispatchClick(payload)
+        // 取完就清掉，避免 Activity 重建时把同一次点击重复派发
+        intent.removeExtra(AndroidNotifier.EXTRA_PAYLOAD)
     }
 }
 
@@ -144,14 +253,13 @@ private data class TabItem(
 @Composable
 private fun MainScaffold(appearance: AppearanceState) {
     val context = LocalContext.current
+    // 页签选中态走注入的 SettingsStore 而不是直接摸 SharedPreferences：
+    // 桌面端用的是 java.util.prefs，同一行代码两端都能跑
+    val settings = LocalPlatform.current.settings
     // 选中态存 tabId 而不是下标：页签顺序可被用户调整，
     // 用下标会在「在最后一个页签时新增一个页签」之类的场景跳到别的页面
     var selectedTabId by remember {
-        mutableStateOf(
-            context.getSharedPreferences(PREFS_UI, Context.MODE_PRIVATE)
-                .getString(KEY_SELECTED_TAB, BuiltinTabs.TAB_ID_PANEL)
-                ?: BuiltinTabs.TAB_ID_PANEL,
-        )
+        mutableStateOf(settings.getString(KEY_SELECTED_TAB, BuiltinTabs.TAB_ID_PANEL))
     }
     // 0 表示不在编辑页；非 0 为编辑中的任务 id；NEW_TASK_ID 表示新建
     var editingTaskId by remember { mutableStateOf<Long?>(null) }
@@ -162,14 +270,34 @@ private fun MainScaffold(appearance: AppearanceState) {
     // 因为两次点同一个插件时 pluginId 不变，LaunchedEffect 不会重跑
     var detailPluginId by remember { mutableStateOf<String?>(null) }
     var detailSession by remember { mutableIntStateOf(0) }
-    var showLogs by remember { mutableStateOf(false) }
-    var logSession by remember { mutableIntStateOf(0) }
-    var showAbout by remember { mutableStateOf(false) }
 
     /** 面板上「重新判定数据源健康度」的触发键 */
     var healthRefreshKey by remember { mutableIntStateOf(0) }
 
-    val dashVm: DashboardViewModel = viewModel()
+    // 日志页（M3-3.2d 起在 shared）：提到这里是为了在「设置 → 运行日志」里跨重组存活，
+    // 从子页返回再进去不会丢搜索词与已加载的分页。
+    // deps 要在 Composable 作用域里先取出来：initializer 的 lambda 不是 @Composable
+    val deps = LocalPlatform.current
+    val logVm: LogViewModel = viewModel(
+        factory = viewModelFactory {
+            initializer {
+                LogViewModel(
+                    store = deps.logStore,
+                    appInfo = deps.appInfo,
+                    exporter = deps.textExporter,
+                )
+            }
+        },
+    )
+
+    val dashVm: DashboardViewModel = viewModel(
+        factory = viewModelFactory {
+            initializer {
+                val app = checkNotNull(this[APPLICATION_KEY]) { "缺少 Application，无法构造仪表盘" }
+                DashboardViewModel(DatabaseProviders.dashboardStore(app), AndroidDashboardBackend(DatabaseProviders.dashboardStore(app)))
+            }
+        },
+    )
     val dashState by dashVm.state.collectAsStateWithLifecycle()
     // 页签管理是压在顶栏上的一层弹窗
     var showTabManager by remember { mutableStateOf(false) }
@@ -193,8 +321,7 @@ private fun MainScaffold(appearance: AppearanceState) {
 
     fun selectTab(tabId: String) {
         selectedTabId = tabId
-        context.getSharedPreferences(PREFS_UI, Context.MODE_PRIVATE)
-            .edit().putString(KEY_SELECTED_TAB, tabId).apply()
+        settings.putString(KEY_SELECTED_TAB, tabId)
     }
 
     // 三种状态必须分开，不能都当成「布局坏了」：
@@ -214,6 +341,58 @@ private fun MainScaffold(appearance: AppearanceState) {
     // 一律回退到面板，否则会停在一个空白页
     val selectedIndex = tabs.indexOfFirst { it.tabId == selectedTabId }.takeIf { it >= 0 } ?: 0
     val current = tabs[selectedIndex]
+
+    // 内置页签的页面注册表。用户页签（route 为空）不注册，走卡片容器。
+    //
+    // 这里就是 3.4 的接线点：共享层的 DashboardHost 只认 route 字符串，
+    // 具体是哪个 Composable 由这一份映射决定。桌面端交一份更短的清单——
+    // 它没有通知监听与无障碍，notice / debug 两页注册不出来。
+    //
+    // 每个页面都通过闭包捕获它需要的东西（外观、浮层开关、tabId），
+    // 所以 PageRoute 的签名里不需要出现任何平台类型。
+    val catalog = remember(appearance, current.tabId, healthRefreshKey, logVm) {
+        buildAndroidPages(
+            appearance = appearance,
+            logViewModel = logVm,
+            tabId = current.tabId,
+            refreshKey = healthRefreshKey,
+            onEditTask = {
+                editorSession++
+                editingTaskId = it
+            },
+            onNewTask = {
+                editorSession++
+                editingTaskId = NEW_TASK_ID
+            },
+            onOpenPluginDetail = { pluginId ->
+                detailSession++
+                detailPluginId = pluginId
+            },
+        )
+    }
+
+    // 页面拿到的壳句柄。key 带 tabId：换了页签就该换句柄，
+    // 否则页面里 remember 住它的地方会一直往旧页签跳
+    val host = remember(catalog, current.tabId) {
+        object : PageHost {
+            override val tabId: String = current.tabId
+
+            override fun navigateTo(route: String) {
+                val target = tabs.firstOrNull { it.route == route } ?: return
+                selectTab(target.tabId)
+            }
+
+            override fun editTask(taskId: Long) {
+                editorSession++
+                editingTaskId = taskId
+            }
+
+            override fun createTask() {
+                editorSession++
+                editingTaskId = NEW_TASK_ID
+            }
+        }
+    }
 
     // 选中页被删掉后，持久化的 tabId 已经失效，把回退后的选择写回去，
     // 否则每次冷启动都要重新回退一次
@@ -281,52 +460,25 @@ private fun MainScaffold(appearance: AppearanceState) {
                 }
                 // 按 route 分发而不是穷尽枚举：用户页签没有枚举值，
                 // 而且删掉内置页签（M6b）后也必须有个去处，
-                // 所以 else 兜底回面板，不能留空屏
-                when (current.route) {
-                    BuiltinTabs.ROUTE_PANEL -> PanelScreen(
-                        tabId = current.tabId,
-                        onEditTask = {
-                            editorSession++
-                            editingTaskId = it
-                        },
-                        onNewTask = {
-                            editorSession++
-                            editingTaskId = NEW_TASK_ID
-                        },
-                        refreshKey = healthRefreshKey,
-                    )
-                    BuiltinTabs.ROUTE_RULES -> RulesScreen()
-                    BuiltinTabs.ROUTE_TREND -> TrendScreen()
-                    BuiltinTabs.ROUTE_REMIND -> RemindTestScreen()
-                    BuiltinTabs.ROUTE_NOTICE -> NoticeDebugScreen()
-                    BuiltinTabs.ROUTE_PLUGIN -> PluginScreen(
-                        onOpenDetail = { pluginId ->
-                            detailSession++
-                            detailPluginId = pluginId
-                        },
-                    )
-                    BuiltinTabs.ROUTE_DEBUG -> IpcDebugScreen()
-                    BuiltinTabs.ROUTE_SETTINGS -> SettingsScreen(
-                        appearance = appearance,
-                        onOpenLogs = {
-                            logSession++
-                            showLogs = true
-                        },
-                        onOpenAbout = { showAbout = true },
-                    )
-                    // 用户页签（route 为空）与一切未知路由都落到卡片容器
-                    else -> PanelScreen(
-                        tabId = current.tabId,
-                        onEditTask = {
-                            editorSession++
-                            editingTaskId = it
-                        },
-                        onNewTask = {
-                            editorSession++
-                            editingTaskId = NEW_TASK_ID
-                        },
-                        refreshKey = healthRefreshKey,
-                    )
+                // 所以 pageContent 里 route 为 null 时走卡片容器，不能留空屏。
+                //
+                // M3-3.4：具体页面由 [androidPages] 注册，这里只剩「查表 + 画」。
+                // 注册表的作用是让共享层的 DashboardHost 不必 import 任何具体页面——
+                // 否则页签壳就永远搬不出 :app。
+                when (val slot = catalog.render(current.route.orEmpty())) {
+                    is PageSlot.Resolved -> slot.route.Content(host)
+                    is PageSlot.Missing ->
+                        // route 为空说明是用户页签：它不是「缺失」，而是走卡片容器
+                        if (current.route == null) {
+                            PanelScreen(
+                                tabId = current.tabId,
+                                onEditTask = host::editTask,
+                                onNewTask = host::createTask,
+                                refreshKey = healthRefreshKey,
+                            )
+                        } else {
+                            MissingPageNotice(slot.route)
+                        }
                 }
             }
         }
@@ -354,26 +506,21 @@ private fun MainScaffold(appearance: AppearanceState) {
             // LaunchedEffect 不会重跑，页面会沿用上次读到的状态
             key(detailSession) {
                 GlassBackground {
+                    // 详情页已下沉到 :shared，与桌面端共用同一份实现。
+                    // VM 由这里持有并在离开时 close()：它自持 scope，不像原来继承
+                    // ViewModel 那样能靠 viewModelScope 自动取消
+                    val detailVm = remember(detail) { PluginDetailViewModel(deps) }
+                    DisposableEffect(detailVm) {
+                        detailVm.load(detail)
+                        onDispose { detailVm.close() }
+                    }
                     PluginDetailScreen(
-                        pluginId = detail,
+                        vm = detailVm,
                         onClose = { detailPluginId = null },
+                        // 桌面端没有返回键，这份处理只有 Android 用得上
+                        backHandler = { onBack -> BackHandler(onBack = onBack) },
                     )
                 }
-            }
-        }
-
-        if (showLogs) {
-            // 与插件详情页同一种覆盖层；每次打开都重建，保证看到的是当下最新的日志
-            key(logSession) {
-                GlassBackground {
-                    LogScreen(onClose = { showLogs = false })
-                }
-            }
-        }
-
-        if (showAbout) {
-            GlassBackground {
-                AboutScreen(onClose = { showAbout = false })
             }
         }
 
@@ -432,69 +579,6 @@ private fun MainScaffold(appearance: AppearanceState) {
 }
 
 /**
- * 「+」点开的新建页签弹窗。
- *
- * 只问名字。重命名、删除、排序这些低频操作留在 [TabManagerDialog]，
- * 用一个入口跳过去——新建是高频动作，不该每次都先经过一个管理列表。
- */
-@Composable
-private fun NewTabDialog(
-    onDismiss: () -> Unit,
-    onManage: () -> Unit,
-    onCreate: (String) -> Unit,
-) {
-    var name by remember { mutableStateOf("") }
-    // 与 TabManagerDialog 共用同一套校验：这里不让叫的名字，
-    // 换个入口也不能叫出来（validateTabName 返回 null 表示合法）
-    val valid = validateTabName(name) != null
-    val tooLong = name.length > MAX_TAB_NAME_LENGTH
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("新建页签") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it },
-                    singleLine = true,
-                    label = { Text("页签名称") },
-                    isError = tooLong,
-                    supportingText = {
-                        // 不截断输入，只说明原因：直接吞字符会让人以为是输入法的问题
-                        Text(
-                            if (tooLong) {
-                                "超出 $MAX_TAB_NAME_LENGTH 个字符，请缩短后再提交"
-                            } else {
-                                "${name.trim().length}/$MAX_TAB_NAME_LENGTH"
-                            },
-                        )
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                TextButton(onClick = onManage, contentPadding = PaddingValues(0.dp)) {
-                    Text("管理现有页签", style = MaterialTheme.typography.labelLarge)
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = {
-                    if (valid) {
-                        onCreate(name.trim())
-                        onDismiss()
-                    }
-                },
-                enabled = valid,
-            ) { Text("创建") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("取消") }
-        },
-    )
-}
-
-/**
  * 把库里的页签行还原成界面用的 [TabItem]。
  *
  * 内置页签的 route 由 [BuiltinTabs] 反查得出——库里只存 tabId 与展示名，
@@ -502,7 +586,7 @@ private fun NewTabDialog(
  * 反查不到说明是内置页签但代码已经不认它了（升级后删掉了某个内置页），
  * route 留空，分发的 else 分支会把它当卡片容器处理并给出空态，而不是崩溃。
  */
-private fun DashboardTabEntity.toTabItem(): TabItem {
+private fun DashboardTab.toTabItem(): TabItem {
     val builtin = BuiltinTabs.byTabId(tabId)
     return TabItem(
         tabId = tabId,
@@ -544,3 +628,69 @@ private const val NEW_TASK_ID = 0L
 /** 界面层偏好（当前选中页签等），与专题设置分开存 */
 private const val PREFS_UI = "lifeboard_ui"
 private const val KEY_SELECTED_TAB = "selected_tab_id"
+
+/**
+ * Android 端的内置页签注册表。
+ *
+ * ## 为什么是函数而不是常量
+ *
+ * 每个页面都要捕获它自己的入口参数：设置页要拿到 `appearance`、
+ * 面板页要知道自己画的是哪个 `tabId`、插件页要能打开详情浮层。
+ * 做成常量就只能把这些做成全局单例，那比显式传参糟得多。
+ *
+ * ## 为什么 `PageRoute` 的 lambda 里能直接写 Composable 调用
+ *
+ * `PageRoute.Content` 自己带 `@Composable`，所以 SAM 转换后的 lambda
+ * 天然处于 Composable 上下文里。反过来，如果把它写成一个普通
+ * `@Composable () -> Unit` 的映射，这个函数本身就必须是 `@Composable`，
+ * 也就没法在 `remember` 里构造——每次重组都会重建整张表。
+ *
+ * ## 桌面端对应的清单
+ *
+ * 少 `notice`（通知监听）与 `debug`（IPC 自检）两项：那两页依赖
+ * Android 特有的能力，桌面端注册不出来。缺的页签不删数据，
+ * 由 `DashboardHost` 画「这一端没有此页」的占位。
+ */
+private fun buildAndroidPages(
+    appearance: AppearanceState,
+    logViewModel: LogViewModel,
+    tabId: String,
+    refreshKey: Int,
+    onEditTask: (Long) -> Unit,
+    onNewTask: () -> Unit,
+    onOpenPluginDetail: (String) -> Unit,
+): PageCatalog = PageCatalog.of(
+    BuiltinTabs.ROUTE_PANEL to PageRoute {
+        PanelScreen(
+            tabId = tabId,
+            onEditTask = onEditTask,
+            onNewTask = onNewTask,
+            refreshKey = refreshKey,
+        )
+    },
+    BuiltinTabs.ROUTE_RULES to PageRoute { RulesScreen() },
+    BuiltinTabs.ROUTE_TREND to PageRoute { TrendScreen() },
+    // 数据指标页（M13）：与「添加指标卡」共用同一份候选产出（原生/自定义/插件三组），
+    // 展开即显示当天值。scope 与 TaskEditViewModel 用的是同一个实现
+    BuiltinTabs.ROUTE_METRICS to PageRoute {
+        val context = LocalContext.current
+        val scope = remember(context) {
+            com.lifeboard.server.platform.AndroidPanelScope(context.applicationContext)
+        }
+        com.lifeboard.shared.metrics.MetricsScreen(scope = scope)
+    },
+    BuiltinTabs.ROUTE_REMIND to PageRoute { RemindTestScreen() },
+    // 这两页是 Android 专属：通知监听与无障碍都只有 Android 有
+    BuiltinTabs.ROUTE_NOTICE to PageRoute { NoticeDebugScreen() },
+    BuiltinTabs.ROUTE_DEBUG to PageRoute { IpcDebugScreen() },
+    BuiltinTabs.ROUTE_PLUGIN to PageRoute {
+        PluginScreen(onOpenDetail = onOpenPluginDetail)
+    },
+    BuiltinTabs.ROUTE_SETTINGS to PageRoute {
+        SettingsScreen(
+            appearance = appearance,
+            logViewModel = logViewModel,
+        )
+    },
+)
+

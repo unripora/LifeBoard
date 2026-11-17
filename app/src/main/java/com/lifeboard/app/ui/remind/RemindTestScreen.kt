@@ -22,10 +22,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import com.lifeboard.core.model.RemindLevel
+import com.lifeboard.server.platform.AndroidRemindBackend
 import com.lifeboard.server.remind.RemindPermissions
+import com.lifeboard.shared.platform.RemindBackend
 
 /**
  * 提醒验证页（M2.7）。
@@ -34,7 +39,16 @@ import com.lifeboard.server.remind.RemindPermissions
  * M3 有正式任务管理后，本页可退化为设置里的"提醒自检"入口。
  */
 @Composable
-fun RemindTestScreen(vm: RemindTestViewModel = viewModel()) {
+fun RemindTestScreen(
+    vm: RemindTestViewModel = viewModel(
+        factory = viewModelFactory {
+            initializer {
+                val app = checkNotNull(this[APPLICATION_KEY]) { "缺少 Application，无法构造提醒后端" }
+                RemindTestViewModel(AndroidRemindBackend(app))
+            }
+        },
+    ),
+) {
     val state by vm.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
@@ -128,7 +142,7 @@ fun RemindTestScreen(vm: RemindTestViewModel = viewModel()) {
 
 @Composable
 private fun PermissionCard(
-    items: List<RemindPermissions.Item>,
+    items: List<RemindBackend.PermissionItem>,
     onOpen: (String) -> Unit,
     onRecheck: () -> Unit,
 ) {

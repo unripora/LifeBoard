@@ -1,0 +1,116 @@
+-- 仪表盘页签。
+--
+-- 内置页签（面板/规则/趋势…）**也要**在这张表里出现，
+-- 否则「页签顺序」就有两个真相：代码里的枚举和这张表。
+--
+-- tabId 是稳定标识而非自增主键：页签被卡片引用，自增 id 在重建布局时会漂移，
+-- 卡片就会指向错的页签。
+CREATE TABLE `dashboard_tab` (
+    `tabId` TEXT NOT NULL,
+    `name` TEXT NOT NULL,
+    `order` INTEGER NOT NULL,
+    `isBuiltin` INTEGER NOT NULL,
+    `enabled` INTEGER NOT NULL,
+    PRIMARY KEY(`tabId`)
+);
+
+-- 仪表盘卡片。只存「摆哪张、什么类型、绑哪个数据」，不存数据本身。
+--
+-- cardId 是实例 id，同一类型可以有多张，所以不能用 type 做主键。
+--
+-- 外键：父表是 dashboard_tab。页签的删除动作在业务层用事务显式写，
+-- 这里的约束是第二道防线——只删页签忘了删卡片时，插入孤儿行会直接失败，
+-- 而不是安静地留下一条永远不会被显示、也永远不会被清理的记录。
+--
+-- (tabId, type) 是**普通索引**不是唯一索引：v12 曾用唯一索引，
+-- 导致一个页签里只能有一张指标卡（「加了一张后再也加不了第二张」）。
+-- 想只对非指标卡唯一需要局部索引，但 Room 的 @Index 表达不了 WHERE 子句。
+-- 去重口径统一收到 com.lifeboard.server.dashboard.DashboardCards.isDuplicate。
+CREATE TABLE `dashboard_card` (
+    `cardId` TEXT NOT NULL,
+    `type` TEXT NOT NULL,
+    `sourceKey` TEXT,
+    `metricKey` TEXT,
+    `order` INTEGER NOT NULL,
+    `tabId` TEXT NOT NULL,
+    `configJson` TEXT,
+    `enabled` INTEGER NOT NULL,
+    PRIMARY KEY(`cardId`),
+    FOREIGN KEY(`tabId`) REFERENCES `dashboard_tab`(`tabId`) ON UPDATE NO ACTION ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS `index_dashboard_card_tabId` ON `dashboard_card` (`tabId`);
+CREATE INDEX IF NOT EXISTS `index_dashboard_card_tabId_type` ON `dashboard_card` (`tabId`, `type`);
+
+-- ============ 页签查询 ============
+
+observeAllTabs:
+SELECT * FROM `dashboard_tab` ORDER BY `order` ASC;
+
+selectAllTabs:
+SELECT * FROM `dashboard_tab` ORDER BY `order` ASC;
+
+selectTabById:
+SELECT * FROM `dashboard_tab` WHERE `tabId` = ?;
+
+countTabs:
+SELECT count(*) FROM `dashboard_tab`;
+
+insertTab:
+INSERT OR REPLACE INTO `dashboard_tab`(`tabId`, `name`, `order`, `isBuiltin`, `enabled`)
+VALUES (?, ?, ?, ?, ?);
+
+deleteTabById:
+DELETE FROM `dashboard_tab` WHERE `tabId` = ?;
+
+renameTab:
+UPDATE `dashboard_tab` SET `name` = ? WHERE `tabId` = ?;
+
+setTabOrder:
+UPDATE `dashboard_tab` SET `order` = ? WHERE `tabId` = ?;
+
+setTabEnabled:
+UPDATE `dashboard_tab` SET `enabled` = ? WHERE `tabId` = ?;
+
+-- ============ 卡片查询 ============
+
+observeCardsByTab:
+SELECT * FROM `dashboard_card` WHERE `tabId` = ? ORDER BY `order` ASC;
+
+selectCardsByTab:
+SELECT * FROM `dashboard_card` WHERE `tabId` = ? ORDER BY `order` ASC;
+
+selectCardById:
+SELECT * FROM `dashboard_card` WHERE `cardId` = ?;
+
+countCards:
+SELECT count(*) FROM `dashboard_card`;
+
+insertCard:
+INSERT OR REPLACE INTO `dashboard_card`(
+    `cardId`, `type`, `sourceKey`, `metricKey`, `order`, `tabId`, `configJson`, `enabled`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+
+-- IGNORE 语义：主键冲突时什么都不做，返回的 rowid 为 -1。
+-- 为什么不用 REPLACE：卡片 id 由调用方新造，重复插入若用覆盖语义，
+-- 只会悄悄替换掉一张已有的卡，用户完全不知道发生了什么。
+-- 注意 IGNORE 对**外键冲突不生效**：插进不存在的页签仍会抛异常。
+insertCardIgnore:
+INSERT OR IGNORE INTO `dashboard_card`(
+    `cardId`, `type`, `sourceKey`, `metricKey`, `order`, `tabId`, `configJson`, `enabled`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+
+deleteCardById:
+DELETE FROM `dashboard_card` WHERE `cardId` = ?;
+
+deleteCardsByTab:
+DELETE FROM `dashboard_card` WHERE `tabId` = ?;
+
+setCardOrder:
+UPDATE `dashboard_card` SET `order` = ? WHERE `cardId` = ?;
+
+setCardEnabled:
+UPDATE `dashboard_card` SET `enabled` = ? WHERE `cardId` = ?;
+
+moveCardToTab:
+UPDATE `dashboard_card` SET `tabId` = ? WHERE `cardId` = ?;

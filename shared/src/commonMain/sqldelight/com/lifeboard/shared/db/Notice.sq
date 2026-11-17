@@ -1,0 +1,150 @@
+-- 提醒触达日志，用于排查「到点没响」。
+CREATE TABLE `notification_log` (
+    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    `taskId` INTEGER NOT NULL,
+    `remindLevel` INTEGER NOT NULL,
+    `triggeredAt` INTEGER NOT NULL,
+    `delivered` INTEGER NOT NULL,
+    `note` TEXT NOT NULL,
+    `createdAt` INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS `index_notification_log_createdAt` ON `notification_log` (`createdAt`);
+
+-- 原始通知流水（M4 校准用）。
+--
+-- 记录目标应用的每一条通知原文，不管是否命中规则——
+-- 「飞书打卡到底发不发通知、文案是什么」只有实机能回答，
+-- 关键词校准必须有原始样本可看，而不是靠猜。
+CREATE TABLE `raw_notification` (
+    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    `packageName` TEXT NOT NULL,
+    `title` TEXT NOT NULL,
+    `text` TEXT NOT NULL,
+    `matchedSources` TEXT NOT NULL,
+    `postedAt` INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS `index_raw_notification_postedAt` ON `raw_notification` (`postedAt`);
+CREATE INDEX IF NOT EXISTS `index_raw_notification_packageName` ON `raw_notification` (`packageName`);
+
+-- 用户自建的识别规则。
+--
+-- 打卡成功的文案因应用、版本、企业而异，写死在代码里必然出现
+-- 「关键词对不上、数据悄悄为 0」。让用户自己选应用、填关键词、划时段才可持续。
+CREATE TABLE `capture_rule` (
+    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    `packageName` TEXT NOT NULL,
+    `sourceName` TEXT NOT NULL,
+    `bucketName` TEXT NOT NULL,
+    `includeKeywords` TEXT NOT NULL,
+    `excludeKeywords` TEXT NOT NULL,
+    `timeRegex` TEXT NOT NULL,
+    `windowStartMinute` INTEGER NOT NULL,
+    `windowEndMinute` INTEGER NOT NULL,
+    `dailyOnce` INTEGER NOT NULL,
+    `enabled` INTEGER NOT NULL,
+    `createdAt` INTEGER NOT NULL,
+    `windows` TEXT NOT NULL,
+    `startDate` TEXT NOT NULL,
+    `endDate` TEXT NOT NULL,
+    `repeatType` TEXT NOT NULL,
+    `weekdayMask` TEXT NOT NULL,
+    `anchorDay` INTEGER NOT NULL,
+    `anchorMonth` INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS `index_capture_rule_packageName` ON `capture_rule` (`packageName`);
+
+-- 用户自建的数据源。
+--
+-- 内置源是编译期枚举，覆盖不到「我想把某个应用的通知算成自己的一个维度」这类需求。
+-- 自建源没有采集器，数据只能由采集规则命中写入——
+-- 面板需要据此标注「仅规则计数」，否则用户看到 0 会以为采集坏了。
+CREATE TABLE `custom_source` (
+    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    `displayName` TEXT NOT NULL,
+    `bucket` TEXT NOT NULL,
+    `createdAt` INTEGER NOT NULL
+);
+
+-- ============ 规则查询 ============
+
+observeAllRules:
+SELECT * FROM `capture_rule` ORDER BY `createdAt` ASC;
+
+-- 采集热路径：只取启用的，避免每次事件都过滤全表
+selectEnabledRules:
+SELECT * FROM `capture_rule` WHERE `enabled` = 1 ORDER BY `createdAt` ASC;
+
+selectEnabledRulesByPackage:
+SELECT * FROM `capture_rule` WHERE `packageName` = ? AND `enabled` = 1;
+
+selectAllRules:
+SELECT * FROM `capture_rule` ORDER BY `createdAt` ASC;
+
+selectRuleById:
+SELECT * FROM `capture_rule` WHERE `id` = ?;
+
+-- REPLACE 语义，与 Room @Upsert 在 id 已存在时一致
+insertRule:
+INSERT OR REPLACE INTO `capture_rule`(
+    `id`, `packageName`, `sourceName`, `bucketName`, `includeKeywords`, `excludeKeywords`,
+    `timeRegex`, `windowStartMinute`, `windowEndMinute`, `dailyOnce`, `enabled`, `createdAt`,
+    `windows`, `startDate`, `endDate`, `repeatType`, `weekdayMask`, `anchorDay`, `anchorMonth`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+-- 新增规则（不带 id）。显式写 0 到 AUTOINCREMENT 主键会被存成 0 而非触发自增，
+-- 详见 Task.sq 的同名注释
+insertRuleAuto:
+INSERT OR REPLACE INTO `capture_rule`(
+    `packageName`, `sourceName`, `bucketName`, `includeKeywords`, `excludeKeywords`,
+    `timeRegex`, `windowStartMinute`, `windowEndMinute`, `dailyOnce`, `enabled`, `createdAt`,
+    `windows`, `startDate`, `endDate`, `repeatType`, `weekdayMask`, `anchorDay`, `anchorMonth`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+deleteRuleById:
+DELETE FROM `capture_rule` WHERE `id` = ?;
+
+countRulesBySource:
+SELECT count(*) FROM `capture_rule` WHERE `sourceName` = ?;
+
+-- ---- 自建源 ----
+
+observeAllCustomSources:
+SELECT * FROM `custom_source` ORDER BY `createdAt` ASC;
+
+selectAllCustomSources:
+SELECT * FROM `custom_source` ORDER BY `createdAt` ASC;
+
+selectCustomSourceById:
+SELECT * FROM `custom_source` WHERE `id` = ?;
+
+insertCustomSource:
+INSERT OR REPLACE INTO `custom_source`(`id`, `displayName`, `bucket`, `createdAt`)
+VALUES (?, ?, ?, ?);
+
+-- 新增自建源（不带 id），理由同 insertRuleAuto
+insertCustomSourceAuto:
+INSERT OR REPLACE INTO `custom_source`(`displayName`, `bucket`, `createdAt`)
+VALUES (?, ?, ?);
+
+deleteCustomSourceById:
+DELETE FROM `custom_source` WHERE `id` = ?;
+
+-- ---- 原始通知 ----
+
+insertRawNotification:
+INSERT INTO `raw_notification`(`packageName`, `title`, `text`, `matchedSources`, `postedAt`)
+VALUES (?, ?, ?, ?, ?);
+
+observeRecentRawNotifications:
+SELECT * FROM `raw_notification` ORDER BY `postedAt` DESC LIMIT ?;
+
+-- 只保留最近 N 条，聚合时顺手裁剪，防止无限膨胀
+trimRawNotifications:
+DELETE FROM `raw_notification`
+WHERE `id` NOT IN (SELECT `id` FROM `raw_notification` ORDER BY `postedAt` DESC LIMIT ?);
+
+clearRawNotifications:
+DELETE FROM `raw_notification`;

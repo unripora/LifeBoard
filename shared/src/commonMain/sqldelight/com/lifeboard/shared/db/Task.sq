@@ -1,0 +1,153 @@
+-- 任务配置表。字段与 com.lifeboard.core.model.TaskConfig 对应。
+--
+-- 时段相关字段有两套，不要合并：
+-- - windowStartMinute/windowEndMinute：旧版单时段，保留作为「默认时段」
+-- - windows/startDate/endDate/repeatType/weekdayMask/anchorDay/anchorMonth：
+--   新版多时段 + 日期范围 + 重复周期，判定统一走 com.lifeboard.core.schedule.ScheduleRule
+--
+-- 建表语句与 Room 导出的 18.json createSql 逐字等价：**不写任何列级 DEFAULT**。
+-- 迁移脚本里的 DEFAULT 只用于给已存在的表补 NOT NULL 列，不会固化进表定义。
+CREATE TABLE `task` (
+    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    `title` TEXT NOT NULL,
+    `sourceType` TEXT NOT NULL,
+    `metricBucket` TEXT NOT NULL,
+    `threshold` REAL NOT NULL,
+    `weight` REAL NOT NULL,
+    `remindLevel` INTEGER NOT NULL,
+    `windowStartMinute` INTEGER NOT NULL,
+    `windowEndMinute` INTEGER NOT NULL,
+    `enabled` INTEGER NOT NULL,
+    `windows` TEXT NOT NULL,
+    `startDate` TEXT NOT NULL,
+    `endDate` TEXT NOT NULL,
+    `repeatType` TEXT NOT NULL,
+    `weekdayMask` TEXT NOT NULL,
+    `anchorDay` INTEGER NOT NULL,
+    `anchorMonth` INTEGER NOT NULL,
+    `ruleId` INTEGER NOT NULL,
+    `timeSource` TEXT NOT NULL,
+    `doneRemindLevel` INTEGER NOT NULL,
+    `doneToastEnabled` INTEGER NOT NULL,
+    `windowOffsetMinutes` INTEGER NOT NULL
+);
+
+-- 每日完成记录。同一任务同一天只应有一条，故以 (taskId, date) 为主键。
+CREATE TABLE `daily_record` (
+    `taskId` INTEGER NOT NULL,
+    `date` TEXT NOT NULL,
+    `value` REAL NOT NULL,
+    `completed` INTEGER NOT NULL,
+    `score` REAL NOT NULL,
+    `origin` TEXT NOT NULL,
+    PRIMARY KEY(`taskId`, `date`)
+);
+
+CREATE INDEX IF NOT EXISTS `index_daily_record_date` ON `daily_record` (`date`);
+
+-- 连续打卡状态。
+CREATE TABLE `streak` (
+    `taskId` INTEGER NOT NULL,
+    `currentStreak` INTEGER NOT NULL,
+    `bestStreak` INTEGER NOT NULL,
+    `lastDate` TEXT,
+    PRIMARY KEY(`taskId`)
+);
+
+-- ============ 查询 ============
+
+selectAllTasks:
+SELECT * FROM `task` ORDER BY `id` ASC;
+
+observeAllTasks:
+SELECT * FROM `task` ORDER BY `id` ASC;
+
+selectEnabledTasks:
+SELECT * FROM `task` WHERE `enabled` = 1 ORDER BY `id` ASC;
+
+selectTaskById:
+SELECT * FROM `task` WHERE `id` = ?;
+
+-- 规则删除前用来拦截
+countTasksByRule:
+SELECT count(*) FROM `task` WHERE `ruleId` = ?;
+
+-- REPLACE 语义：传了已存在的 id 时整行替换，未显式赋值的列回到默认值。
+-- 与 Room 的 @Insert(onConflict = REPLACE) 等价。
+insertTask:
+INSERT OR REPLACE INTO `task`(
+    `id`, `title`, `sourceType`, `metricBucket`, `threshold`, `weight`, `remindLevel`,
+    `windowStartMinute`, `windowEndMinute`, `enabled`, `windows`, `startDate`, `endDate`,
+    `repeatType`, `weekdayMask`, `anchorDay`, `anchorMonth`, `ruleId`, `timeSource`,
+    `doneRemindLevel`, `doneToastEnabled`, `windowOffsetMinutes`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+-- 新增任务（不带 id）。
+--
+-- 为什么不复用 insertTask：把 0 显式写进 AUTOINCREMENT 主键，
+-- SQLite 会真的存成 0，而不是触发自增——于是 last_insert_rowid() 拿到 0，
+-- 表现为「新增成功但返回 id = 0」，后续操作全部指不到那一行。
+-- Room 的 @Insert 在 id = 0 时是**省略该列**，这里必须同样省略。
+insertTaskAuto:
+INSERT OR REPLACE INTO `task`(
+    `title`, `sourceType`, `metricBucket`, `threshold`, `weight`, `remindLevel`,
+    `windowStartMinute`, `windowEndMinute`, `enabled`, `windows`, `startDate`, `endDate`,
+    `repeatType`, `weekdayMask`, `anchorDay`, `anchorMonth`, `ruleId`, `timeSource`,
+    `doneRemindLevel`, `doneToastEnabled`, `windowOffsetMinutes`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+deleteTaskById:
+DELETE FROM `task` WHERE `id` = ?;
+
+-- ---- 每日记录 ----
+
+observeRecordsByDate:
+SELECT * FROM `daily_record` WHERE `date` = ?;
+
+selectRecordsByDate:
+SELECT * FROM `daily_record` WHERE `date` = ?;
+
+selectRecord:
+SELECT * FROM `daily_record` WHERE `taskId` = ? AND `date` = ?;
+
+selectRecordsInRange:
+SELECT * FROM `daily_record` WHERE `date` BETWEEN ? AND ? ORDER BY `date` ASC;
+
+-- 区间内按「日期 + 来源」分组计数。只给「手动打卡次数」这类图表用：
+-- origin 是写入语境而非记录属性，不该进日常读路径
+countRecordsByOrigin:
+SELECT `date`, `origin`, count(*) AS `total` FROM `daily_record`
+WHERE `date` BETWEEN ? AND ?
+GROUP BY `date`, `origin`;
+
+-- REPLACE 实现 upsert：主键是 (taskId, date)，同一天重复写就是覆盖
+insertRecord:
+INSERT OR REPLACE INTO `daily_record`(`taskId`, `date`, `value`, `completed`, `score`, `origin`)
+VALUES (?, ?, ?, ?, ?, ?);
+
+deleteRecordsByTask:
+DELETE FROM `daily_record` WHERE `taskId` = ?;
+
+-- ---- 连击 ----
+
+selectStreak:
+SELECT * FROM `streak` WHERE `taskId` = ?;
+
+observeAllStreaks:
+SELECT * FROM `streak`;
+
+selectAllStreaks:
+SELECT * FROM `streak`;
+
+insertStreak:
+INSERT OR REPLACE INTO `streak`(`taskId`, `currentStreak`, `bestStreak`, `lastDate`)
+VALUES (?, ?, ?, ?);
+
+deleteStreakByTask:
+DELETE FROM `streak` WHERE `taskId` = ?;
+
+-- 刚插入行的自增 id。REPLACE 在 id = 0 时由 SQLite 分配，这里取回来给调用方。
+-- 为什么不依赖 insert 的返回值：SQLDelight 的 insert 返回受影响行数，
+-- 而 REPLACE 命中冲突时受影响行数是 2（删 + 插），不是新 id
+selectLastInsertRowId:
+SELECT last_insert_rowid();

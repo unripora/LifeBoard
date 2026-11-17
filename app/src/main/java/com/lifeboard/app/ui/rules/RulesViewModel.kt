@@ -1,27 +1,19 @@
 package com.lifeboard.app.ui.rules
 
-import android.app.Application
-import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.lifeboard.plugin.api.MetricBucket
-import com.lifeboard.core.model.builtinRef
-import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.core.model.SourceType
+import com.lifeboard.core.model.builtinRef
 import com.lifeboard.core.schedule.RepeatType
 import com.lifeboard.core.schedule.ScheduleRule
 import com.lifeboard.core.schedule.TimeWindow
-import com.lifeboard.core.util.Dates
-import com.lifeboard.server.db.CaptureRuleEntity
-import com.lifeboard.server.db.CustomSourceEntity
-import com.lifeboard.server.db.LifeBoardDatabase
-import com.lifeboard.server.db.MetricEntity
+import com.lifeboard.plugin.api.MetricBucket
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.server.notice.CaptureRuleMatcher
-import com.lifeboard.server.notice.NoticeListenerService
-import com.lifeboard.server.notice.NoticeSourceStatus
-import com.lifeboard.server.notice.ScreenCaptureAccessibilityService
-import com.lifeboard.server.notice.toRuleSchedule
-import com.lifeboard.server.remind.RemindScheduler
-import com.lifeboard.server.source.SourceRegistry
+import com.lifeboard.shared.platform.RulesBackend
+import com.lifeboard.shared.repository.RuleStore
+import com.lifeboard.shared.repository.model.CaptureRuleRecord
+import com.lifeboard.shared.repository.model.CustomSourceRecord
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -31,7 +23,7 @@ import kotlinx.coroutines.withContext
 
 /** 规则列表页状态 */
 data class RulesUiState(
-    val rules: List<CaptureRuleEntity> = emptyList(),
+    val rules: List<CaptureRuleRecord> = emptyList(),
     val sources: List<SourceRef> = emptyList(),
     /** 源 key → 今日计数 */
     val counts: Map<String, Double> = emptyMap(),
@@ -47,22 +39,23 @@ data class RulesUiState(
  * 授权引导、原始流水、匹配测试留在调试页——那些是排查工具，
  * 混在正式功能页里会让界面越来越杂。
  */
-class RulesViewModel(app: Application) : AndroidViewModel(app) {
+class RulesViewModel(
+    private val ruleStore: RuleStore,
+    private val backend: RulesBackend,
+) : ViewModel() {
 
     private val _state = MutableStateFlow(RulesUiState())
     val state: StateFlow<RulesUiState> = _state.asStateFlow()
 
-    private val db get() = LifeBoardDatabase.get(getApplication())
-
     init {
         viewModelScope.launch {
-            db.captureRuleDao().observeAll().collect { list ->
+            ruleStore.observeRules().collect { list ->
                 _state.value = _state.value.copy(rules = list)
                 refreshCounts()
             }
         }
         viewModelScope.launch {
-            db.customSourceDao().observeAll().collect {
+            ruleStore.observeCustomSources().collect {
                 loadSources()
                 refreshCounts()
             }
@@ -77,16 +70,19 @@ class RulesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun refreshPermissions() {
-        val ctx = getApplication<Application>()
-        _state.value = _state.value.copy(
-            listenerEnabled = NoticeListenerService.isEnabled(ctx),
-            accessibilityEnabled = ScreenCaptureAccessibilityService.isEnabled(ctx),
-        )
+        viewModelScope.launch {
+            val listener = backend.isNotificationListenerEnabled()
+            val capture = backend.isCaptureServiceEnabled()
+            _state.value = _state.value.copy(
+                listenerEnabled = listener,
+                accessibilityEnabled = capture,
+            )
+        }
     }
 
     private fun loadSources() {
         viewModelScope.launch {
-            val list = withContext(Dispatchers.IO) { SourceRegistry.selectable(getApplication()) }
+            val list = backend.selectableSources()
             _state.value = _state.value.copy(sources = list)
         }
     }
@@ -94,59 +90,52 @@ class RulesViewModel(app: Application) : AndroidViewModel(app) {
     private fun refreshCounts() {
         viewModelScope.launch {
             val counts = withContext(Dispatchers.IO) {
-                val rules = db.captureRuleDao().getAll()
-                rules.map { it.sourceName to it.bucketName }.distinct().associate { (src, bucket) ->
-                    src to NoticeSourceStatus.todayCount(getApplication(), src, bucket)
-                }
+                ruleStore.getAllRules()
+                    .map { it.sourceName to it.bucketName }
+                    .distinct()
+                    .associate { (src, bucket) -> src to backend.todayCount(src, bucket) }
             }
             _state.value = _state.value.copy(counts = counts)
         }
     }
 
-    fun saveRule(rule: CaptureRuleEntity) {
+    fun saveRule(rule: CaptureRuleRecord) {
         viewModelScope.launch {
-            withContext(Dispatchers.IO) { db.captureRuleDao().upsert(rule) }
+            withContext(Dispatchers.IO) { ruleStore.saveRule(rule) }
             // 规则变了，无障碍服务订阅的包名要跟着变，否则新加的应用收不到事件
-            ScreenCaptureAccessibilityService.notifyRulesChanged()
-            runCatching { RemindScheduler.rescheduleAll(getApplication()) }
+            backend.notifyRulesChanged()
+            backend.rescheduleReminders()
             _state.value = _state.value.copy(message = "规则已保存")
         }
     }
 
     fun deleteRule(id: Long) {
         viewModelScope.launch {
-            val refs = withContext(Dispatchers.IO) { db.taskDao().countByRule(id) }
-            if (refs > 0) {
-                _state.value = _state.value.copy(
-                    message = "还有 $refs 个任务关联这条规则，先改掉它们再删",
-                )
+            val rule = withContext(Dispatchers.IO) { ruleStore.getRule(id) }
+            if (rule == null) {
+                _state.value = _state.value.copy(message = "规则已不存在")
                 return@launch
             }
-            withContext(Dispatchers.IO) { db.captureRuleDao().deleteById(id) }
-            ScreenCaptureAccessibilityService.notifyRulesChanged()
-            runCatching { RemindScheduler.rescheduleAll(getApplication()) }
+            withContext(Dispatchers.IO) { ruleStore.deleteRule(id) }
+            backend.notifyRulesChanged()
+            backend.rescheduleReminders()
             _state.value = _state.value.copy(message = "规则已删除")
         }
     }
 
-    fun toggleRule(rule: CaptureRuleEntity) {
+    fun toggleRule(rule: CaptureRuleRecord) {
         saveRule(rule.copy(enabled = !rule.enabled))
     }
 
     /** 清空某源今日计数，便于反复测试规则 */
     fun clearToday() {
         viewModelScope.launch {
-            val date = Dates.todayString()
             withContext(Dispatchers.IO) {
                 runCatching {
-                    db.captureRuleDao().getAll()
+                    ruleStore.getAllRules()
                         .map { it.sourceName to it.bucketName }
                         .distinct()
-                        .forEach { (source, bucket) ->
-                            db.metricDao().upsert(
-                                MetricEntity(sourceType = source, date = date, bucket = bucket, value = 0.0),
-                            )
-                        }
+                        .forEach { (source, bucket) -> backend.clearTodayCount(source, bucket) }
                 }
             }
             _state.value = _state.value.copy(message = "已清空今日计数")
@@ -164,8 +153,8 @@ class RulesViewModel(app: Application) : AndroidViewModel(app) {
         }
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
-                db.customSourceDao().upsert(
-                    CustomSourceEntity(displayName = trimmed, bucket = bucket.name),
+                ruleStore.saveCustomSource(
+                    CustomSourceRecord(displayName = trimmed, bucket = bucket.name),
                 )
             }
             _state.value = _state.value.copy(message = "已新建数据源「$trimmed」")
@@ -180,14 +169,14 @@ class RulesViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun deleteCustomSource(ref: SourceRef.Custom) {
         viewModelScope.launch {
-            val refs = withContext(Dispatchers.IO) { SourceRegistry.referenceCount(getApplication(), ref.key) }
+            val refs = withContext(Dispatchers.IO) { backend.referenceCount(ref.key) }
             if (refs > 0) {
                 _state.value = _state.value.copy(
                     message = "「${ref.displayName}」还有 $refs 条规则在用，先改掉它们再删",
                 )
                 return@launch
             }
-            withContext(Dispatchers.IO) { db.customSourceDao().deleteById(ref.id) }
+            withContext(Dispatchers.IO) { ruleStore.deleteCustomSource(ref.id) }
             _state.value = _state.value.copy(message = "已删除数据源「${ref.displayName}」")
         }
     }
@@ -235,10 +224,10 @@ data class RuleEditUiState(
         )
 }
 
-/** 草稿 → 实体 */
-fun RuleEditUiState.toEntity(): CaptureRuleEntity {
+/** 草稿 → 记录 */
+fun RuleEditUiState.toRecord(): CaptureRuleRecord {
     val first = windows.firstOrNull() ?: TimeWindow(0, 24 * 60)
-    return CaptureRuleEntity(
+    return CaptureRuleRecord(
         id = id,
         packageName = packageName,
         sourceName = source?.key.orEmpty(),
@@ -261,14 +250,15 @@ fun RuleEditUiState.toEntity(): CaptureRuleEntity {
     )
 }
 
-/** 规则实体 → 草稿（编辑已有规则时用） */
-fun buildEditState(rule: CaptureRuleEntity, resolved: SourceRef?): RuleEditUiState {
-    val schedule = rule.toRuleSchedule()
+/** 记录 → 草稿（编辑已有规则时用） */
+fun buildEditState(rule: CaptureRuleRecord, resolved: SourceRef?): RuleEditUiState {
+    val schedule = rule.schedule
     return RuleEditUiState(
         id = rule.id,
         packageName = rule.packageName,
         source = resolved,
-        bucket = MetricBucket.entries.firstOrNull { it.name == rule.bucketName } ?: MetricBucket.FLAG,
+        bucket = MetricBucket.entries.firstOrNull { it.name == rule.bucketName }
+            ?: MetricBucket.FLAG,
         includeKeywords = rule.includeKeywords,
         excludeKeywords = rule.excludeKeywords,
         timeRegex = rule.timeRegex,
@@ -285,7 +275,7 @@ fun buildEditState(rule: CaptureRuleEntity, resolved: SourceRef?): RuleEditUiSta
 }
 
 /** 供外部构造空规则时使用的默认数据源 */
-val defaultRuleSource: SourceRef get() = builtinRef(SourceType.FEISHU_ATTENDANCE)
+val defaultRuleSource: SourceRef get() = builtinRef(SourceType.MANUAL)
 
 /** 关键词拆分复用匹配引擎的实现，避免两处规则不一致 */
 fun splitRuleKeywords(raw: String): List<String> = CaptureRuleMatcher.splitKeywords(raw)

@@ -1,0 +1,65 @@
+-- 应用内日志。
+--
+-- 为什么要有这张表：排查插件、采集、调度问题时只靠 adb logcat 很不可靠——
+-- 日志缓冲随时被系统日志顶掉，进程被杀后更是什么都不剩，
+-- 「到底加载了没有、为什么没出数」在用户手机上无从查证。
+--
+-- 与 android.util.Log 是**并行**关系：Logcat 仍照常输出，
+-- 这里只是多一份可持久化、可检索的记录。
+CREATE TABLE `app_log` (
+    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    `level` TEXT NOT NULL,
+    `tag` TEXT NOT NULL,
+    `location` TEXT NOT NULL,
+    `message` TEXT NOT NULL,
+    `time` INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS `index_app_log_time` ON `app_log` (`time`);
+CREATE INDEX IF NOT EXISTS `index_app_log_level` ON `app_log` (`level`);
+
+-- ============ 应用日志 ============
+
+insertAppLog:
+INSERT INTO `app_log`(`level`, `tag`, `location`, `message`, `time`)
+VALUES (?, ?, ?, ?, ?);
+
+-- 最新在前。level 传空表示不按级别过滤；query 同时匹配 message 与 tag。
+-- 注意 LIKE 的通配符要拼在参数里而不是写死在 SQL 里，
+-- 否则 `:query` 为空串时 `%%` 会匹配全部，与「不按 query 过滤」等价但多一次全表扫描
+pageAppLogs:
+SELECT * FROM `app_log`
+WHERE (? = '' OR `level` = ?)
+  AND (? = '' OR `message` LIKE '%' || ? || '%' OR `tag` LIKE '%' || ? || '%')
+ORDER BY `id` DESC LIMIT ? OFFSET ?;
+
+latestAppLogs:
+SELECT * FROM `app_log` ORDER BY `id` DESC LIMIT ?;
+
+countAppLogs:
+SELECT count(*) FROM `app_log`;
+
+clearAppLogs:
+DELETE FROM `app_log`;
+
+-- 只保留最近 N 条，其余删掉
+trimAppLogs:
+DELETE FROM `app_log`
+WHERE `id` NOT IN (SELECT `id` FROM `app_log` ORDER BY `id` DESC LIMIT ?);
+
+-- ============ 提醒触达日志 ============
+
+-- 显式带 id 写入（id ≠ 0 时用）
+insertNotificationLog:
+INSERT OR REPLACE INTO `notification_log`(
+    `id`, `taskId`, `remindLevel`, `triggeredAt`, `delivered`, `note`, `createdAt`
+) VALUES (?, ?, ?, ?, ?, ?, ?);
+
+-- 不带 id 写入，让 AUTOINCREMENT 分配（显式传 0 会被真的存成 0）
+insertNotificationLogAuto:
+INSERT OR REPLACE INTO `notification_log`(
+    `taskId`, `remindLevel`, `triggeredAt`, `delivered`, `note`, `createdAt`
+) VALUES (?, ?, ?, ?, ?, ?);
+
+recentNotificationLogs:
+SELECT * FROM `notification_log` ORDER BY `triggeredAt` DESC LIMIT ?;

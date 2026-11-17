@@ -1,0 +1,45 @@
+{
+  "id": "com.lifeboard.plugin.mihealth",
+  "name": "小米运动健康",
+  "version": "1.3.1",
+  "versionCode": 23,
+  "apiVersion": 1,
+  "entry": "main.js",
+  "description": "从小米运动健康云端拉取步数、睡眠、心率、血氧、压力等指标",
+  "author": "LifeBoard",
+  "defaultTabName": "健康",
+
+  "metrics": [
+    { "metricKey": "STEPS", "bucket": "STEPS", "displayName": "步数" },
+    { "metricKey": "SLEEP_MINUTES", "bucket": "SLEEP_MINUTES", "displayName": "睡眠" },
+
+    { "metricKey": "OBS_HEART_RATE", "bucket": "COUNT", "displayName": "心率", "unit": "bpm" },
+    { "metricKey": "OBS_SPO2", "bucket": "COUNT", "displayName": "血氧", "unit": "%" },
+    { "metricKey": "OBS_STRESS", "bucket": "COUNT", "displayName": "压力", "unit": "" },
+    { "metricKey": "OBS_CALORIES", "bucket": "COUNT", "displayName": "热量", "unit": "kcal" },
+    { "metricKey": "OBS_DISTANCE", "bucket": "COUNT", "displayName": "距离", "unit": "米" },
+    { "metricKey": "OBS_STAND", "bucket": "COUNT", "displayName": "站立", "unit": "次" },
+    { "metricKey": "OBS_INTENSITY", "bucket": "COUNT", "displayName": "中高强度活动", "unit": "分钟" },
+    { "metricKey": "OBS_WEIGHT", "bucket": "COUNT", "displayName": "体重", "unit": "kg" },
+    { "metricKey": "OBS_VO2_MAX", "bucket": "COUNT", "displayName": "VO2Max", "unit": "ml/kg/min" },
+    { "metricKey": "OBS_PAI", "bucket": "COUNT", "displayName": "PAI", "unit": "" },
+    { "metricKey": "OBS_BLOOD_SYSTOLIC", "bucket": "COUNT", "displayName": "收缩压", "unit": "mmHg" },
+    { "metricKey": "OBS_BLOOD_DIASTOLIC", "bucket": "COUNT", "displayName": "舒张压", "unit": "mmHg" },
+    { "metricKey": "OBS_BLOOD_SUGAR", "bucket": "COUNT", "displayName": "血糖", "unit": "mmol/L" }
+  ],
+
+  "credentialSpec": [
+    {
+      "name": "account",
+      "displayName": "小米账号",
+      "required": true,
+      "secret": false
+    },
+    {
+      "name": "password",
+      "displayName": "密码",
+      "required": true,
+      "secret": true
+    }
+  ]
+}

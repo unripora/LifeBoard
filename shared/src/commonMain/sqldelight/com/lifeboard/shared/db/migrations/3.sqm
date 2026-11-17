@@ -1,0 +1,33 @@
+-- v3 -> v4：任务与规则都支持多时段 + 日期范围 + 重复周期；新增用户自建数据源。
+--
+-- 两处 ALTER 都带 DEFAULT：给已存在的表补 NOT NULL 列时，老行必须有值可填，
+-- 否则 ALTER 会直接失败。这里的 DEFAULT 只在迁移这一瞬起作用，
+-- 不会改变目标表结构（目标结构见各 .sq，那里不写任何 DEFAULT）。
+--
+-- 默认值语义：
+-- - `windows` 空串 = 沿用旧的 windowStart/End 单时段，老任务行为完全不变
+-- - `repeatType` 默认 DAILY，老任务本来就是每天
+-- - `weekdayMask` 空串 = 不按星期过滤
+-- - `anchorDay`/`anchorMonth` 默认 1，仅在每月/每年重复时才有意义
+ALTER TABLE `task` ADD COLUMN `windows` TEXT NOT NULL DEFAULT '';
+ALTER TABLE `task` ADD COLUMN `startDate` TEXT NOT NULL DEFAULT '';
+ALTER TABLE `task` ADD COLUMN `endDate` TEXT NOT NULL DEFAULT '';
+ALTER TABLE `task` ADD COLUMN `repeatType` TEXT NOT NULL DEFAULT 'DAILY';
+ALTER TABLE `task` ADD COLUMN `weekdayMask` TEXT NOT NULL DEFAULT '';
+ALTER TABLE `task` ADD COLUMN `anchorDay` INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE `task` ADD COLUMN `anchorMonth` INTEGER NOT NULL DEFAULT 1;
+
+ALTER TABLE `capture_rule` ADD COLUMN `windows` TEXT NOT NULL DEFAULT '';
+ALTER TABLE `capture_rule` ADD COLUMN `startDate` TEXT NOT NULL DEFAULT '';
+ALTER TABLE `capture_rule` ADD COLUMN `endDate` TEXT NOT NULL DEFAULT '';
+ALTER TABLE `capture_rule` ADD COLUMN `repeatType` TEXT NOT NULL DEFAULT 'DAILY';
+ALTER TABLE `capture_rule` ADD COLUMN `weekdayMask` TEXT NOT NULL DEFAULT '';
+ALTER TABLE `capture_rule` ADD COLUMN `anchorDay` INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE `capture_rule` ADD COLUMN `anchorMonth` INTEGER NOT NULL DEFAULT 1;
+
+CREATE TABLE IF NOT EXISTS `custom_source` (
+    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    `displayName` TEXT NOT NULL,
+    `bucket` TEXT NOT NULL,
+    `createdAt` INTEGER NOT NULL
+);

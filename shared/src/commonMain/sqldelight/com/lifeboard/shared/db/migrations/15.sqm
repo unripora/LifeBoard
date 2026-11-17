@@ -1,0 +1,16 @@
+-- v15 -> v16：新增 plugin_metric_query，记录「哪个指标被查过」。
+--
+-- 为什么要这张表：插件查了某指标但一条没拿到时，详情页要显示「暂无」。
+-- 光看 plugin_raw_record 分不清「没查过」和「查了但为空」——
+-- 两种情况下那张表都没有行。
+--
+-- 主键 (pluginId, date, metricKey)：同一天重复查询只留一行，不需要额外去重逻辑。
+CREATE TABLE IF NOT EXISTS `plugin_metric_query` (
+    `pluginId` TEXT NOT NULL,
+    `date` TEXT NOT NULL,
+    `metricKey` TEXT NOT NULL,
+    PRIMARY KEY(`pluginId`, `date`, `metricKey`)
+);
+
+CREATE INDEX IF NOT EXISTS `index_plugin_metric_query_pluginId_date`
+    ON `plugin_metric_query` (`pluginId`, `date`);

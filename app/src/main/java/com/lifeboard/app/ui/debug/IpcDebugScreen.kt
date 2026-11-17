@@ -99,13 +99,13 @@ fun IpcDebugScreen() {
     }
 }
 
-/** 主通道写入：直接经内容提供者插入一条当日阅读时长（用假源避免污染屏幕时长数据） */
+/** 主通道写入：直接经内容提供者插入一条当日屏幕使用时长 */
 private fun writeViaProvider(context: Context) {
     MetricWriter.write(
         context,
         LifeBoardContract.PATH_METRIC,
         ContentValues().apply {
-            put(LifeBoardContract.COL_SOURCE_TYPE, SourceType.LEGADO.name)
+            put(LifeBoardContract.COL_SOURCE_TYPE, SourceType.SCREEN_TIME.name)
             put(LifeBoardContract.COL_DATE, Dates.todayString())
             put(LifeBoardContract.COL_BUCKET, MetricBucket.DURATION_MINUTES.name)
             put(LifeBoardContract.COL_VALUE, 1.0)
