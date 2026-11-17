@@ -270,7 +270,9 @@ class DashboardViewModel(
                     configJson = chartConfig?.takeIf { type == CardType.CHART }
                         ?.let { ChartConfigCodec.encode(it) },
                 )
-                runCatching { store.insertCard(card) > 0 }.getOrDefault(false)
+                // insertCard 成功返回 0、被 IGNORE 挡住才返回 -1（见 DashboardStore 契约），
+                // 这里必须判 >= 0：写成 > 0 会把「已经落库」误报成失败
+                runCatching { store.insertCard(card) >= 0 }.getOrDefault(false)
             }
             onAdded(ok)
         }

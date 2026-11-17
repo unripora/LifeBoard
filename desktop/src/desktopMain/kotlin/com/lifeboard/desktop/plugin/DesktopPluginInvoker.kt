@@ -39,7 +39,17 @@ import java.time.LocalDate
 class DesktopPluginInvoker(
     private val repository: DesktopPluginRepository,
     private val metricStore: MetricStore,
-    private val collectRunner: suspend () -> Boolean,
+    /**
+     * 采一个插件。
+     *
+     * [collectRunner] 接的是宿主既有采集链路（桌面端为插件采集器 + 任务重判），
+     * 不是直接调插件的 `fetch`：后者会绕过量纲校验、去重与健康度更新。
+     *
+     * 入参是 pluginId 而不是空的：详情页点的是「同步这个插件」，
+     * 采全部插件既慢又会让结果失真——A 失败、B 成功时整体返回成功，
+     * 界面上看起来 A 也同步过了。
+     */
+    private val collectRunner: suspend (String) -> Boolean,
     private val hostContextFactory: (pluginId: String) -> HostPluginContext,
 ) : PluginInvoker {
 
@@ -136,7 +146,7 @@ class DesktopPluginInvoker(
 
         // 同上：取消要放行，不能收成 false 再报「同步未完成」
         val ok = try {
-            collectRunner()
+            collectRunner(pluginId)
         } catch (cancel: CancellationException) {
             throw cancel
         } catch (error: Throwable) {
@@ -221,7 +231,7 @@ class DesktopPluginInvoker(
     /**
      * 一次采集。
      *
-     * [collectRunner] 是宿主既有采集链路（桌面端为 `DesktopCollectionBackend`），
+     * [collectRunner] 是宿主既有采集链路（桌面端为插件采集器 + 任务重判），
      * 不是直接调插件的 `fetch`：后者会绕过量纲校验、去重与健康度更新。
      *
      * 链路只回一个布尔，分不清「没数据」与「失败」，所以成功后再比对一次
@@ -244,7 +254,7 @@ class DesktopPluginInvoker(
         // 再往上就变成「同步未完成，请检查网络」——用户切个页签就被告知网络有问题，
         // 排查方向完全错了。取消不是失败，让它按控制流正常向上传播。
         val ok = try {
-            collectRunner()
+            collectRunner(pluginId)
         } catch (cancel: CancellationException) {
             throw cancel
         } catch (error: Throwable) {

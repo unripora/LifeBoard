@@ -266,8 +266,10 @@ private object DesktopStartup {
 @Composable
 private fun DesktopRoot(deps: PlatformDependencies) {
     // 页签的增删改走与 Android 端同一个 ViewModel：它已经在 commonMain 里，
-    // 两端交的只是各自的 Store 与 Backend
-    val tabActions = rememberTabActions(deps)
+    // 两端交的只是各自的 Store 与 Backend。
+    // 同一个实例也用来提供「恢复默认页签」——页签被删空时那是唯一的自愈出口
+    val dashboardViewModel = remember(deps) { DashboardViewModel(deps.dashboardStore, deps.dashboard) }
+    val tabActions = rememberTabActions(dashboardViewModel)
 
     // 外观状态与日志 ViewModel 提到 App 之外：设置页是它们的唯一使用者，
     // 但要让「改配色 → 整个界面换色」与「离开设置页再回来日志还在」都成立，
@@ -322,6 +324,9 @@ private fun DesktopRoot(deps: PlatformDependencies) {
         tabActions = tabActions,
         onEditTask = { editingTaskId = it },
         onNewTask = { editingTaskId = 0L },
+        // 兜底页上的「恢复默认页签」：桌面端后端能力已有（DesktopDashboardBackend.ensureDefaults），
+        // 之前传空实现，用户删光页签后就只剩删库一条路
+        onRestoreDefaults = dashboardViewModel::restoreDefaults,
         pageContent = { route, host ->
             when (val slot = catalog.render(route.orEmpty())) {
                 is PageSlot.Resolved -> slot.route.Content(host)
@@ -492,10 +497,12 @@ private fun rememberTabLayout(store: DashboardStore): Flow<TabLayout> = remember
  * 这里没用 `viewModel { }`：桌面端没有 Activity 级的 `ViewModelStoreOwner`，
  * 硬造一个反而要为退出清理负责。改用 `remember` + 一个跟随窗口生命周期的
  * 协程作用域承载，语义更直白——窗口关了就一起结束。
+ *
+ * [vm] 由调用方持有：同一实例还要供「恢复默认页签」使用，
+ * 在这里再 new 一个会让两处操作各自持有一份状态。
  */
 @Composable
-private fun rememberTabActions(deps: PlatformDependencies): TabActions {
-    val vm = remember(deps) { DashboardViewModel(deps.dashboardStore, deps.dashboard) }
+private fun rememberTabActions(vm: DashboardViewModel): TabActions {
     return remember(vm) {
         object : TabActions {
             override fun create(name: String, onCreated: (String) -> Unit) =

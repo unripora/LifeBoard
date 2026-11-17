@@ -205,10 +205,33 @@ fun DashboardHost(
     // 任务列表弹窗：与页签管理一样是纯界面状态，不必提到调用方
     var showTaskList by remember { mutableStateOf(false) }
 
-    // 页签表读完了但一个页签都没有——只可能是用户全删了。
-    // 必须与「还没读完」区分开，后者要给默认布局让路。
+    // 一个可见页签都没有。分两种情况：页签表真的空了（用户全删了），
+    // 和页签还在、只是都被关掉了。后者不能走「恢复默认页签」——
+    // ensureDefaults 只在页签表为空时才写库，点了不会有任何反应，
+    // 用户会被困在这张兜底页里出不来。
     if (layout.ready && items.isEmpty()) {
-        EmptyTabs(onRestore = onRestoreDefaults)
+        if (allItems.isEmpty()) {
+            EmptyTabs(
+                title = "页签列表为空",
+                message = "可能是数据被清空了。恢复默认页签不会删除已有任务与记录。",
+                actionLabel = "恢复默认页签",
+                onRestore = onRestoreDefaults,
+            )
+        } else {
+            EmptyTabs(
+                title = "所有页签都已关闭",
+                message = "页签还在，只是都被关掉了。点下面可以重新打开。",
+                actionLabel = "重新打开页签",
+                onRestore = {
+                    val actions = tabActions
+                    if (actions != null) {
+                        allItems.forEach { actions.setEnabled(it.tabId, true) }
+                    } else {
+                        onRestoreDefaults()
+                    }
+                },
+            )
+        }
         return
     }
 
@@ -426,27 +449,32 @@ fun MissingPageNotice(route: String) {
     }
 }
 
-/** 页签表为空的兜底页。这不是「加载中」，是「数据真的没了」，所以要给恢复入口 */
+/** 页签兜底页：页签表为空（数据没了）和页签全被关掉，共用这一张，文案与按钮由调用方给 */
 @Composable
-private fun EmptyTabs(onRestore: () -> Unit) {
+private fun EmptyTabs(
+    title: String,
+    message: String,
+    actionLabel: String,
+    onRestore: () -> Unit,
+) {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(
-                "页签列表为空",
+                title,
                 style = MaterialTheme.typography.titleMedium,
                 textAlign = TextAlign.Center,
             )
             Text(
-                "可能是数据被清空了。恢复默认页签不会删除已有任务与记录。",
+                message,
                 style = MaterialTheme.typography.bodySmall,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.padding(horizontal = 32.dp),
             )
             Spacer(Modifier.height(4.dp))
-            TextButton(onClick = onRestore) { Text("恢复默认页签") }
+            TextButton(onClick = onRestore) { Text(actionLabel) }
         }
     }
 }
