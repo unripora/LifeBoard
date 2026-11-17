@@ -38,6 +38,8 @@ import kotlinx.coroutines.flow.Flow
  *   页签管理弹窗也打不开（M3-3.2c 之前的桌面端就是这样）
  * @param onEditTask 打开任务编辑器
  * @param onNewTask 新建任务
+ * @param onRestoreDefaults 页签表被删空时兜底页上的「恢复默认页签」。
+ *   默认空实现只在真正没有该能力的端上才可接受——点了没反应等于把用户困在兜底页
  * @param pageContent 画页面内容
  * @param shortcutHandler 把按键翻译成 [Shortcut]。桌面端提供真实映射；
  *   Android 没有物理键盘，用默认的空实现
@@ -52,6 +54,7 @@ fun App(
     tabActions: TabActions? = null,
     onEditTask: (Long) -> Unit = {},
     onNewTask: () -> Unit = {},
+    onRestoreDefaults: () -> Unit = {},
     shortcutHandler: (KeyEvent) -> Shortcut? = { null },
     showTaskIndicator: Boolean = false,
 ) {
@@ -83,9 +86,9 @@ fun App(
                     pageContent = pageContent,
                     onEditTask = onEditTask,
                     onNewTask = onNewTask,
-                    // 桌面端还没有「恢复默认页签」的后端方法，先给空实现：
-                    // 那个入口只在页签表空掉时才出现，正常路径下不会碰到
-                    onRestoreDefaults = {},
+                    // 恢复默认页签：桌面端已具备后端能力（DashboardViewModel.restoreDefaults），
+                    // 由各端入口透传；只在这些页签真的被删空时才会被点到
+                    onRestoreDefaults = onRestoreDefaults,
                     tabActions = tabActions,
                     onShortcut = { shortcutSink = it },
                     // 由调用方决定：Android 在自己 TopAppBar 里已经画了一颗，

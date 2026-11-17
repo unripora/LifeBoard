@@ -236,7 +236,8 @@ object DesktopPlatformDependencies {
         DesktopPluginInvoker(
             repository = pluginRepository,
             metricStore = stores.metricStore,
-            collectRunner = { collectAllPlugins() },
+            // 传单个插件：详情页「立即同步」与插件自己触发的同步都只针对自己
+            collectRunner = { pluginId -> collectPlugin(pluginId) },
             hostContextFactory = { pluginId ->
                 HostPluginContext(
                     pluginId = pluginId,
@@ -293,6 +294,25 @@ object DesktopPlatformDependencies {
                             )
                         }
                 }
+
+            /**
+             * 任务保存后重排提醒。
+             *
+             * 基类默认是空实现，那是「桌面端没有系统闹钟」时期的占位。
+             * 现在桌面端的提醒由进程内定时器承载，任务改了时段/档位却不重排，
+             * 表现就是「改了提醒时间还是按老时间响」——而且不会报错。
+             *
+             * 整个重排而不是只排这一条，与 Android 端保持同一套语义：
+             * 修改可能涉及时段与重复规则，单条重排会在跨任务的时间冲突上算错。
+             */
+            override suspend fun onTaskSaved(taskId: Long) {
+                remindBackendInternal.rescheduleAll()
+            }
+
+            /** 任务删除后撤销它的定时器与未完成通知 */
+            override suspend fun onTaskDeleted(taskId: Long) {
+                remindBackendInternal.cancelTask(taskId)
+            }
         },
         // 布局存储与面板数据同源，必须取同一个 stores 实例
         dashboardStore = stores.dashboardStore,
@@ -387,9 +407,14 @@ object DesktopPlatformDependencies {
      * 与库文件同根，`~/.lifeboard/plugins/<id>/`。每个插件一个目录，
      * 卸载时只删包不删它——用户可能只是想重装，数据还在就有意义。
      */
-    private fun pluginDataDir(pluginId: String): File =
-        File(System.getProperty("user.home"), ".lifeboard/plugins/$pluginId")
+    private fun pluginDataDir(pluginId: String): File {
+        // pluginId 最终会拼进路径。打包层若被塞了 "../"，这里就要写到插件目录之外去。
+        // 共享层构造 HostPluginContext 时也会校验，但那是下游；目录在更早的
+        // 上下文构建里就被用到，早一步拦住代价更低
+        require(HostPluginContext.isSafePluginId(pluginId)) { "非法 pluginId：$pluginId" }
+        return File(System.getProperty("user.home"), ".lifeboard/plugins/$pluginId")
             .apply { mkdirs() }
+    }
 
     /** 某插件的凭据存储。共享的 `CredentialVault` 按 pluginId 分槽，这里不需要再分文件 */
     private fun credentialsStore(pluginId: String): com.lifeboard.plugin.api.CredentialStore =
@@ -402,8 +427,14 @@ object DesktopPlatformDependencies {
      * 界面上看起来「同步了但没变化」。判定失败不影响采集结论的返回——
      * 数据已经落库是事实，判定只是派生结果，下次刷新还会再算。
      */
-    private suspend fun collectAllPlugins(): Boolean {
-        val collected = pluginCollector.collectAll()
+    private suspend fun collectAllPlugins(): Boolean =
+        finishCollection(pluginCollector.collectAll())
+
+    /** 只采一个插件（详情页「立即同步」），同样要重判任务 */
+    private suspend fun collectPlugin(pluginId: String): Boolean =
+        finishCollection(pluginCollector.collectOne(pluginId))
+
+    private suspend fun finishCollection(collected: Boolean): Boolean {
         runCatching {
             ConditionEvaluator(stores.taskStore, stores.metricStore)
                 .evaluateAll(Dates.todayString(), persist = true)

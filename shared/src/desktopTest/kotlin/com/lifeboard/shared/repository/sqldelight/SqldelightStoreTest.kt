@@ -281,6 +281,20 @@ class SqldelightStoreTest {
     }
 
     @Test
+    fun insertCard成功返回0() = runBlocking {
+        val store = SqldelightDashboardStore(open())
+        store.saveTab(DashboardTab(tabId = "t1", name = "面板", order = 0))
+
+        // 契约：成功返回 0，被 IGNORE 挡住才返回 -1。
+        // ViewModel 用 >= 0 判成功，这里把返回值钉死，防止有人把成功改成别的正数
+        val result = store.insertCard(
+            DashboardCard(cardId = "c1", type = "TODO", order = 0, tabId = "t1"),
+        )
+        assertEquals(0L, result, "首次插入应返回 0")
+        assertEquals(1, store.countCards())
+    }
+
+    @Test
     fun insertCard用IGNORE不覆盖已有卡() = runBlocking {
         val store = SqldelightDashboardStore(open())
         store.saveTab(DashboardTab(tabId = "t1", name = "面板", order = 0))

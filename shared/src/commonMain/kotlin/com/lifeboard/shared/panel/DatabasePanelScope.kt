@@ -20,10 +20,11 @@ import kotlinx.coroutines.withContext
  *
  * 所以这里只实现「数据」这一半，把「插件」与「副作用」留给子类覆盖：
  *
- * - [pluginMetrics] 默认返回空表。桌面端没有插件运行时，空表就是正确结果；
- * - [onTaskSaved] / [onTaskDeleted] 默认什么都不做。桌面端没有系统闹钟。
+ * - [pluginMetrics] 默认返回空表；
+ * - [onTaskSaved] / [onTaskDeleted] 默认什么都不做。
  *
- * Android 用 `AndroidPanelScope`，桌面可以直接用这个类。
+ * Android 用 `AndroidPanelScope`，桌面端用自己的匿名子类：插件指标查本地注册表，
+ * 任务变更后重排或撤销系统提醒——两端的差异都收在这两个覆盖里。
  *
  * ## 为什么不把三件事都做成构造参数
  *
@@ -57,10 +58,10 @@ open class DatabasePanelScope(
         }
     }
 
-    /** 插件指标。默认空表——桌面端没有插件运行时 */
+    /** 插件指标。默认空表——有插件运行时的一端在子类里覆盖 */
     override suspend fun pluginMetrics(): Map<String, PluginMetricSet> = emptyMap()
 
-    /** 任务保存后的平台联动。默认空——桌面端没有系统闹钟 */
+    /** 任务保存后的平台联动。默认空——有提醒能力的一端在子类里覆盖 */
     override suspend fun onTaskSaved(taskId: Long) = Unit
 
     /** 任务删除后的平台清理。默认空 */

@@ -174,8 +174,14 @@ actual class PluginJsonArray actual constructor() {
     actual fun optJSONArray(index: Int): PluginJsonArray? =
         (list.getOrNull(index) as? JsonArray)?.let { PluginJsonArray(it, Unit) }
 
-    actual fun optStringOrNull(index: Int): String? =
-        (list.getOrNull(index) as? JsonPrimitive)?.content
+    // 只有 JSON 字符串才算字符串。这里不能只看 JsonPrimitive：
+    // JsonNull 也是 JsonPrimitive（content 是 "null"），数字/布尔也有 content，
+    // 早期写法会把 null 读成 "null"、把 123 读成 "123"，与 Android 侧
+    // `opt(index) as? String` 以及本类的契约都不一致
+    actual fun optStringOrNull(index: Int): String? {
+        val primitive = list.getOrNull(index) as? JsonPrimitive ?: return null
+        return if (primitive.isString) primitive.content else null
+    }
 
     actual fun optDouble(index: Int, fallback: Double): Double {
         val primitive = list.getOrNull(index) as? JsonPrimitive ?: return fallback

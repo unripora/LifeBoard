@@ -67,6 +67,18 @@ class DesktopPluginCollector(
         anySucceeded
     }
 
+    /**
+     * 只采指定插件。找不到或未信任时返回 false。
+     *
+     * 详情页的「立即同步」用这个：采全部插件会把「别的插件成功」
+     * 当成「这个插件也同步好了」。
+     */
+    suspend fun collectOne(pluginId: String): Boolean = withContext(Dispatchers.IO) {
+        val entry = repository.plugins().firstOrNull { it.pluginId == pluginId && it.trusted }
+            ?: return@withContext false
+        collectOne(entry)
+    }
+
     /** 采集单个插件。返回它是否「成功」（含明确无数据） */
     suspend fun collectOne(entry: LoadedEntry): Boolean = withContext(Dispatchers.IO) {
         // 需要登录但没登录：不跑插件，只记一条健康度。
@@ -199,8 +211,10 @@ class DesktopPluginCollector(
     )
 
     /** 插件私有数据目录，与 `DesktopPlatformDependencies` 里保持一致 */
-    private fun pluginDataDir(pluginId: String): String =
-        java.io.File(System.getProperty("user.home"), ".lifeboard/plugins/$pluginId")
+    private fun pluginDataDir(pluginId: String): String {
+        require(HostPluginContext.isSafePluginId(pluginId)) { "非法 pluginId：$pluginId" }
+        return java.io.File(System.getProperty("user.home"), ".lifeboard/plugins/$pluginId")
             .apply { mkdirs() }
             .absolutePath
+    }
 }
