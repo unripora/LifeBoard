@@ -50,6 +50,18 @@ actual class PluginJsonObject internal constructor(internal val delegate: JSONOb
         delegate.put(key, value)
     }
 
+    actual fun put(key: String, value: Int) {
+        delegate.put(key, value)
+    }
+
+    actual fun put(key: String, value: Double) {
+        delegate.put(key, value)
+    }
+
+    actual fun put(key: String, value: Boolean) {
+        delegate.put(key, value)
+    }
+
     actual fun put(key: String, value: PluginJsonObject) {
         delegate.put(key, value.delegate)
     }
@@ -111,6 +123,18 @@ actual class PluginJsonArray internal constructor(internal val delegate: JSONArr
     }
 
     actual fun put(value: String) {
+        delegate.put(value)
+    }
+
+    actual fun put(value: Double) {
+        delegate.put(value)
+    }
+
+    actual fun put(value: Int) {
+        delegate.put(value)
+    }
+
+    actual fun put(value: Boolean) {
         delegate.put(value)
     }
 

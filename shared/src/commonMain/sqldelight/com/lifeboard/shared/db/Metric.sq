@@ -9,6 +9,28 @@ CREATE TABLE `metric` (
 
 CREATE INDEX IF NOT EXISTS `index_metric_date` ON `metric` (`date`);
 
+-- 插件指标的元数据（每源一条）。
+--
+-- 插件的指标是运行时装配的，宿主编译期不知道有哪些，此前这份元数据
+-- （MetricSpec 的 displayName / bucket / unit）只活在内存里，一重启就丢，
+-- 读取侧只能靠 key 猜：displayName 拼成 "<pluginId>·STEPS"，
+-- bucket 反解不出就退化成 COUNT，心率被标成「次」。
+--
+-- 与 `metric` 分表的理由见 migrations/18.sqm：不碰已有主键、不迁移历史行，
+-- 且 meta 是低频数据，混进按天增长的 metric 只会重复膨胀。
+CREATE TABLE `metric_meta` (
+    `sourceType` TEXT NOT NULL,
+    `pluginId` TEXT NOT NULL,
+    `metricKey` TEXT NOT NULL,
+    `displayName` TEXT NOT NULL,
+    `unit` TEXT NOT NULL,
+    `bucket` TEXT NOT NULL,
+    `updatedAt` INTEGER NOT NULL,
+    PRIMARY KEY(`sourceType`)
+);
+
+CREATE INDEX IF NOT EXISTS `index_metric_meta_pluginId` ON `metric_meta` (`pluginId`);
+
 -- 数据源健康度表，面板据此提示断源降级。
 CREATE TABLE `source_health` (
     `sourceType` TEXT NOT NULL,
@@ -61,6 +83,30 @@ INSERT OR REPLACE INTO `metric`(`sourceType`, `date`, `bucket`, `value`) VALUES 
 
 deleteMetricsBySource:
 DELETE FROM `metric` WHERE `sourceType` = ?;
+
+-- ---- 插件指标元数据 ----
+
+selectMetricMeta:
+SELECT * FROM `metric_meta` WHERE `sourceType` = ?;
+
+-- 一次取一组源，避免读取侧逐条查库（面板每帧都可能重建卡片列表）
+selectMetricMetaIn:
+SELECT * FROM `metric_meta` WHERE `sourceType` IN ?;
+
+selectMetricMetaByPlugin:
+SELECT * FROM `metric_meta` WHERE `pluginId` = ? ORDER BY `metricKey` ASC;
+
+-- REPLACE 而不是 INSERT：插件重装或指标改名时同名源要直接覆盖。
+-- 用 INSERT 会在主键冲突时抛异常，表现为「插件升级后采集直接报错」
+insertMetricMeta:
+INSERT OR REPLACE INTO `metric_meta`(
+    `sourceType`, `pluginId`, `metricKey`, `displayName`, `unit`, `bucket`, `updatedAt`
+) VALUES (?, ?, ?, ?, ?, ?, ?);
+
+-- 插件卸载时按 pluginId 清干净；只删 meta，不动 metric 里的历史值，
+-- 因为用户可能只是想重装插件，历史数据不该跟着消失
+deleteMetricMetaByPlugin:
+DELETE FROM `metric_meta` WHERE `pluginId` = ?;
 
 -- ---- 数据源健康度 ----
 

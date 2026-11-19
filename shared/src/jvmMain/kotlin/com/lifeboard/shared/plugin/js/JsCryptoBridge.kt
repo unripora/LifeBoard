@@ -26,14 +26,7 @@ import java.security.MessageDigest
  */
 class JsCryptoBridge : HostFunctionDispatcher {
 
-    fun functionNames(): List<String> = listOf(
-        "ctx.crypto.md5Hex",
-        "ctx.crypto.sha1Base64",
-        "ctx.crypto.sha256Base64",
-        "ctx.crypto.sha256Hex",
-        "ctx.codec.base64Encode",
-        "ctx.codec.base64Decode",
-    )
+    fun functionNames(): List<String> = JsHostFunctions.CRYPTO
 
     override fun invoke(name: String, argsJson: String): String {
         val args = runCatching { PluginJsonArray(argsJson) }.getOrElse { return error("参数不是数组") }

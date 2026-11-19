@@ -20,12 +20,12 @@ import kotlin.test.assertTrue
  *
  * ## 比什么
  *
- * - 表：16 张，一个不多一个不少
+ * - 表：17 张（18.json 的 16 张 + 18.sqm 新增的 metric_meta），一个不多一个不少
  * - 列：名字、声明类型、NOT NULL、主键序号——顺序也要一致（v18 的列序是固定的）
- * - 索引：14 个，名字与唯一性
+ * - 索引：15 个，名字与唯一性
  * - 外键：1 个，指向 dashboard_tab.tabId 且 ON DELETE CASCADE
  *
- * 期望值全部从 `18.json` 抄来，改动 schema 时必须同步改这里——
+ * 期望值从 `18.json` 抄来，此后每个新的 .sqm 都要同步追加到这里——
  * 这正是本测试存在的意义：让「结构漂移」无法悄悄发生。
  */
 class SchemaMatchesRoomV18Test {
@@ -50,12 +50,13 @@ class SchemaMatchesRoomV18Test {
         assertEquals(
             listOf(
                 "app_log", "app_usage", "capture_rule", "custom_source", "daily_record",
-                "dashboard_card", "dashboard_tab", "metric", "notification_log",
+                "dashboard_card", "dashboard_tab", "metric", "metric_meta",
+                "notification_log",
                 "plugin_credential", "plugin_metric_query", "plugin_raw_record",
                 "raw_notification", "source_health", "streak", "task",
             ),
             tables,
-            "表清单必须与 18.json 一致",
+            "表清单必须与 18.json 加上 18.sqm 的 metric_meta 一致",
         )
     }
 
@@ -82,6 +83,7 @@ class SchemaMatchesRoomV18Test {
                 "index_dashboard_card_tabId",
                 "index_dashboard_card_tabId_type",
                 "index_metric_date",
+                "index_metric_meta_pluginId",
                 "index_notification_log_createdAt",
                 "index_plugin_credential_pluginId",
                 "index_plugin_metric_query_pluginId_date",
@@ -91,7 +93,7 @@ class SchemaMatchesRoomV18Test {
                 "index_raw_notification_postedAt",
             ),
             actual,
-            "索引清单必须与 18.json 一致（14 个）",
+            "索引清单必须与 18.json 加上 18.sqm 的 index_metric_meta_pluginId 一致（15 个）",
         )
     }
 
@@ -264,5 +266,11 @@ private val V18_COLUMNS: Map<String, List<String>> = mapOf(
     ),
     "plugin_metric_query" to listOf(
         "pluginId|TEXT|NN PK1", "date|TEXT|NN PK2", "metricKey|TEXT|NN PK3",
+    ),
+    // 18.sqm 新增。全部 NOT NULL：元数据缺任何一项都没法正确展示，
+    // 允许为空只会把问题推迟到读取侧，变成又一处「查不到就猜」
+    "metric_meta" to listOf(
+        "sourceType|TEXT|NN PK1", "pluginId|TEXT|NN", "metricKey|TEXT|NN",
+        "displayName|TEXT|NN", "unit|TEXT|NN", "bucket|TEXT|NN", "updatedAt|INTEGER|NN",
     ),
 )

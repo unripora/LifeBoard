@@ -1,8 +1,10 @@
-// 小米健康 JS 插件 —— HTTP 与小米加密协议
+// 小米健康 JS 插件 —— 小米加密协议
 //
 // 这一层的职责边界：
-// - client.js 管 cookie 存储与请求发出（宿主 ctx.http 只是运输层）
+// - client.ts 管 cookie 存储与请求发出（宿主 ctx.http 只是运输层）
 // - 本文件不管业务语义，只负责「把参数按小米要求签名后发出去」
+
+/// <reference path="../types/index.d.ts" />
 
 import {
     absoluteUrl,
@@ -25,9 +27,19 @@ export const SDK_VERSION = 'accountsdk-18.8.15';
 
 const JSON_PREFIX = '&&&START&&&';
 
+/** 签名参数表。值允许 null / undefined，签名的第一步会把它们剔掉。 */
+export type SignParams = Record<string, string | number | null | undefined>;
+
+export interface SignedQuery {
+    /** 可直接拼到 URL 后面、形如 `a=..&signature=..&_nonce=..` 的 query 串 */
+    query: string;
+    /** 本次使用的 nonce，解密响应时要用同一个 */
+    nonce: string;
+}
+
 // ---------- Cookie ----------
 //
-// cookie 由 client.js 自己管理（见其中的 jar），不经宿主 CookieJar。
+// cookie 由 client.ts 自己管理（见其中的 jar），不经宿主 CookieJar。
 // 早期手写版本确实因为 OkHttp 在自动重定向时剔除 Cookie 头而丢过会话，
 // 但根因是「让宿主替我们跟跳转」。现在跳转也由插件自己逐跳发起，
 // 每一跳的 Set-Cookie 当场收下、下一跳按域重新拼，不再有这个缺口。
@@ -40,7 +52,7 @@ const JSON_PREFIX = '&&&START&&&';
 //   3. 排序集合是 params ∪ {rc4_hash__}，按 key 升序
 //   4. RC4 必须 drop 1024，且同一状态对象连续加密
 
-export function nonce() {
+export function nonce(): string {
     // 8 随机字节 + int32BE(分钟级时间戳)，共 12 字节
     const bytes = randomBytes(8);
     const minutes = Math.floor(Date.now() / 60000);
@@ -51,14 +63,14 @@ export function nonce() {
     return b64encode(bytes);
 }
 
-export function sessionKey(ssecurity, nonceValue) {
+export function sessionKey(ssecurity: string, nonceValue: string): string {
     const a = b64decode(ssecurity);
     const b = b64decode(nonceValue);
     return sha256BytesBase64(a.concat(b));
 }
 
 /** 取纯 path，去掉 scheme/host/query */
-function pathOf(url) {
+function pathOf(url: string): string {
     if (url.indexOf('://') >= 0) {
         const afterScheme = url.slice(url.indexOf('://') + 3);
         const slash = afterScheme.indexOf('/');
@@ -71,9 +83,14 @@ function pathOf(url) {
 /**
  * 对参数签名。
  *
- * @return 形如 `a=..&b=..&signature=..&_nonce=..` 的 query 串（已是可拼接形态）
+ * @returns 形如 `a=..&b=..&signature=..&_nonce=..` 的 query 串（已是可拼接形态）
  */
-export function signQuery(method, url, params, ssecurity) {
+export function signQuery(
+    method: string,
+    url: string,
+    params: SignParams,
+    ssecurity: string,
+): SignedQuery {
     const p = pathOf(url);
     const upper = method.toUpperCase();
     // nonce 必须只生成一次：sessionKey 用它算，_nonce 要把它作为明文原样带上。
@@ -82,7 +99,7 @@ export function signQuery(method, url, params, ssecurity) {
     const skey = sessionKey(ssecurity, nonceValue);
 
     // 步骤 A：明文表（value 非空白的项）
-    const plain = {};
+    const plain: Record<string, string> = {};
     Object.keys(params).forEach((k) => {
         const v = params[k];
         if (v == null) return;
@@ -110,7 +127,7 @@ export function signQuery(method, url, params, ssecurity) {
     // 步骤 C：按 key 升序，用同一 RC4 状态连续加密
     const allKeys = Object.keys(plain).sort();
     const stream = rc4(b64decode(skey));
-    const encrypted = {};
+    const encrypted: Record<string, string> = {};
     allKeys.forEach((k) => {
         encrypted[k] = b64encode(stream(utf8Bytes(plain[k])));
     });
@@ -134,7 +151,7 @@ export function signQuery(method, url, params, ssecurity) {
 }
 
 /** 解密响应体：rc4(b64dec(sessionKey), b64dec(body)) 再按 UTF-8 解码 */
-export function decryptBody(ssecurity, nonceValue, bodyB64) {
+export function decryptBody(ssecurity: string, nonceValue: string, bodyB64: string): string {
     const key = b64decode(sessionKey(ssecurity, nonceValue));
     const data = b64decode(bodyB64);
     const out = rc4(key)(data);
@@ -143,12 +160,12 @@ export function decryptBody(ssecurity, nonceValue, bodyB64) {
 
 // ---------- UTF-8 解码 ----------
 
-export function utf8Decode(bytes) {
+export function utf8Decode(bytes: number[]): string {
     let out = '';
     let i = 0;
     while (i < bytes.length) {
         const b0 = bytes[i++] & 0xff;
-        let cp;
+        let cp: number;
         if (b0 < 0x80) {
             cp = b0;
         } else if (b0 < 0xe0) {
@@ -169,8 +186,14 @@ export function utf8Decode(bytes) {
 
 // ---------- 响应解析 ----------
 
-/** 剥掉 `&&&START&&&` 前缀后 JSON.parse */
-export function parseMiapi(body) {
+/**
+ * 剥掉 `&&&START&&&` 前缀后 JSON.parse。
+ *
+ * 响应体是外部数据结构，返回 `any` 由各调用点自行收窄：那些字段名
+ * （`_sign`、`ssecurity`、`code`…）就是小米协议本身，给它硬编类型只会
+ * 在服务端加字段时被迫改一遍，而容错仍然要写。
+ */
+export function parseMiapi(body: string): any {
     const text = String(body || '');
     const idx = text.indexOf(JSON_PREFIX);
     const clean = (idx >= 0 ? text.slice(idx + JSON_PREFIX.length) : text).trim();
@@ -181,14 +204,14 @@ export function parseMiapi(body) {
     }
 }
 
-export function ua(deviceId, userId) {
+export function ua(deviceId: string, userId: string | number): string {
     return (
         'MiFit/3.59.0 (Android 14; en_US) Resolution/1080x2400 Version/3.59.0 ' +
         'Stage/Production DeviceId/' + deviceId + ' UserId/' + (userId || '0')
     );
 }
 
-export function identityUa(deviceId, userId) {
+export function identityUa(deviceId: string, userId: string | number): string {
     return (
         'MiHome/11.3.203 (com.xiaomi.mihome; build:11.3.203; Android 9) APP/com.xiaomi.mihome ' +
         'APPV/11.3.203 DeviceId/' + deviceId + ' UserId/' + (userId || '0') +

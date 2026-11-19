@@ -50,7 +50,7 @@ class MigrationDataPreservationTest {
         DatabaseDriverFactory(migrate = false).create(dbFile.absolutePath)
 
     @Test
-    fun 从v5逐版本回放到v18_行数与抽样值全部保留() {
+    fun 从v5逐版本回放到最新_行数与抽样值全部保留() {
         val driver = rawDriver()
         createV5Schema(driver)
         driver.writeUserVersion(5)
@@ -131,8 +131,13 @@ class MigrationDataPreservationTest {
             assertEquals(expected, driver.longValue("SELECT count(*) FROM `$table`"), "v5 基线：$table")
         }
 
-        // ---- 逐版本回放 5 -> 18 ----
-        for (from in 5L until 18L) {
+        // ---- 逐版本回放 5 -> 最新 ----
+        //
+        // 目标版本取 Schema.version 而不是写字面量：每加一个 .sqm 都要回来改
+        // 一堆数字，漏改一处就会变成「测试只迁到旧版本居然还绿」，
+        // 而那时新迁移根本没被执行过。
+        val latest = LifeBoardDb.Schema.version
+        for (from in 5L until latest) {
             LifeBoardDb.Schema.migrate(driver, from, from + 1).value
             driver.writeUserVersion(from + 1)
 
@@ -149,7 +154,7 @@ class MigrationDataPreservationTest {
             }
         }
 
-        assertEquals(18L, driver.longValue("PRAGMA user_version"))
+        assertEquals(latest, driver.longValue("PRAGMA user_version"))
     }
 
     @Test
@@ -165,8 +170,8 @@ class MigrationDataPreservationTest {
             0,
         )
 
-        LifeBoardDb.Schema.migrate(driver, 5L, 18L).value
-        driver.writeUserVersion(18)
+        LifeBoardDb.Schema.migrate(driver, 5L, LifeBoardDb.Schema.version).value
+        driver.writeUserVersion(LifeBoardDb.Schema.version)
 
         // 原有列逐字不变，新增列取迁移里声明的默认值。
         // 这些默认值不是随手挑的：每一个都对应「老用户升级后行为不变」的承诺，
@@ -206,8 +211,8 @@ class MigrationDataPreservationTest {
             0,
         )
 
-        LifeBoardDb.Schema.migrate(driver, 5L, 18L).value
-        driver.writeUserVersion(18)
+        LifeBoardDb.Schema.migrate(driver, 5L, LifeBoardDb.Schema.version).value
+        driver.writeUserVersion(LifeBoardDb.Schema.version)
 
         // 升级前的记录来源不可考。猜成 AUTO 会让「手动打卡」类图表把历史数据
         // 全算成自动采集，用户看到一条从没有过的曲线
@@ -239,8 +244,8 @@ class MigrationDataPreservationTest {
             0,
         )
 
-        LifeBoardDb.Schema.migrate(driver, 14L, 18L).value
-        driver.writeUserVersion(18)
+        LifeBoardDb.Schema.migrate(driver, 14L, LifeBoardDb.Schema.version).value
+        driver.writeUserVersion(LifeBoardDb.Schema.version)
 
         // 16.sqm 有意不给 configJson 默认值：空串会被 ChartConfigCodec 判成「配置损坏」，
         // 界面把老卡片显示成坏卡
@@ -285,7 +290,7 @@ class MigrationDataPreservationTest {
         val uniques = driver.stringColumn(
             "SELECT name FROM sqlite_master WHERE type = 'index' AND sql LIKE '%UNIQUE%'",
         )
-        assertTrue(uniques.isEmpty(), "v18 不应有任何唯一索引，实际有：$uniques")
+        assertTrue(uniques.isEmpty(), "最新版不应有任何唯一索引，实际有：$uniques")
     }
 
     @Test
@@ -293,8 +298,8 @@ class MigrationDataPreservationTest {
         val driver = rawDriver()
         createV5Schema(driver)
         driver.writeUserVersion(5)
-        LifeBoardDb.Schema.migrate(driver, 5L, 18L).value
-        driver.writeUserVersion(18)
+        LifeBoardDb.Schema.migrate(driver, 5L, LifeBoardDb.Schema.version).value
+        driver.writeUserVersion(LifeBoardDb.Schema.version)
 
         assertEquals(1L, driver.longValue("PRAGMA foreign_keys"), "外键必须开启，否则 CASCADE 静默失效")
 
@@ -323,7 +328,7 @@ class MigrationDataPreservationTest {
      * 按 v5 的结构建库：9 张表、6 个索引。
      *
      * 手写而不是复用 `.sq`：这里的目的是「造一个当年真实存在的库」，
-     * 用当前 `.sq` 建出来的已经是 v18 结构，迁不出任何东西。
+     * 用当前 `.sq` 建出来的已经是最新结构，迁不出任何东西。
      *
      * 注意 `task` / `capture_rule` 里带着 `windows`、`repeatType` 等列——
      * 那是 3.sqm（v3→v4）加进来的，v5 的库本来就该有。漏掉它们会让

@@ -309,7 +309,7 @@ object DesktopPlatformDependencies {
                 remindBackendInternal.rescheduleAll()
             }
 
-            /** 任务删除后撤销它的定时器与未完成通知 */
+            /** 任务删除后撤销它已登记的定时器（不撤回已弹出的托盘通知） */
             override suspend fun onTaskDeleted(taskId: Long) {
                 remindBackendInternal.cancelTask(taskId)
             }

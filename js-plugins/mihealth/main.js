@@ -1,1972 +1,1834 @@
-// 小米运动健康 JS 插件 —— 契约实现
-//
-// 这是整个插件唯一的入口。宿主通过 callFunction 调用本模块的导出函数：
-//   login(inputs) / logout() / authState() / fetch(date) / health() / detailUi() / onAction(actionId)
-//
-// ## 三条必须守住的线
-//
-// 1. **任何异常都不许抛给宿主**。宿主对抛出的异常只有一层通用兜底，
-//    用户看到的是「插件未实现 login」这类误导信息。每个导出函数都要自己
-//     try/catch 并翻译成契约允许的表达（Failure / Broken / 空数组）。
-// 2. **reportMetricQueried 必须在任何 early return 之前**。它决定详情页
-//    「查了但没数据」的指标能不能列出来，放晚了就会整批消失。
-// 3. **中间态用模块级变量**。QuickJS 单线程，login 天然串行，
-//    不需要 Kotlin 版的 Mutex；但也因此绝不能把中间态挂到 ctx 上
-//    （它是每次调用传入的，跨轮次不保证同一个实例）。
-//
-// ## 与 Kotlin 版的结构对应
-//
-//   MiHealthPlugin.kt   → 本文件
-//   MiHealthAuth.kt     → auth.js 的职责，按需内联在本文件（登录轮次调度）
-//   MiHealthClient.kt   → client.js
-//   MiHealthCrypto.kt   → crypto.js
-//   MiHealthParser.kt   → 本文件的 payloadOf / numberAt / timestampAt
-
-import {
-    ACCOUNT,
-    IDENTITY,
-    SID,
-    decryptBody,
-    parseMiapi,
-    signQuery,
-    ua,
-    identityUa,
-} from './crypto.js';
-import {
-    createSession,
-    fetchCaptcha,
-    fetchServiceToken,
-    serviceLogin,
-    serviceLoginAuth2,
-    serviceLoginRaw,
-} from './client.js';
-import { absoluteUrl, asLong, asNumber, b64decode } from './util.js';
-
-// ---------- 常量 ----------
-
-const SLOT_ACCOUNT = 'account';
-const SLOT_PASSWORD = 'password';
-const SLOT_SSECURITY = 'ssecurity';
-const SLOT_SERVICE_TOKEN = 'service_token';
-const SLOT_CUSER_ID = 'cuser_id';
-const SLOT_PASS_TOKEN = 'pass_token';
-const SLOT_CAPTCHA = 'captcha';
-const SLOT_OTP = 'otp';
-
-const DAY_MILLIS = 24 * 60 * 60 * 1000;
-
-/**
- * identity（二次验证）端点的单次请求超时。
- *
- * 宿主的单次插件调用上限是 60s，而 identity 端点偶发挂住（日志里有过
- * 等 37 秒才超时的情况）。默认 30s 再叠加重试直接顶到上限，用户最终看到的是
- * `login failed: undefined`——超时把整个登录轮次掐断，连错误码都没有。
- * 压到 12s 让失败能及时回到插件手里，由插件给出可读的失败原因。
- */
-const IDENTITY_TIMEOUT_MS = 12000;
-
-/** 详情页趋势图回看天数 */
-const DAYS = 7;
-
-/** 回补历史的天数，与 Kotlin 版 BACKFILL_DAYS 一致 */
-const BACKFILL_DAYS = 30;
-
-/** 详情页按钮标识 */
-const ACTION_SYNC = 'sync_now';
-const ACTION_BACKFILL = 'backfill';
-
-/** 指标 key，与 manifest.json 声明保持一致 */
-const STEPS_KEY = 'STEPS';
-const SLEEP_KEY = 'SLEEP_MINUTES';
-
-const OBS_HEART_RATE = 'OBS_HEART_RATE';
-const OBS_SPO2 = 'OBS_SPO2';
-const OBS_STRESS = 'OBS_STRESS';
-const OBS_CALORIES = 'OBS_CALORIES';
-const OBS_DISTANCE = 'OBS_DISTANCE';
-const OBS_STAND = 'OBS_STAND';
-const OBS_INTENSITY = 'OBS_INTENSITY';
-const OBS_WEIGHT = 'OBS_WEIGHT';
-const OBS_VO2_MAX = 'OBS_VO2_MAX';
-const OBS_PAI = 'OBS_PAI';
-const OBS_BLOOD_SYSTOLIC = 'OBS_BLOOD_SYSTOLIC';
-const OBS_BLOOD_DIASTOLIC = 'OBS_BLOOD_DIASTOLIC';
-const OBS_BLOOD_SUGAR = 'OBS_BLOOD_SUGAR';
-
-/**
- * 采样类指标清单。
- *
- * `fields` 为空表示**事件型**：记录存在本身就是「发生过」，按 1 计。
- * 实测 `valid_stand` 只有 `{start_time,end_time}`、`intensity` 只有 `{time}`，
- * 硬找一个数值字段只会得到 null。
- *
- * 血压拆成收缩压/舒张压两行但共用 `blood_pressure` 这个 cloudKey：
- * 一次请求就能同时供给两个指标，按指标各查一次等于翻倍请求。
- */
-const SAMPLED = [
-    { cloudKey: 'heart_rate', metricKey: OBS_HEART_RATE, fields: ['bpm', 'heart_rate'], mean: true },
-    { cloudKey: 'spo2', metricKey: OBS_SPO2, fields: ['spo2'], mean: true },
-    { cloudKey: 'stress', metricKey: OBS_STRESS, fields: ['stress_value', 'stress'], mean: true },
-    { cloudKey: 'calories', metricKey: OBS_CALORIES, fields: ['calories'], mean: false },
-    { cloudKey: 'distance', metricKey: OBS_DISTANCE, fields: ['distance'], mean: false },
-    { cloudKey: 'valid_stand', metricKey: OBS_STAND, fields: [], mean: false },
-    { cloudKey: 'intensity', metricKey: OBS_INTENSITY, fields: [], mean: false },
-    { cloudKey: 'weight', metricKey: OBS_WEIGHT, fields: ['weight'], mean: true },
-    { cloudKey: 'vo2_max', metricKey: OBS_VO2_MAX, fields: ['vo2_max'], mean: true },
-    { cloudKey: 'pai', metricKey: OBS_PAI, fields: ['pai', 'value'], mean: true },
-    { cloudKey: 'blood_pressure', metricKey: OBS_BLOOD_SYSTOLIC, fields: ['systolic'], mean: true },
-    { cloudKey: 'blood_pressure', metricKey: OBS_BLOOD_DIASTOLIC, fields: ['diastolic'], mean: true },
-    { cloudKey: 'blood_sugar', metricKey: OBS_BLOOD_SUGAR, fields: ['value', 'blood_sugar'], mean: true },
-];
-
-const STEP_FIELDS = ['steps', 'step', 'count', 'value'];
-const SLEEP_START_FIELDS = ['bedtime', 'device_bedtime', 'start_time', 'startTime'];
-const SLEEP_END_FIELDS = ['device_wake_up_time', 'wake_up_time', 'end_time', 'endTime'];
-
-// ---------- 模块级状态 ----------
-
-/**
- * 当前登录流程的中间态。
- *
- * 为什么不用 ctx 存：ctx 是每次调用传进来的，跨轮次不保证是同一个实例；
- * 而验证码与那次登录的 cookie 绑定，换会话取到的图必然对不上，
- * 所以必须把 session 整个留在内存里。
- */
-let pendingLogin = null;
-
-/**
- * deviceId 要跨轮次、跨进程稳定。
- *
- * 服务端按 UA 里的 deviceId 认设备，登录用 A、取数用 B 会触发风控。
- * 只放内存变量是不够的：插件被宿主重新加载（升级、进程重启）后模块状态全没了，
- * 会生成一个新的 deviceId，在服务端看来就是「换了一台设备登录」。
- * 参考实现把它落在 config，Kotlin 版靠同一个实例存活，
- * 这里用 `ctx.files` 落到插件私有目录，效果等价。
- */
-let cachedDeviceId = '';
-
-const DEVICE_ID_FILE = 'device_id.txt';
-
-function deviceId() {
-    if (cachedDeviceId) return cachedDeviceId;
-
-    // 先读上次存的
-    try {
-        const saved = ctx.files.read(DEVICE_ID_FILE);
-        if (typeof saved === 'string') {
-            const trimmed = saved.trim();
-            if (trimmed.length >= 8) {
-                cachedDeviceId = trimmed;
-                return cachedDeviceId;
-            }
-        }
-    } catch (e) {
-        log('w', '读取 deviceId 失败，将重新生成：' + (e && e.message));
+// mihealth/util.ts
+function utf8Bytes(str) {
+  const out = [];
+  for (let i = 0; i < str.length; i++) {
+    let code = str.charCodeAt(i);
+    if (code >= 55296 && code <= 56319 && i + 1 < str.length) {
+      const low = str.charCodeAt(i + 1);
+      if (low >= 56320 && low <= 57343) {
+        code = 65536 + (code - 55296 << 10) + (low - 56320);
+        i++;
+      }
     }
-
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-    let out = '';
-    for (let i = 0; i < 16; i++) {
-        out += chars.charAt(Math.floor(Math.random() * chars.length));
+    if (code < 128) {
+      out.push(code);
+    } else if (code < 2048) {
+      out.push(192 | code >> 6, 128 | code & 63);
+    } else if (code < 65536) {
+      out.push(224 | code >> 12, 128 | code >> 6 & 63, 128 | code & 63);
+    } else {
+      out.push(
+        240 | code >> 18,
+        128 | code >> 12 & 63,
+        128 | code >> 6 & 63,
+        128 | code & 63
+      );
     }
-    cachedDeviceId = out;
-    try {
-        ctx.files.write(DEVICE_ID_FILE, out);
-    } catch (e) {
-        log('w', '保存 deviceId 失败：' + (e && e.message));
+  }
+  return out;
+}
+function sha1Base64(bytes) {
+  return ctx.crypto.sha1Base64(bytes);
+}
+function sha256BytesBase64(bytes) {
+  return ctx.crypto.sha256Base64(bytes);
+}
+function b64encode(bytes) {
+  return ctx.codec.base64Encode(bytes);
+}
+function b64decode(str) {
+  return ctx.codec.base64Decode(str);
+}
+var randomCounter = 0;
+function randomBytes(n) {
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) {
+    out[i] = Math.floor(Math.random() * 256);
+  }
+  randomCounter = (randomCounter + 1) % 256;
+  if (n > 0) out[0] ^= randomCounter;
+  return out;
+}
+function rc4(keyBytes) {
+  const s = new Array(256);
+  for (let i = 0; i < 256; i++) s[i] = i;
+  let j = 0;
+  for (let i = 0; i < 256; i++) {
+    j = j + s[i] + keyBytes[i % keyBytes.length] & 255;
+    const tmp = s[i];
+    s[i] = s[j];
+    s[j] = tmp;
+  }
+  let i2 = 0;
+  let j2 = 0;
+  for (let k = 0; k < 1024; k++) {
+    i2 = i2 + 1 & 255;
+    j2 = j2 + s[i2] & 255;
+    const tmp = s[i2];
+    s[i2] = s[j2];
+    s[j2] = tmp;
+  }
+  return function transform(bytes) {
+    const out = new Array(bytes.length);
+    for (let n = 0; n < bytes.length; n++) {
+      i2 = i2 + 1 & 255;
+      j2 = j2 + s[i2] & 255;
+      const tmp = s[i2];
+      s[i2] = s[j2];
+      s[j2] = tmp;
+      out[n] = bytes[n] ^ s[s[i2] + s[j2] & 255];
     }
-    return cachedDeviceId;
-}
-
-/** 当前会话的凭据（内存缓存，落盘在 ctx.credentials） */
-let currentCreds = null;
-
-/**
- * 会话代数：每次登出 +1。
- *
- * 异步流程（登录、续期）在起步时记下当时的代数，写回凭据前比对：
- * 不一致说明这期间用户登出过，本次结果必须作废。
- *
- * 为什么不能只靠 `pendingLogin = null`：那只能挡住「同一轮登录的后续轮次」，
- * 挡不住已经发出去的 await。典型场景是用户点了登录、等了两秒觉得不对又点登出，
- * 两秒后登录成功回来，凭据又被写回去了——用户看到的是「登出了但还在采数」。
- */
-let sessionEpoch = 0;
-
-function log(level, message) {
-    try {
-        ctx.log[level]('MiHealth', message);
-    } catch (e) {
-        // 日志失败绝不能让业务中断
-    }
-}
-
-/**
- * 账号打码后再进日志。
- *
- * 日志页是给用户看、也会被整份导出发给别人的，账号属于个人信息，
- * 完整写进去等于把「谁在用这台手机」一并带出去了。
- * 保留前 3 后 2 位，足够用户确认「是不是我这个号」。
- */
-function maskAccount(account) {
-    const s = String(account || '');
-    if (s.length <= 5) return '***';
-    return s.slice(0, 3) + '***' + s.slice(-2);
-}
-
-// ---------- 凭据存取 ----------
-
-function loadCredentials() {
-    if (currentCreds) return currentCreds;
-    const ssecurity = ctx.credentials.get(SLOT_SSECURITY);
-    const serviceToken = ctx.credentials.get(SLOT_SERVICE_TOKEN);
-    if (!ssecurity || !serviceToken) return null;
-    currentCreds = {
-        ssecurity,
-        serviceToken,
-        cUserId: ctx.credentials.get(SLOT_CUSER_ID) || '',
-        passToken: ctx.credentials.get(SLOT_PASS_TOKEN) || '',
-        account: ctx.credentials.get(SLOT_ACCOUNT) || '',
-    };
-    return currentCreds;
-}
-
-/**
- * 落盘凭据。
- *
- * **不写 password**：密码只在登录那一次用到，存下来只是风险没有收益。
- * Kotlin 版的 saveCredentials 也只写这五个槽位。
- */
-function saveCredentials(creds) {
-    ctx.credentials.put(SLOT_SSECURITY, creds.ssecurity || '');
-    ctx.credentials.put(SLOT_SERVICE_TOKEN, creds.serviceToken || '');
-    ctx.credentials.put(SLOT_CUSER_ID, creds.cUserId || '');
-    ctx.credentials.put(SLOT_PASS_TOKEN, creds.passToken || '');
-    if (creds.account) {
-        ctx.credentials.put(SLOT_ACCOUNT, creds.account);
-    }
-    currentCreds = creds;
-}
-
-/**
- * 在异步流程开头记下当前代数，用于写回前判断「这期间用户是否登出过」。
- *
- * 用法：
- * ```js
- * const epoch = captureEpoch();
- * const creds = await doNetworkLogin();
- * if (epoch !== sessionEpoch) return;   // 用户已登出，丢弃本次结果
- * saveCredentials(creds);
- * ```
- */
-function captureEpoch() {
-    return sessionEpoch;
-}
-
-function isValidCreds(creds) {
-    // cUserId 不算必需：服务端靠 serviceToken + ssecurity 认人，
-    // 把它算成必需会让「cookie 名大小写对不上」被误判成未登录
-    return !!creds && !!creds.ssecurity && !!creds.serviceToken;
-}
-
-// ---------- 数据接口 ----------
-
-/**
- * 调一次云端接口并返回解密后的对象。
- *
- * @return 解析后的对象；网络失败 / 非 2xx / 解密失败均抛出异常
- */
-async function callApi(session, creds, method, path, params) {
-    const signed = signQuery(method, path, params || {}, creds.ssecurity);
-    const url = 'https://hlth.io.mi.com' + path + '?' + signed.query;
-
-    const res = await session.send(method, url, {
-        // 注意：不带 userId cookie，带了服务端稳定返回 401
-        headers: {
-            Cookie: cookieHeaderOf(creds),
-            Accept: 'application/json',
-        },
-        userAgent: ua(deviceId(), 0),
-        contentType: 'application/x-www-form-urlencoded',
-        body: method === 'POST' ? '' : undefined,
-    });
-
-    // HTTP 失败、空响应、解密失败都必须向上抛出，不能被调用方当成「无数据」。
-    if (!res || !res.ok) {
-        throw new Error('HTTP ' + ((res && res.status) || '无响应'));
-    }
-    const body = String(res.body || '').trim();
-    if (!body) {
-        throw new Error('数据接口响应为空');
-    }
-
-    const plain = decryptBody(creds.ssecurity, signed.nonce, body);
-    return JSON.parse(plain);
-}
-
-/** 数据接口只认这三件 cookie */
-function cookieHeaderOf(creds) {
-    return 'cUserId=' + creds.cUserId + '; serviceToken=' + creds.serviceToken + '; locale=zh_cn';
-}
-
-/**
- * 用 passToken 换一套新凭据。
- *
- * 免密续期：passToken 有效期约 1~2 个月。返回 null 说明连它都过期了，
- * 必须让用户重新输密码。
- */
-async function refreshWithPassToken(passToken, cUserId, userId, account) {
-    if (!passToken) return null;
-    // 临时会话，不抢默认会话的位置：续期可能在登录流程中途被触发，
-    // 让它成为默认会把正在进行的那轮登录换到另一个空会话上。
-    const session = createSession(deviceId(), 'refresh', { adoptAsDefault: false });
-    // 换票时必须带 cUserId 与 userId，只带 passToken 服务端会当作未认证。
-    //
-    // cookie 名是大小写敏感的：写成小写 `userid` 不会报错，只是 value() 静默
-    // 返回 null，于是换票请求只带 passToken，服务端按未认证处理，稳定返回 70016。
-    session.setCookie('passToken', passToken, 'xiaomi.com');
-    if (cUserId) session.setCookie('cUserId', cUserId, 'xiaomi.com');
-    if (userId) session.setCookie('userId', userId, 'xiaomi.com');
-
-    const res = await session.send('GET', ACCOUNT + '/pass/serviceLogin?sid=' + SID + '&_json=true', {
-        headers: { Referer: ACCOUNT + '/' },
-    });
-    const j = parseMiapi(res.body);
-    if (!j || !j.ssecurity) {
-        log('i', 'refreshWithPassToken rejected: ' + JSON.stringify(j || {}).slice(0, 200));
-        return null;
-    }
-    const loc = j.location || '';
-    if (!loc) return null;
-
-    const token = await fetchServiceToken(session, loc, userId || '');
-    if (!token) return null;
-
-    return {
-        ssecurity: j.ssecurity,
-        serviceToken: token,
-        cUserId: j.cUserId || cUserId,
-        userId: j.userId ? String(j.userId) : (userId || ''),
-        passToken: j.passToken || passToken,
-        account: account || '',
-    };
-}
-
-/**
- * 带 401 自愈的客户端。
- *
- * 返回一个 `getPoints(cloudKey, start, end)` 闭包，内部在收到 401 时
- * 用 passToken 续期再重试一次。续期成功后立刻写回凭据，
- * 下一次采集就不用再续了。
- */
-function clientFor(creds) {
-    // 采集用独立会话，与登录流程分开：采集随时可能在后台跑，
-    // 复用登录会话会让正在填验证码的那一轮突然换掉 cookie。
-    const session = createSession(deviceId(), 'collect', { adoptAsDefault: false });
-    let current = creds;
-
-    async function callWithRetry(method, path, params) {
-        try {
-            return await callApi(session, current, method, path, params);
-        } catch (error) {
-            const message = describeError(error);
-            if (message.indexOf('HTTP 401') < 0 || !current.passToken) throw error;
-            // 仅 401 走 Python 参考实现的 passToken 续期，网络错误不触发。
-            log('i', '数据接口返回 401，按参考实现用 passToken 续期后重试一次');
-            const refreshEpoch = captureEpoch();
-            const fresh = await refreshWithPassToken(
-                current.passToken,
-                current.cUserId,
-                current.userId || '',
-                current.account,
-            );
-            if (!fresh) throw error;
-            current = fresh;
-            // 续期期间用户可能已登出：不把旧凭据写回去。
-            if (refreshEpoch === sessionEpoch) {
-                saveCredentials(fresh);
-            }
-            return await callApi(session, current, method, path, params);
-        }
-    }
-
-    /**
-     * 取某类数据在时间窗内的采样点。
-     *
-     * ## 分页陷阱
-     * - 游标参数名必须是 snake_case `next_key`，camelCase 会被忽略
-     * - 游标会向后遍历全部历史，与 startTime 无关；startTime 传太早会卡死
-     * - 所以这里永远把 startTime 钳到「不早于 end - 24h」
-     */
-    async function getFitnessDataByTime(cloudKey, startTimeMillis, endTimeMillis, maxPages) {
-        const limit = maxPages || 10;
-        const apiStart = Math.max(startTimeMillis, endTimeMillis - DAY_MILLIS);
-        const out = [];
-        let nextKey = null;
-
-        for (let page = 0; page < limit; page++) {
-            const data = {
-                key: cloudKey,
-                startTime: apiStart,
-                endTime: endTimeMillis,
-                reverse: true,
-                next_key: nextKey,
-            };
-            const resp = await callWithRetry('GET', '/app/v1/data/get_fitness_data_by_time', {
-                data: JSON.stringify(data),
-            });
-            if (!resp || typeof resp !== 'object') {
-                throw new Error('数据接口返回不是 JSON 对象');
-            }
-            if (typeof resp.code === 'number' && resp.code !== 0 && resp.code !== 1) {
-                throw new Error('数据接口 code=' + resp.code + ' message=' + (resp.message || '无'));
-            }
-
-            // 外层统一是 {code, message, result}，数据和分页字段都在 result 里。
-            // 早期直接读顶层 data_list，结果永远拿不到列表
-            const body = resp.result || resp;
-            const items = body.data_list;
-            if (!items) {
-                // 服务端偶尔用 dataPoints 另一套命名
-                (body.dataPoints || []).forEach((p) => {
-                    if (p) out.push(p);
-                });
-                break;
-            }
-            items.forEach((p) => {
-                if (p) out.push(p);
-            });
-
-            const more = !!(body.has_more || body.hasMore);
-            nextKey = body.next_key || null;
-            if (!more || !nextKey) break;
-        }
-        return out;
-    }
-
-    return { getFitnessDataByTime, currentCreds: () => current };
-}
-
-// ---------- 采样点解析 ----------
-
-/**
- * 取出真正承载字段的对象。
- *
- * 真实接口的数值不在外层，而在字符串字段 `value` 里的**内层 JSON** 中。
- * 直接对外层取 value 只会拿到一串数字字符，表现为「登录成功但全 0 条」。
- * `value` 为空或不是合法 JSON 时退回原对象（sport_records 这类本就把
- * 字段放在外层）。
- */
-function payloadOf(point) {
-    if (!point) return {};
-    const raw = point.value;
-    if (typeof raw !== 'string' || raw.trim() === '') return point;
-    try {
-        const inner = JSON.parse(raw);
-        return inner && typeof inner === 'object' ? inner : point;
-    } catch (e) {
-        return point;
-    }
-}
-
-/** 按候选字段顺序取第一个有效数值。内层优先，外层兜底 */
-function numberAt(point, fields) {
-    const payload = payloadOf(point);
-    for (let i = 0; i < fields.length; i++) {
-        const name = fields[i];
-        if (payload && Object.prototype.hasOwnProperty.call(payload, name)) {
-            const v = asNumber(payload[name]);
-            if (v !== null) return v;
-        }
-        if (point && Object.prototype.hasOwnProperty.call(point, name)) {
-            const v = asNumber(point[name]);
-            if (v !== null) return v;
-        }
-    }
-    return null;
-}
-
-/**
- * 取时间戳并统一成毫秒。
- *
- * 阈值 1e11：毫秒时间戳 1973 年就超过它，秒级要到公元 5138 年，
- * 正常健康数据不可能落错区间。
- */
-function timestampAt(point, fields) {
-    const payload = payloadOf(point);
-    for (let i = 0; i < fields.length; i++) {
-        const name = fields[i];
-        let raw;
-        if (payload && Object.prototype.hasOwnProperty.call(payload, name)) {
-            raw = payload[name];
-        } else if (point && Object.prototype.hasOwnProperty.call(point, name)) {
-            raw = point[name];
-        } else {
-            continue;
-        }
-        const v = asLong(raw);
-        if (v === null || v <= 0) continue;
-        return v < 100000000000 ? v * 1000 : v;
-    }
-    return null;
-}
-
-// ---------- 日期工具 ----------
-//
-// QuickJS 没有 Intl，也拿不到系统时区名，但 Date 的本地时间方法
-// （getFullYear / getMonth 等）是可用的，它们按宿主进程的默认时区计算。
-// 这与 Kotlin 版的 ZoneId.systemDefault() 语义一致。
-
-/** `YYYY-MM-DD` → 本地零点毫秒 */
-function dayStart(dateStr) {
-    const parts = String(dateStr).split('-');
-    if (parts.length !== 3) return null;
-    const y = parseInt(parts[0], 10);
-    const m = parseInt(parts[1], 10);
-    const d = parseInt(parts[2], 10);
-    if (!isFinite(y) || !isFinite(m) || !isFinite(d)) return null;
-    return new Date(y, m - 1, d, 0, 0, 0, 0).getTime();
-}
-
-/** 目标自然日的 [start, end] 毫秒窗口；当天未结束时截止到现在 */
-function dayRange(dateStr) {
-    const start = dayStart(dateStr);
-    if (start === null) return null;
-    const nextStart = new Date(start);
-    nextStart.setDate(nextStart.getDate() + 1);
-    const end = Math.min(nextStart.getTime() - 1, Date.now());
-    return [start, end];
-}
-
-/** 本地日期 → `YYYY-MM-DD` */
-function formatDate(d) {
-    const y = d.getFullYear();
-    const m = d.getMonth() + 1;
-    const day = d.getDate();
-    return y + '-' + (m < 10 ? '0' + m : m) + '-' + (day < 10 ? '0' + day : day);
-}
-
-/** 毫秒 → 本地 `HH:mm`，用于睡眠区间附注 */
-function formatClock(millis) {
-    const d = new Date(millis);
-    const h = d.getHours();
-    const mi = d.getMinutes();
-    return (h < 10 ? '0' + h : h) + ':' + (mi < 10 ? '0' + mi : mi);
-}
-
-// ---------- 采集 ----------
-
-function reportQueried(metricKey, date) {
-    try {
-        ctx.reportMetricQueried(metricKey, date);
-    } catch (e) {
-        log('w', 'reportMetricQueried(' + metricKey + ') failed: ' + (e && e.message));
-    }
-}
-
-function reportRaw(metricKey, records, date) {
-    if (!records || records.length === 0) return;
-    try {
-        ctx.reportRawRecords(metricKey, records, date);
-    } catch (e) {
-        log('w', 'reportRawRecords(' + metricKey + ') failed: ' + (e && e.message));
-    }
-}
-
-/**
- * 当日步数。
- *
- * 步数接口返回的是采样点（通常按小时间隔），需要累加。
- * 聚合前把每个采样点原样上报：用户想核对「1253 步是怎么来的」时
- * 需要的正是这些点，聚合之后就再也拿不到了。
- */
-async function collectSteps(client, start, end, date) {
-    const points = await client.getFitnessDataByTime('steps', start, end);
-    if (!points || points.length === 0) {
-        log('i', 'collectSteps(' + date + ') 接口返回 0 个采样点');
-        return null;
-    }
-
-    const raw = [];
-    let sum = 0;
-    points.forEach((p) => {
-        const at = timestampAt(p, ['time', 'timestamp']);
-        const steps = numberAt(p, STEP_FIELDS);
-        // 没有有效数值的点按 0 处理：它们代表「这个时刻没记步」，不是数据缺失
-        if (steps !== null) sum += steps;
-        if (at !== null && steps !== null) {
-            raw.push({ timestamp: at, value: steps });
-        }
-    });
-
-    log('i', 'collectSteps(' + date + ') 采样点 ' + points.length + ' 个，可解析 ' + raw.length + ' 个');
-    raw.sort((a, b) => a.timestamp - b.timestamp);
-    reportRaw(STEPS_KEY, raw, date);
-
-    return sum > 0 ? sum : null;
-}
-
-/**
- * 当日睡眠分钟数。
- *
- * 口径是「**这一自然日里睡着的分钟数**」，不是「昨夜总睡眠」：
- * 23:00 睡到次日 07:00 会被拆成前一天 60 分钟 + 当天 420 分钟。
- * 这样两天不重复计数。
- *
- * 查询窗口向前多取一天：前一晚入睡、当天凌晨结束的睡眠段，
- * 起点落在目标日之前，不向前取就会被窗口过滤掉。
- */
-async function collectSleepMinutes(client, start, end, date) {
-    const points = await client.getFitnessDataByTime('sleep', start - DAY_MILLIS, end);
-    if (!points || points.length === 0) return null;
-
-    let totalMillis = 0;
-    const raw = [];
-
-    points.forEach((p) => {
-        const s = timestampAt(p, SLEEP_START_FIELDS);
-        const e = timestampAt(p, SLEEP_END_FIELDS);
-        if (s === null || e === null || e <= s) return;
-
-        // 只统计与当日窗口重叠的部分，避免跨天睡眠把前后两天都算满
-        const overlapStart = Math.max(s, start);
-        const overlapEnd = Math.min(e, end);
-        if (overlapEnd <= overlapStart) return;
-
-        totalMillis += overlapEnd - overlapStart;
-        raw.push({
-            timestamp: s,
-            value: (overlapEnd - overlapStart) / 60000,
-            // 起止时间都写进附注：拆到当天的那一段到底从几点到几点，
-            // 光看时长是推不出来的
-            detail: formatClock(s) + ' → ' + formatClock(e),
-        });
-    });
-
-    raw.sort((a, b) => a.timestamp - b.timestamp);
-    reportRaw(SLEEP_KEY, raw, date);
-
-    return totalMillis > 0 ? totalMillis / 60000 : null;
-}
-
-/**
- * 采集一组共用同一个小米 key 的采样类指标。
- *
- * 原始条目全部上报，日值按 `mean` 折算：
- * 心率取均值（累加心率没有意义），热量取累加（一天烧掉多少是有意义的量）。
- */
-async function collectSampled(client, cloudKey, specs, start, end, date) {
-    const points = await client.getFitnessDataByTime(cloudKey, start, end);
-
-    // 先统一登记「这些指标查过了」：即使 points 为空也要登记，
-    // 详情页才能把「查了但没数据」的指标列出来显示「暂无」。
-    // 放在任何 return 之前是必须的——一 return 就会漏掉这一批
-    specs.forEach((spec) => reportQueried(spec.metricKey, date));
-
-    if (!points || points.length === 0) return [];
-
-    const out = [];
-    specs.forEach((spec) => {
-        const raw = [];
-        points.forEach((p) => {
-            const at = timestampAt(p, ['time', 'timestamp', 'start_time']);
-            if (at === null) return;
-            // 事件型（fields 为空）：记录存在本身就是「发生过」，按 1 计
-            const value = spec.fields.length === 0 ? 1 : numberAt(p, spec.fields);
-            if (value === null) return;
-            raw.push({ timestamp: at, value });
-        });
-
-        if (raw.length === 0) {
-            log('i', cloudKey + ' 的 ' + spec.fields.join('/') + ' 解析不出值');
-            return;
-        }
-
-        raw.sort((a, b) => a.timestamp - b.timestamp);
-        reportRaw(spec.metricKey, raw, date);
-
-        let daily;
-        if (spec.mean) {
-            let sum = 0;
-            raw.forEach((r) => {
-                sum += r.value;
-            });
-            daily = sum / raw.length;
-        } else {
-            let sum = 0;
-            raw.forEach((r) => {
-                sum += r.value;
-            });
-            daily = sum;
-        }
-
-        // 0 不算「有效日值」：接口对没有测量的日子会返回 0 值点，
-        // 当成真实的 0 会把均值拉到地上，卡片的趋势图也会跟着失真
-        if (daily > 0) out.push({ metricKey: spec.metricKey, value: daily });
-    });
-
     return out;
+  };
+}
+function asNumber(v) {
+  if (typeof v === "number" && isFinite(v)) return v;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    if (isFinite(n)) return n;
+  }
+  return null;
+}
+function asLong(v) {
+  if (typeof v === "number" && isFinite(v)) return Math.trunc(v);
+  if (typeof v === "string" && /^-?\d+$/.test(v.trim())) return parseInt(v.trim(), 10);
+  return null;
+}
+function formEncode(params) {
+  return Object.keys(params).map((k) => {
+    const v = params[k];
+    return encodeURIComponent(k) + "=" + encodeURIComponent(v == null ? "" : v);
+  }).join("&");
+}
+function absoluteUrl(base, location) {
+  const loc = String(location || "").trim();
+  if (!loc) return base;
+  if (/^https?:\/\//i.test(loc)) return loc;
+  if (loc.startsWith("//")) return "https:" + loc;
+  const m = String(base || "").match(/^https?:\/\/[^/?#]+/);
+  const origin = m ? m[0] : "https://account.xiaomi.com";
+  const basePath = String(base || "").slice(origin.length).replace(/[?#].*$/, "") || "/";
+  if (loc.startsWith("/")) return origin + loc;
+  if (loc.startsWith("?")) return origin + basePath + loc;
+  const dir = basePath.slice(0, basePath.lastIndexOf("/") + 1) || "/";
+  return origin + dir + loc;
 }
 
-// ---------- 契约：登录 ----------
-
-/**
- * 多轮登录。
- *
- * 小米 passport 的流程是**递进**的：提交密码后才知道要不要验证码，
- * 验证码过了才知道要不要二次验证。所以用「轮到哪一步」决定读哪些输入，
- * 而不是一开始就要齐所有字段。
- */
-export async function login(inputs) {
-    const form = inputs || {};
-    try {
-        if (!pendingLogin) {
-            // 第一轮：要账号密码。调用方第一次调用通常不带 inputs，
-            // 这时先问，不该把空账号密码拿去请求
-            const account = form[SLOT_ACCOUNT];
-            const password = form[SLOT_PASSWORD];
-            if (!account || !password) {
-                return needPassword(account || '');
-            }
-            return await startLogin(account, password);
-        }
-
-        // 当前停在某个中间步骤，用户却提交了一个**完全空**的表单：
-        // 这表示他不想继续这一步，要退回去重填账号密码。
-        //
-        // 宿主没法替插件决定「退回」意味着什么，只能把空的意图传下来。
-        // 不清 pendingLogin 的话会死循环：空表单 → 仍返回同一个 OTP 界面，
-        // 用户既发不出短信也换不了账号。
-        const wantsRestart =
-            !form[SLOT_ACCOUNT] && !form[SLOT_PASSWORD] &&
-            !form[SLOT_CAPTCHA] && !form[SLOT_OTP];
-        if (wantsRestart) {
-            pendingLogin = null;
-            return needPassword('');
-        }
-
-        if (pendingLogin.stage === 'captcha') {
-            const code = form[SLOT_CAPTCHA];
-            if (!code) return await needCaptcha(pendingLogin);
-            return await submitCaptcha(code);
-        }
-
-        if (pendingLogin.stage === 'twoFactor') {
-            const code = form[SLOT_OTP];
-            if (!code) return needOtp(pendingLogin.hint);
-            return await submit2FA(code);
-        }
-
-        // stage === 'password'：重新走一遍密码登录
-        return await startLogin(
-            form[SLOT_ACCOUNT] || pendingLogin.account,
-            form[SLOT_PASSWORD] || pendingLogin.password,
-        );
-    } catch (e) {
-        log('e', 'login failed: ' + describeError(e));
-        // 失败要清掉中间态，否则用户重试时会直接跳到验证码步骤、拿不到新会话
-        pendingLogin = null;
-        return { type: 'failure', message: '登录异常：' + describeError(e) };
+// mihealth/crypto.ts
+var ACCOUNT = "https://account.xiaomi.com";
+var IDENTITY = "https://account.xiaomi.com/identity";
+var SID = "miothealth";
+var JSON_PREFIX = "&&&START&&&";
+function nonce() {
+  const bytes = randomBytes(8);
+  const minutes = Math.floor(Date.now() / 6e4);
+  bytes.push(minutes >>> 24 & 255);
+  bytes.push(minutes >>> 16 & 255);
+  bytes.push(minutes >>> 8 & 255);
+  bytes.push(minutes & 255);
+  return b64encode(bytes);
+}
+function sessionKey(ssecurity, nonceValue) {
+  const a = b64decode(ssecurity);
+  const b = b64decode(nonceValue);
+  return sha256BytesBase64(a.concat(b));
+}
+function pathOf(url) {
+  if (url.indexOf("://") >= 0) {
+    const afterScheme = url.slice(url.indexOf("://") + 3);
+    const slash = afterScheme.indexOf("/");
+    const pathAndQuery = slash < 0 ? "/" : afterScheme.slice(slash);
+    return pathAndQuery.split("?")[0];
+  }
+  return url.split("?")[0];
+}
+function signQuery(method, url, params, ssecurity) {
+  const p = pathOf(url);
+  const upper = method.toUpperCase();
+  const nonceValue = nonce();
+  const skey = sessionKey(ssecurity, nonceValue);
+  const plain = {};
+  Object.keys(params).forEach((k) => {
+    const v = params[k];
+    if (v == null) return;
+    const s = String(v);
+    if (s.trim() === "") return;
+    plain[k] = s;
+  });
+  const sortedKeys = Object.keys(plain).sort();
+  const hashSource = upper + "&" + p + "&" + sortedKeys.map((k) => k + "=" + plain[k]).join("&") + "&" + skey;
+  const rc4Hash = sha1Base64(utf8Bytes(hashSource));
+  plain["rc4_hash__"] = rc4Hash;
+  const allKeys = Object.keys(plain).sort();
+  const stream = rc4(b64decode(skey));
+  const encrypted = {};
+  allKeys.forEach((k) => {
+    encrypted[k] = b64encode(stream(utf8Bytes(plain[k])));
+  });
+  const sigSource = upper + "&" + p + "&" + allKeys.map((k) => k + "=" + encrypted[k]).join("&") + "&" + skey;
+  const signature = sha1Base64(utf8Bytes(sigSource));
+  const parts = allKeys.map((k) => encodeURIComponent(k) + "=" + encodeURIComponent(encrypted[k]));
+  parts.push("signature=" + encodeURIComponent(signature));
+  parts.push("_nonce=" + encodeURIComponent(nonceValue));
+  return { query: parts.join("&"), nonce: nonceValue };
+}
+function decryptBody(ssecurity, nonceValue, bodyB64) {
+  const key = b64decode(sessionKey(ssecurity, nonceValue));
+  const data = b64decode(bodyB64);
+  const out = rc4(key)(data);
+  return utf8Decode(out);
+}
+function utf8Decode(bytes) {
+  let out = "";
+  let i = 0;
+  while (i < bytes.length) {
+    const b0 = bytes[i++] & 255;
+    let cp;
+    if (b0 < 128) {
+      cp = b0;
+    } else if (b0 < 224) {
+      cp = (b0 & 31) << 6 | bytes[i++] & 63;
+    } else if (b0 < 240) {
+      cp = (b0 & 15) << 12 | (bytes[i++] & 63) << 6 | bytes[i++] & 63;
+    } else {
+      cp = (b0 & 7) << 18 | (bytes[i++] & 63) << 12 | (bytes[i++] & 63) << 6 | bytes[i++] & 63;
     }
+    out += String.fromCodePoint(cp);
+  }
+  return out;
+}
+function parseMiapi(body) {
+  const text = String(body || "");
+  const idx = text.indexOf(JSON_PREFIX);
+  const clean = (idx >= 0 ? text.slice(idx + JSON_PREFIX.length) : text).trim();
+  try {
+    return JSON.parse(clean);
+  } catch (e) {
+    return null;
+  }
+}
+function ua(deviceId2, userId) {
+  return "MiFit/3.59.0 (Android 14; en_US) Resolution/1080x2400 Version/3.59.0 Stage/Production DeviceId/" + deviceId2 + " UserId/" + (userId || "0");
+}
+function identityUa(deviceId2, userId) {
+  return "MiHome/11.3.203 (com.xiaomi.mihome; build:11.3.203; Android 9) APP/com.xiaomi.mihome APPV/11.3.203 DeviceId/" + deviceId2 + " UserId/" + (userId || "0") + " Platform/Android Region/CN L/zh_CN";
 }
 
-/**
- * 把任意形态的异常转成一句可读的话。
- *
- * 宿主 reject Promise 时传的对象形态不一定：可能是 Error、可能是字符串、
- * 也可能是个没有 message 的普通对象。只取 `e.message` 会得到 undefined，
- * 用户看到「登录异常：undefined」，等于什么信息都没有。
- */
+// mihealth/client.ts
+var SID2 = "miothealth";
+var MAX_WINDOW_MILLIS = 2 * 24 * 60 * 60 * 1e3;
+function log(level, message) {
+  try {
+    ctx.log[level]("MiHealth", message);
+  } catch (e) {
+  }
+}
 function describeError(e) {
-    if (e == null) return '未知错误';
-    if (typeof e === 'string') return e || '未知错误';
-    if (typeof e.message === 'string' && e.message) return e.message;
-    try {
-        const s = String(e);
-        if (s && s !== '[object Object]') return s;
-    } catch (ignore) {
-        /* 落到下面 */
-    }
-    // 走到这里说明 reject 给的对象既没有可读 message，转字符串也没信息。
-    // 不能再返回 `'未知错误'` 的 undefined 分支——日志里出现过 `login failed: undefined`，
-    // 那正是「吞掉了真实原因」，排障时完全无从下手。
-    try {
-        const json = JSON.stringify(e);
-        if (json && json !== '{}') return json;
-    } catch (ignore) {
-        /* 循环引用等，落到下面 */
-    }
-    return '未知错误（' + (typeof e) + '）';
+  if (e == null) return "\u672A\u77E5\u9519\u8BEF";
+  if (typeof e === "string") return e || "\u672A\u77E5\u9519\u8BEF";
+  if (typeof e === "object") {
+    const msg = e.message;
+    if (typeof msg === "string" && msg) return msg;
+  }
+  try {
+    const s = String(e);
+    if (s && s !== "[object Object]") return s;
+  } catch (ignore) {
+  }
+  return "\u672A\u77E5\u9519\u8BEF";
 }
-
-function needPassword(account) {
-    return {
-        type: 'needInput',
-        prompt: '请输入小米账号和密码',
-        // 密码必须掩码：登录时旁边可能有人，明文输入是实打实的泄露
-        fields: [
-            { name: SLOT_ACCOUNT, displayName: '小米账号', secret: false, hint: account ? '上次输入：' + account : undefined },
-            { name: SLOT_PASSWORD, displayName: '密码', secret: true },
-        ],
-    };
+function shortUrl(url) {
+  const s = String(url || "");
+  const noQuery = s.split("?")[0];
+  const keep = ["sid", "_flag", "flag", "icodeType"];
+  const params = [];
+  const query = s.includes("?") ? s.slice(s.indexOf("?") + 1) : "";
+  for (const pair of query.split("&")) {
+    const key = pair.split("=")[0];
+    if (keep.includes(key)) params.push(pair);
+  }
+  const tail = params.length > 0 ? "?" + params.join("&") : "";
+  const parts = noQuery.split("/");
+  return parts.slice(-2).join("/") + tail;
 }
-
-/** 第一轮：拿账号密码去小米 passport 换结果 */
-async function startLogin(account, password) {
-    const session = createSession(deviceId(), 'login');
-    log('i', '登录开始，account=' + maskAccount(account));
-
-    // ① 握手。服务端响应带 &&&START&&& 前缀，只能用插件自己的 parseMiapi 解析
-    // （serviceLogin 内部就是这么做的），不能读宿主给的 json 字段：
-    // 宿主是严格 JSON 解析，遇到前缀必然失败并返回 null。
-    const handshake = await serviceLogin(session);
-    if (!handshake || !handshake._sign) {
-        log('e', '握手失败：未拿到 _sign，响应=' + JSON.stringify(handshake || null).slice(0, 200));
-        return { type: 'failure', message: '登录握手失败：无法连接小米登录服务或未拿到 _sign' };
+function createSession(deviceId2, name, options) {
+  const opts = options || {};
+  const adoptAsDefault = opts.adoptAsDefault !== false;
+  let sessionName = "default";
+  try {
+    sessionName = ctx.http.session(name || "default", adoptAsDefault);
+  } catch (e) {
+    log("w", "\u521B\u5EFA HTTP \u4F1A\u8BDD\u5931\u8D25\uFF0C\u56DE\u9000\u5230\u9ED8\u8BA4\u4F1A\u8BDD\uFF1A" + describeError(e));
+  }
+  const jar = /* @__PURE__ */ new Map();
+  function jarKey(domain, path, cname) {
+    return domain + "|" + path + "|" + cname;
+  }
+  function splitUrl(url) {
+    const m = String(url || "").match(/^https?:\/\/([^/?#]+)([^?#]*)/i);
+    if (!m) return { hostname: "", pathname: "/" };
+    let host = m[1].toLowerCase();
+    const at = host.indexOf("@");
+    if (at >= 0) host = host.slice(at + 1);
+    const colon = host.indexOf(":");
+    if (colon >= 0) host = host.slice(0, colon);
+    return { hostname: host, pathname: m[2] || "/" };
+  }
+  function saveSetCookie(url, raw) {
+    const u = splitUrl(url);
+    const parts = String(raw || "").split(";");
+    const first = parts[0] || "";
+    const eq = first.indexOf("=");
+    if (eq <= 0) return;
+    const cname = first.slice(0, eq).trim();
+    const value = first.slice(eq + 1).trim();
+    if (!cname) return;
+    let domain = u.hostname;
+    let cpath = "/";
+    let expired = false;
+    for (let i = 1; i < parts.length; i++) {
+      const seg = parts[i].trim();
+      const lower = seg.toLowerCase();
+      if (lower.startsWith("domain=")) {
+        domain = seg.slice(7).trim().replace(/^\./, "");
+      } else if (lower.startsWith("path=")) {
+        cpath = seg.slice(5).trim() || "/";
+      } else if (lower.startsWith("max-age=")) {
+        const n = parseInt(seg.slice(8).trim(), 10);
+        if (!isNaN(n) && n <= 0) expired = true;
+      } else if (lower.startsWith("expires=")) {
+        const t = Date.parse(seg.slice(8).trim());
+        if (!isNaN(t) && t <= Date.now()) expired = true;
+      }
     }
-    log('i', '握手成功，已拿到 _sign');
-    // ② 提交密码。密码哈希必须是**单次** MD5 转大写，
-    // 双重 MD5 会稳定返回 70016，且错误信息看起来像风控
-    const hash = md5Upper(password);
-    const auth2 = await serviceLoginAuth2(session, account, hash, handshake, '');
-    log(
-        'i',
-        'serviceLoginAuth2 返回：code=' + (auth2 && auth2.code) +
-            ' 有 notificationUrl=' + !!(auth2 && auth2.notificationUrl) +
-            ' 有 captchaUrl=' + !!(auth2 && auth2.captchaUrl) +
-            ' desc=' + ((auth2 && auth2.desc) || ''),
-    );
-
-    pendingLogin = {
-        stage: 'password',
-        session,
-        account,
-        password,
-        handshake,
-        userId: '',
-    };
-
-    return await handleAuth2(auth2, account);
-}
-
-// ---------- 契约：登出 / 登录态 ----------
-
-export async function logout() {
-    // 不排队：登出是用户点了就要立刻生效的动作。
-    // 代数递增让所有在途的异步流程作废——它们回来时会发现代数变了，不再写凭据
-    sessionEpoch++;
-    pendingLogin = null;
-    currentCreds = null;
-    try {
-        ctx.credentials.clear();
-    } catch (e) {
-        log('w', 'logout clear failed: ' + (e && e.message));
+    const key = jarKey(domain, cpath, cname);
+    if (expired) {
+      jar.delete(key);
+    } else {
+      jar.set(key, { name: cname, value, domain, path: cpath });
     }
-}
-
-export async function authState() {
-    try {
-        const creds = loadCredentials();
-        if (!isValidCreds(creds)) return { state: 'loggedOut' };
-
-        // 有 passToken 说明凭据即将或已经过期，但还能自动续期。
-        // 报「已登录」会让用户看到拉不到数，报「未登录」又会在下次拉数时自己恢复，
-        // 所以契约专门留了 expired 这一档
-        if (creds.passToken) {
-            return { state: 'loggedIn', accountName: creds.account || null };
-        }
-        return { state: 'expired', message: '登录即将过期，需要重新输入密码' };
-    } catch (e) {
-        log('e', 'authState failed: ' + (e && e.message));
-        return { state: 'loggedOut' };
-    }
-}
-
-// ---------- 契约：拉数 ----------
-
-export async function fetch(date) {
+  }
+  function cookiesFor(url) {
+    const u = splitUrl(url);
     const out = [];
-    try {
-        const range = dayRange(date);
-        if (!range) {
-            log('w', 'fetch 非法日期：' + date);
-            return out;
-        }
-        const creds = loadCredentials();
-        if (!isValidCreds(creds)) return out;
-
-        const [start, end] = range;
-        const client = clientFor(creds);
-
-        // 两个量纲各自独立：一个失败不该让另一个也丢
-        //
-        // 注意 reportQueried 的登记位置：必须放在「请求成功返回之后」。
-        // 它的语义是「这一天确实查过、结果就是没有数据」，详情页据此显示「暂无」。
-        // 若在请求前就登记，网络失败或未登录时也会显示「暂无」，
-        // 用户会误判为「这天真的没走步」，而不是「采集失败」。
-        try {
-            const steps = await collectSteps(client, start, end, date);
-            reportQueried(STEPS_KEY, date);
-            if (steps !== null) out.push({ metricKey: STEPS_KEY, value: steps });
-        } catch (e) {
-            log('w', '步数采集失败（' + date + '）：' + (e && e.message));
-        }
-
-        try {
-            const sleep = await collectSleepMinutes(client, start, end, date);
-            reportQueried(SLEEP_KEY, date);
-            if (sleep !== null) out.push({ metricKey: SLEEP_KEY, value: sleep });
-        } catch (e) {
-            log('w', '睡眠采集失败（' + date + '）：' + (e && e.message));
-        }
-
-        // 按 cloudKey 分组复用网络请求：血压的收缩压/舒张压来自同一份数据
-        const groups = groupBy(SAMPLED, (s) => s.cloudKey);
-        for (let i = 0; i < groups.length; i++) {
-            const g = groups[i];
-            try {
-                const metrics = await collectSampled(client, g.key, g.items, start, end, date);
-                metrics.forEach((m) => out.push(m));
-            } catch (e) {
-                log('w', g.key + ' 采集失败（' + date + '）：' + (e && e.message));
-            }
-        }
-
-        return out;
-    } catch (e) {
-        // 兜底：fetch 抛异常会被宿主当成「插件未实现」，宁可返回空数组
-        log('e', 'fetch failed: ' + (e && e.message));
-        return out;
-    }
-}
-
-/** 按 key 分组并保持首次出现顺序 */
-function groupBy(items, keyOf) {
-    const order = [];
-    const map = {};
-    items.forEach((it) => {
-        const k = keyOf(it);
-        if (!map[k]) {
-            map[k] = [];
-            order.push(k);
-        }
-        map[k].push(it);
+    jar.forEach((c) => {
+      const hostOk = u.hostname === c.domain || u.hostname.endsWith("." + c.domain);
+      const pathOk = u.pathname.indexOf(c.path) === 0;
+      if (hostOk && pathOk) out.push(c);
     });
-    return order.map((k) => ({ key: k, items: map[k] }));
-}
-
-// ---------- 契约：健康度 ----------
-
-export async function health() {
-    try {
-        const creds = loadCredentials();
-        if (!isValidCreds(creds)) {
-            return { status: 'broken', message: '未登录小米账号' };
-        }
-
-        // 用最近一天的数据探一次，能拿到就算健康
-        const client = clientFor(creds);
-        const now = Date.now();
-        try {
-            const points = await client.getFitnessDataByTime('steps', now - DAY_MILLIS, now, 1);
-            if (points && points.length >= 0) return { status: 'healthy' };
-        } catch (e) {
-            log('w', 'health probe failed: ' + (e && e.message));
-        }
-
-        // 凭据过期且续期失败：这不是网络抖动，用户必须重新登录
-        if (!isValidCreds(loadCredentials())) {
-            return { status: 'broken', message: '登录已失效，请重新登录' };
-        }
-        return { status: 'degraded', message: '云端接口暂时不可用' };
-    } catch (e) {
-        log('e', 'health failed: ' + (e && e.message));
-        return { status: 'degraded', message: '健康检查异常：' + describeError(e) };
+    return out;
+  }
+  ["xiaomi.com", "mi.com"].forEach((domain) => {
+    const seed = (n, v) => jar.set(jarKey(domain, "/", n), { name: n, value: v, domain, path: "/" });
+    seed("sdkVersion", "accountsdk-18.8.15");
+    seed("deviceId", deviceId2);
+    seed("_locale", "zh_CN");
+  });
+  async function send(method, url, options2) {
+    const opts2 = options2 || {};
+    return await sendOnce(method, url, opts2);
+  }
+  async function sendOnce(method, url, opts2) {
+    const follow = opts2.followRedirects !== false;
+    const maxHops = follow ? 10 : 1;
+    let current = url;
+    let currentMethod = method;
+    let currentBody = opts2.body;
+    for (let hop = 0; hop < maxHops; hop++) {
+      const res = await sendRaw(currentMethod, current, opts2, currentBody);
+      const list = Array.isArray(res.setCookie) ? res.setCookie : [];
+      list.forEach((raw) => saveSetCookie(current, raw));
+      const next = res.headers && res.headers["location"] || "";
+      const isRedirect = res.status >= 300 && res.status < 400 && next;
+      if (isRedirect) {
+        log(
+          "d",
+          "hop" + hop + " " + res.status + " setCookie=" + list.length + " jar=" + jar.size + " from=" + shortUrl(current) + " to=" + shortUrl(next)
+        );
+      }
+      if (!isRedirect || !follow) return res;
+      const resolved = absoluteUrl(current, next);
+      if (resolved === current) {
+        throw new Error("\u8DF3\u8F6C\u5730\u5740\u4E0E\u5F53\u524D\u76F8\u540C\uFF0C\u65E0\u6CD5\u524D\u8FDB\uFF1A" + shortUrl(current));
+      }
+      current = resolved;
+      if (res.status === 303 || currentMethod !== "GET") {
+        currentMethod = "GET";
+        currentBody = void 0;
+      }
     }
-}
-
-// ---------- 契约：详情页 ----------
-
-/**
- * 详情页内容：登录状态 + 步数 + 睡眠 + 两个按钮。
- *
- * 这里**不发网络请求**：详情页可能被频繁打开，每次进来都拉一次接口
- * 既慢又浪费。要更新数据由用户点「立即同步」，走 triggerSync。
- */
-export async function detailUi() {
-    const blocks = [];
-    try {
-        const auth = await authState();
-
-        let label = '未登录';
-        let tone = 'ERROR';
-        let detail = '请回插件列表页登录';
-        if (auth.state === 'loggedIn') {
-            label = '已登录';
-            tone = 'OK';
-            detail = auth.accountName || '';
-        } else if (auth.state === 'expired') {
-            label = '登录即将过期';
-            tone = 'WARN';
-            detail = auth.message || '';
-        }
-
-        blocks.push({ type: 'statusCard', label: '登录状态', value: label, tone, detail: detail || null });
-
-        const recentSteps = recentValues(STEPS_KEY);
-        const recentSleep = recentValues(SLEEP_KEY);
-
-        if (recentSteps.length > 0) {
-            const last = recentSteps[recentSteps.length - 1];
-            blocks.push({
-                type: 'statusCard',
-                label: '最近一次步数',
-                value: Math.round(last.value) + ' 步',
-                tone: 'NEUTRAL',
-                detail: last.date,
-            });
-            blocks.push({
-                type: 'chart',
-                title: '近 ' + recentSteps.length + ' 日步数',
-                chart: {
-                    kind: 'bar',
-                    bars: recentSteps.map((r) => ({ label: r.date.slice(-5), value: r.value })),
-                    unit: ' 步',
-                    // 最后一根通常是今天，高亮它让用户一眼找到当前位置
-                    highlightIndex: recentSteps.length - 1,
-                },
-            });
-        } else {
-            blocks.push({
-                type: 'text',
-                title: '还没有步数数据',
-                body: '点下面的「立即同步」拉取今天的数据。',
-            });
-        }
-
-        if (recentSleep.length > 0) {
-            const last = recentSleep[recentSleep.length - 1];
-            blocks.push({
-                type: 'statusCard',
-                label: '最近一次睡眠',
-                value: (last.value / 60).toFixed(1) + ' 小时',
-                tone: 'NEUTRAL',
-                detail: last.date,
-            });
-            blocks.push({
-                type: 'chart',
-                title: '近 ' + recentSleep.length + ' 日睡眠',
-                chart: {
-                    kind: 'line',
-                    // 库里存的是分钟，图上换成小时才符合日常表达
-                    points: recentSleep.map((r) => ({ label: r.date.slice(-5), value: r.value / 60 })),
-                    unit: ' 小时',
-                },
-            });
-            blocks.push({
-                type: 'text',
-                title: '统计口径',
-                body: '按自然日累计睡眠时长，跨夜睡眠会拆到前后两天，所以这里显示的不是「昨夜总睡眠」。',
-            });
-        } else {
-            blocks.push({
-                type: 'text',
-                title: '还没有睡眠数据',
-                body: '戴手环睡觉后点「立即同步」，睡眠才会被同步过来。',
-            });
-        }
-
-        const loggedIn = auth.state === 'loggedIn';
-        blocks.push({
-            type: 'buttonRow',
-            buttons: [
-                {
-                    label: '立即同步',
-                    actionId: ACTION_SYNC,
-                    primary: true,
-                    // 没登录时同步必然失败，直接禁用比让用户点了再看报错好
-                    enabled: loggedIn,
-                },
-                {
-                    label: '回补近 ' + BACKFILL_DAYS + ' 天',
-                    actionId: ACTION_BACKFILL,
-                    // 回补只补原始条目（供查看核对），不改历史聚合值与得分
-                    enabled: loggedIn,
-                },
-            ],
-        });
-
-        return blocks;
-    } catch (e) {
-        log('e', 'detailUi failed: ' + (e && e.message));
-        // 详情页崩掉会让整个插件页空白，退化成一条说明更好
-        return blocks.concat([{ type: 'text', title: '详情页渲染失败', body: describeError(e) }]);
+    throw new Error("\u91CD\u5B9A\u5411\u6B21\u6570\u8FC7\u591A\uFF1A" + shortUrl(url));
+  }
+  async function sendRaw(method, url, opts2, body) {
+    const headers = Object.assign({}, opts2.headers);
+    const argv = {
+      headers,
+      // 永远不让宿主跟随：它跟随会丢掉我们拼的 Cookie 头
+      followRedirects: false
+    };
+    if (opts2.contentType) argv.contentType = opts2.contentType;
+    if (!headers.Cookie && !headers.cookie) {
+      const list = cookiesFor(url);
+      if (list.length) headers.Cookie = list.map((c) => c.name + "=" + c.value).join("; ");
     }
-}
-
-/** 读近 N 天的已落库指标 */
-function recentValues(metricKey) {
+    if (opts2.userAgent) argv.userAgent = opts2.userAgent;
+    if (opts2.timeoutMs) argv.timeoutMs = opts2.timeoutMs;
+    let res;
     try {
-        const rows = ctx.recentMetrics(metricKey, DAYS);
-        if (!rows || rows.length === 0) return [];
-        const arr = rows.map((r) => ({ date: String(r.date || ''), value: Number(r.value) || 0 }));
-        return arr.slice(-DAYS);
+      if (method === "POST") {
+        res = await ctx.http.post(url, body || "", argv, sessionName);
+      } else {
+        res = await ctx.http.get(url, argv, sessionName);
+      }
     } catch (e) {
-        log('w', 'recentMetrics(' + metricKey + ') failed: ' + (e && e.message));
-        return [];
+      log("e", method + " " + shortUrl(url) + " \u8BF7\u6C42\u5931\u8D25\uFF1A" + describeError(e));
+      throw e;
     }
+    log("d", method + " " + shortUrl(url) + " -> " + res.status);
+    return res;
+  }
+  function cookie(cname, domain) {
+    if (domain) {
+      const d = String(domain).replace(/^\./, "");
+      const hit = jar.get(jarKey(d, "/", cname));
+      if (hit) return hit.value;
+      let found2 = null;
+      jar.forEach((c) => {
+        if (c.name === cname && c.domain === d && found2 == null) found2 = c.value;
+      });
+      return found2;
+    }
+    let found = null;
+    jar.forEach((c) => {
+      if (c.name === cname && found == null) found = c.value;
+    });
+    return found;
+  }
+  function setCookie(name2, value, domain) {
+    if (!name2 || value == null || value === "") return;
+    const d = String(domain || "xiaomi.com").replace(/^\./, "");
+    jar.set(jarKey(d, "/", name2), { name: name2, value, domain: d, path: "/" });
+  }
+  return {
+    send,
+    cookie,
+    setCookie,
+    deviceId: deviceId2,
+    sessionName,
+    names: () => {
+      const seen = {};
+      const out = [];
+      jar.forEach((c) => {
+        if (!seen[c.name]) {
+          seen[c.name] = true;
+          out.push(c.name);
+        }
+      });
+      return out;
+    }
+  };
+}
+async function fetchCaptcha(session) {
+  const res = await session.send(
+    "GET",
+    ACCOUNT + "/pass/getCode?icodeType=login&" + Math.random(),
+    { headers: { Referer: ACCOUNT + "/" } }
+  );
+  const b64 = res.bodyBase64;
+  if (!res.ok || !b64) return "";
+  const bytes = ctx.codec.base64Decode(b64);
+  if (!bytes || bytes.length < 4) return "";
+  const isJpeg = bytes[0] === 255 && bytes[1] === 216;
+  const isPng = bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71;
+  if (!isJpeg && !isPng) return "";
+  return "data:image/jpeg;base64," + b64;
+}
+async function serviceLogin(session) {
+  const res = await session.send(
+    "GET",
+    ACCOUNT + "/pass/serviceLogin?sid=miothealth&_json=true",
+    { headers: { Referer: ACCOUNT + "/" } }
+  );
+  const json = parseMiapi(res.body);
+  if (!json || !json._sign) {
+    const raw = String(res && res.body || "");
+    log("e", "serviceLogin \u672A\u62FF\u5230 _sign\uFF1Astatus=" + (res && res.status || "\u65E0") + " body\u957F\u5EA6=" + raw.length + " \u5F00\u5934=" + JSON.stringify(raw.slice(0, 160)));
+  }
+  return json;
+}
+async function serviceLoginRaw(session) {
+  const res = await session.send(
+    "GET",
+    ACCOUNT + "/pass/serviceLogin?sid=miothealth&_json=true",
+    { headers: { Referer: ACCOUNT + "/" } }
+  );
+  const json = parseMiapi(res.body);
+  if (!json) {
+    const raw = String(res && res.body || "");
+    log("e", "serviceLogin \u54CD\u5E94\u65E0\u6CD5\u89E3\u6790\uFF1Astatus=" + (res && res.status || "\u65E0") + " body\u957F\u5EA6=" + raw.length + " \u5F00\u5934=" + JSON.stringify(raw.slice(0, 160)));
+  }
+  return { json, raw: String(res.body || ""), status: res.status };
+}
+async function serviceLoginAuth2(session, account, passwordHash, handshake, captCode) {
+  const body = {
+    user: account,
+    hash: passwordHash,
+    sid: "miothealth",
+    jsondata: "",
+    _json: "true",
+    _sign: handshake._sign,
+    qs: handshake.qs || "",
+    callback: handshake.callback || "",
+    locale: "zh_CN"
+  };
+  if (captCode) body.captCode = captCode;
+  const res = await session.send("POST", ACCOUNT + "/pass/serviceLoginAuth2", {
+    headers: {
+      Referer: ACCOUNT + "/",
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: formEncode(body),
+    contentType: "application/x-www-form-urlencoded",
+    // 不能自动跟随：登录结果里的 location 是下一步要走的 STS 回调，
+    // 跟着跳会让 serviceToken 下发在中间跳，插件再也拿不到
+    followRedirects: false
+  });
+  return parseMiapi(res.body);
+}
+function isUsableServiceToken(value) {
+  return !!value && value !== "EXPIRED" && value !== SID2;
+}
+async function fetchServiceToken(session, location, userId) {
+  const res = await session.send("GET", absolute(ACCOUNT, location), {
+    userAgent: identityUa(session.deviceId, userId),
+    followRedirects: false
+  });
+  const setCookie = Array.isArray(res.setCookie) ? res.setCookie : [];
+  for (let i = 0; i < setCookie.length; i++) {
+    const m = String(setCookie[i] || "").match(/serviceToken=([^;]+)/);
+    if (m && isUsableServiceToken(m[1])) return m[1];
+  }
+  const fromCookie = session.cookie("serviceToken", "sts-hlth.io.mi.com") || session.cookie("serviceToken", "sts.api.io.mi.com");
+  if (isUsableServiceToken(fromCookie)) return fromCookie;
+  const m2 = String(res.body || "").match(/serviceToken=([^;&"'\s]+)/);
+  if (m2 && isUsableServiceToken(m2[1])) return m2[1];
+  return null;
+}
+function absolute(base, location) {
+  if (/^https?:\/\//i.test(location)) return location;
+  if (location.startsWith("//")) return "https:" + location;
+  const origin = base.match(/^https?:\/\/[^/]+/);
+  const prefix = origin ? origin[0] : ACCOUNT;
+  return location.startsWith("/") ? prefix + location : prefix + "/" + location;
 }
 
-// ---------- 契约：按钮动作 ----------
-
-export async function onAction(actionId) {
+// mihealth/main.ts
+var SLOT_ACCOUNT = "account";
+var SLOT_PASSWORD = "password";
+var SLOT_SSECURITY = "ssecurity";
+var SLOT_SERVICE_TOKEN = "service_token";
+var SLOT_CUSER_ID = "cuser_id";
+var SLOT_PASS_TOKEN = "pass_token";
+var SLOT_CAPTCHA = "captcha";
+var SLOT_OTP = "otp";
+var DAY_MILLIS = 24 * 60 * 60 * 1e3;
+var IDENTITY_TIMEOUT_MS = 12e3;
+var DAYS = 7;
+var BACKFILL_DAYS = 30;
+var ACTION_SYNC = "sync_now";
+var ACTION_BACKFILL = "backfill";
+var STEPS_KEY = "STEPS";
+var SLEEP_KEY = "SLEEP_MINUTES";
+var OBS_HEART_RATE = "OBS_HEART_RATE";
+var OBS_SPO2 = "OBS_SPO2";
+var OBS_STRESS = "OBS_STRESS";
+var OBS_CALORIES = "OBS_CALORIES";
+var OBS_DISTANCE = "OBS_DISTANCE";
+var OBS_STAND = "OBS_STAND";
+var OBS_INTENSITY = "OBS_INTENSITY";
+var OBS_WEIGHT = "OBS_WEIGHT";
+var OBS_VO2_MAX = "OBS_VO2_MAX";
+var OBS_PAI = "OBS_PAI";
+var OBS_BLOOD_SYSTOLIC = "OBS_BLOOD_SYSTOLIC";
+var OBS_BLOOD_DIASTOLIC = "OBS_BLOOD_DIASTOLIC";
+var OBS_BLOOD_SUGAR = "OBS_BLOOD_SUGAR";
+var SAMPLED = [
+  { cloudKey: "heart_rate", metricKey: OBS_HEART_RATE, fields: ["bpm", "heart_rate"], mean: true },
+  { cloudKey: "spo2", metricKey: OBS_SPO2, fields: ["spo2"], mean: true },
+  { cloudKey: "stress", metricKey: OBS_STRESS, fields: ["stress_value", "stress"], mean: true },
+  { cloudKey: "calories", metricKey: OBS_CALORIES, fields: ["calories"], mean: false },
+  { cloudKey: "distance", metricKey: OBS_DISTANCE, fields: ["distance"], mean: false },
+  { cloudKey: "valid_stand", metricKey: OBS_STAND, fields: [], mean: false },
+  { cloudKey: "intensity", metricKey: OBS_INTENSITY, fields: [], mean: false },
+  { cloudKey: "weight", metricKey: OBS_WEIGHT, fields: ["weight"], mean: true },
+  { cloudKey: "vo2_max", metricKey: OBS_VO2_MAX, fields: ["vo2_max"], mean: true },
+  { cloudKey: "pai", metricKey: OBS_PAI, fields: ["pai", "value"], mean: true },
+  { cloudKey: "blood_pressure", metricKey: OBS_BLOOD_SYSTOLIC, fields: ["systolic"], mean: true },
+  { cloudKey: "blood_pressure", metricKey: OBS_BLOOD_DIASTOLIC, fields: ["diastolic"], mean: true },
+  { cloudKey: "blood_sugar", metricKey: OBS_BLOOD_SUGAR, fields: ["value", "blood_sugar"], mean: true }
+];
+var STEP_FIELDS = ["steps", "step", "count", "value"];
+var POINT_TIME_FIELDS = ["time", "timestamp", "start_time", "startTime"];
+var SLEEP_START_FIELDS = ["bedtime", "device_bedtime", "start_time", "startTime"];
+var SLEEP_END_FIELDS = ["device_wake_up_time", "wake_up_time", "end_time", "endTime"];
+var pendingLogin = null;
+var cachedDeviceId = "";
+var DEVICE_ID_FILE = "device_id.txt";
+function deviceId() {
+  if (cachedDeviceId) return cachedDeviceId;
+  try {
+    const saved = ctx.files.read(DEVICE_ID_FILE);
+    if (typeof saved === "string") {
+      const trimmed = saved.trim();
+      if (trimmed.length >= 8) {
+        cachedDeviceId = trimmed;
+        return cachedDeviceId;
+      }
+    }
+  } catch (e) {
+    log2("w", "\u8BFB\u53D6 deviceId \u5931\u8D25\uFF0C\u5C06\u91CD\u65B0\u751F\u6210\uFF1A" + describeError(e));
+  }
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let out = "";
+  for (let i = 0; i < 16; i++) {
+    out += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  cachedDeviceId = out;
+  try {
+    ctx.files.write(DEVICE_ID_FILE, out);
+  } catch (e) {
+    log2("w", "\u4FDD\u5B58 deviceId \u5931\u8D25\uFF1A" + describeError(e));
+  }
+  return cachedDeviceId;
+}
+var currentCreds = null;
+var sessionEpoch = 0;
+var credsRejectedByServer = false;
+function log2(level, message) {
+  try {
+    ctx.log[level]("MiHealth", message);
+  } catch (e) {
+  }
+}
+function maskAccount(account) {
+  const s = String(account || "");
+  if (s.length <= 5) return "***";
+  return s.slice(0, 3) + "***" + s.slice(-2);
+}
+function loadCredentials() {
+  if (currentCreds) return currentCreds;
+  const ssecurity = ctx.credentials.get(SLOT_SSECURITY);
+  const serviceToken = ctx.credentials.get(SLOT_SERVICE_TOKEN);
+  if (!ssecurity || !serviceToken) return null;
+  currentCreds = {
+    ssecurity,
+    serviceToken,
+    cUserId: ctx.credentials.get(SLOT_CUSER_ID) || "",
+    // userId 不落盘：原实现没存这个槽位，认证链路里的 userId 都从会话
+    // cookie 现取。加进来会多一个凭据槽位，属于超出原行为范围的改动
+    userId: "",
+    passToken: ctx.credentials.get(SLOT_PASS_TOKEN) || "",
+    account: ctx.credentials.get(SLOT_ACCOUNT) || ""
+  };
+  return currentCreds;
+}
+function saveCredentials(creds) {
+  ctx.credentials.put(SLOT_SSECURITY, creds.ssecurity || "");
+  ctx.credentials.put(SLOT_SERVICE_TOKEN, creds.serviceToken || "");
+  ctx.credentials.put(SLOT_CUSER_ID, creds.cUserId || "");
+  ctx.credentials.put(SLOT_PASS_TOKEN, creds.passToken || "");
+  if (creds.account) {
+    ctx.credentials.put(SLOT_ACCOUNT, creds.account);
+  }
+  currentCreds = creds;
+  credsRejectedByServer = false;
+}
+function captureEpoch() {
+  return sessionEpoch;
+}
+function isValidCreds(creds) {
+  return !!creds && !!creds.ssecurity && !!creds.serviceToken;
+}
+var AuthError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "AuthError";
+  }
+};
+function isAuthError(e) {
+  if (e instanceof AuthError) return true;
+  return e != null && e.name === "AuthError";
+}
+async function callApi(session, creds, method, path, params) {
+  const signed = signQuery(method, path, params, creds.ssecurity);
+  const url = "https://hlth.io.mi.com" + path + "?" + signed.query;
+  const res = await session.send(method, url, {
+    // 注意：不带 userId cookie，带了服务端稳定返回 401
+    headers: {
+      Cookie: cookieHeaderOf(creds),
+      Accept: "application/json"
+    },
+    userAgent: ua(deviceId(), 0),
+    contentType: "application/x-www-form-urlencoded",
+    body: method === "POST" ? "" : void 0
+  });
+  if (!res || res.status === 401) {
+    throw new AuthError("\u5C0F\u7C73\u63A5\u53E3\u8FD4\u56DE 401\uFF0C\u51ED\u636E\u5DF2\u5931\u6548");
+  }
+  if (!res.ok) {
+    throw new Error("HTTP " + (res && res.status || "\u65E0\u54CD\u5E94"));
+  }
+  const body = String(res.body || "").trim();
+  if (!body) {
+    throw new Error("\u6570\u636E\u63A5\u53E3\u54CD\u5E94\u4E3A\u7A7A");
+  }
+  const plain = decryptBody(creds.ssecurity, signed.nonce, body);
+  try {
+    return JSON.parse(plain);
+  } catch (e) {
+    throw new Error("\u6570\u636E\u63A5\u53E3\u54CD\u5E94\u65E0\u6CD5\u89E3\u5BC6\u89E3\u6790\uFF08\u4F1A\u8BDD\u5BC6\u94A5\u53EF\u80FD\u4E0D\u914D\u5957\uFF09");
+  }
+}
+function cookieHeaderOf(creds) {
+  return "cUserId=" + creds.cUserId + "; serviceToken=" + creds.serviceToken + "; locale=zh_cn";
+}
+async function refreshWithPassToken(passToken, cUserId, userId, account) {
+  if (!passToken) return null;
+  const session = createSession(deviceId(), "refresh", { adoptAsDefault: false });
+  session.setCookie("passToken", passToken, "xiaomi.com");
+  if (cUserId) session.setCookie("cUserId", cUserId, "xiaomi.com");
+  if (userId) session.setCookie("userId", userId, "xiaomi.com");
+  const res = await session.send("GET", ACCOUNT + "/pass/serviceLogin?sid=" + SID + "&_json=true", {
+    headers: { Referer: ACCOUNT + "/" }
+  });
+  const j = parseMiapi(res.body);
+  if (!j || !j.ssecurity) {
+    log2("i", "refreshWithPassToken rejected: " + JSON.stringify(j || {}).slice(0, 200));
+    return null;
+  }
+  const loc = j.location || "";
+  if (!loc) return null;
+  const token = await fetchServiceToken(session, loc, userId || "");
+  if (!token) return null;
+  return {
+    ssecurity: j.ssecurity,
+    serviceToken: token,
+    cUserId: j.cUserId || cUserId,
+    userId: j.userId ? String(j.userId) : userId || "",
+    passToken: j.passToken || passToken,
+    account: account || ""
+  };
+}
+function clientFor(creds) {
+  const session = createSession(deviceId(), "collect", { adoptAsDefault: false });
+  let current = creds;
+  async function callWithRetry(method, path, params) {
     try {
-        if (actionId === ACTION_SYNC) {
-            // 交给宿主跑采集链路：插件不碰数据库，否则健康度与量纲校验都会被绕过
-            return { type: 'triggerSync' };
-        }
-        if (actionId === ACTION_BACKFILL) {
-            return await backfillHistory();
-        }
-        return { type: 'noop' };
-    } catch (e) {
-        log('e', 'onAction(' + actionId + ') failed: ' + (e && e.message));
-        return { type: 'showMessage', text: '操作失败：' + describeError(e) };
+      return await callApi(session, current, method, path, params);
+    } catch (error) {
+      if (!isAuthError(error) || !current.passToken) throw error;
+      log2("i", "\u6570\u636E\u63A5\u53E3\u8FD4\u56DE 401\uFF0C\u6309\u53C2\u8003\u5B9E\u73B0\u7528 passToken \u7EED\u671F\u540E\u91CD\u8BD5\u4E00\u6B21");
+      const refreshEpoch = captureEpoch();
+      const fresh = await refreshWithPassToken(
+        current.passToken,
+        current.cUserId,
+        current.userId || "",
+        current.account
+      );
+      if (!fresh) throw error;
+      current = fresh;
+      if (refreshEpoch === sessionEpoch) {
+        saveCredentials(fresh);
+      }
+      return await callApi(session, current, method, path, params);
     }
+  }
+  async function getFitnessDataByTime(cloudKey, startTimeMillis, endTimeMillis, maxPages) {
+    const limit = maxPages || 10;
+    const apiStart = Math.max(startTimeMillis, endTimeMillis - DAY_MILLIS);
+    const out = [];
+    const seen = /* @__PURE__ */ new Set();
+    let nextKey = null;
+    const accept = (p) => {
+      if (!p || typeof p !== "object") return;
+      const t = timestampAt(p, POINT_TIME_FIELDS);
+      if (t === null || t < startTimeMillis || t > endTimeMillis) return;
+      const sid = typeof p.sid === "string" ? String(p.sid) : null;
+      const key = sid !== null ? sid : t + "|" + JSON.stringify(p);
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(p);
+    };
+    for (let page = 0; page < limit; page++) {
+      const data = {
+        key: cloudKey,
+        startTime: apiStart,
+        endTime: endTimeMillis,
+        reverse: true,
+        next_key: nextKey
+      };
+      const resp = await callWithRetry("GET", "/app/v1/data/get_fitness_data_by_time", {
+        data: JSON.stringify(data)
+      });
+      if (!resp || typeof resp !== "object") {
+        throw new Error("\u6570\u636E\u63A5\u53E3\u8FD4\u56DE\u4E0D\u662F JSON \u5BF9\u8C61");
+      }
+      if (typeof resp.code === "number" && resp.code !== 0 && resp.code !== 1) {
+        throw new Error("\u6570\u636E\u63A5\u53E3 code=" + resp.code + " message=" + (resp.message || "\u65E0"));
+      }
+      const body = resp.result || resp;
+      const items = body.data_list;
+      if (!items) {
+        (body.dataPoints || []).forEach(accept);
+        break;
+      }
+      items.forEach(accept);
+      const more = !!(body.has_more || body.hasMore);
+      nextKey = body.next_key || null;
+      if (!more || !nextKey) break;
+    }
+    return out;
+  }
+  return { getFitnessDataByTime, currentCreds: () => current };
 }
-
-/**
- * 回补最近 BACKFILL_DAYS 天的**原始条目**。
- *
- * 常规采集只跑「昨天 + 今天」，更早的日期从来没有原始条目。
- * 只补 raw 不补 metric：metric 是判定与计分用的聚合值，
- * 补历史会改动已定稿的历史得分，那不是用户点这个按钮的本意。
- *
- * 按天逐段拉而不是一次拉个大窗口：窗口越宽游标越容易退化成遍历全部历史。
- * 失败的那一天跳过并继续，一天拉不到不该让整轮失败。
- */
-async function backfillHistory() {
+function payloadOf(point) {
+  if (!point) return {};
+  const raw = point.value;
+  if (typeof raw !== "string" || raw.trim() === "") return point;
+  try {
+    const inner = JSON.parse(raw);
+    return inner && typeof inner === "object" ? inner : point;
+  } catch (e) {
+    return point;
+  }
+}
+function numberAt(point, fields) {
+  const payload = payloadOf(point);
+  for (let i = 0; i < fields.length; i++) {
+    const name = fields[i];
+    if (payload && Object.prototype.hasOwnProperty.call(payload, name)) {
+      const v = asNumber(payload[name]);
+      if (v !== null) return v;
+    }
+    if (point && Object.prototype.hasOwnProperty.call(point, name)) {
+      const v = asNumber(point[name]);
+      if (v !== null) return v;
+    }
+  }
+  return null;
+}
+function timestampAt(point, fields) {
+  const payload = payloadOf(point);
+  for (let i = 0; i < fields.length; i++) {
+    const name = fields[i];
+    let raw;
+    if (payload && Object.prototype.hasOwnProperty.call(payload, name)) {
+      raw = payload[name];
+    } else if (point && Object.prototype.hasOwnProperty.call(point, name)) {
+      raw = point[name];
+    } else {
+      continue;
+    }
+    const v = asLong(raw);
+    if (v === null || v <= 0) continue;
+    return v < 1e11 ? v * 1e3 : v;
+  }
+  return null;
+}
+function dayStart(dateStr) {
+  const parts = String(dateStr).split("-");
+  if (parts.length !== 3) return null;
+  const y = parseInt(parts[0], 10);
+  const m = parseInt(parts[1], 10);
+  const d = parseInt(parts[2], 10);
+  if (!isFinite(y) || !isFinite(m) || !isFinite(d)) return null;
+  return new Date(y, m - 1, d, 0, 0, 0, 0).getTime();
+}
+function dayRange(dateStr) {
+  const start = dayStart(dateStr);
+  if (start === null) return null;
+  const nextStart = new Date(start);
+  nextStart.setDate(nextStart.getDate() + 1);
+  const end = Math.min(nextStart.getTime() - 1, Date.now());
+  return [start, end];
+}
+function formatDate(d) {
+  const y = d.getFullYear();
+  const m = d.getMonth() + 1;
+  const day = d.getDate();
+  return y + "-" + (m < 10 ? "0" + m : m) + "-" + (day < 10 ? "0" + day : day);
+}
+function formatClock(millis) {
+  const d = new Date(millis);
+  const h = d.getHours();
+  const mi = d.getMinutes();
+  return (h < 10 ? "0" + h : h) + ":" + (mi < 10 ? "0" + mi : mi);
+}
+function reportQueried(metricKey, date) {
+  try {
+    ctx.reportMetricQueried(metricKey, date);
+  } catch (e) {
+    log2("w", "reportMetricQueried(" + metricKey + ") failed: " + describeError(e));
+  }
+}
+function reportRaw(metricKey, records, date) {
+  if (!records || records.length === 0) return;
+  try {
+    ctx.reportRawRecords(metricKey, records, date);
+  } catch (e) {
+    log2("w", "reportRawRecords(" + metricKey + ") failed: " + describeError(e));
+  }
+}
+async function collectSteps(client, start, end, date) {
+  const points = await client.getFitnessDataByTime("steps", start, end);
+  if (!points || points.length === 0) {
+    log2("i", "collectSteps(" + date + ") \u63A5\u53E3\u8FD4\u56DE 0 \u4E2A\u91C7\u6837\u70B9");
+    return null;
+  }
+  const raw = [];
+  let sum = 0;
+  points.forEach((p) => {
+    const at = timestampAt(p, ["time", "timestamp"]);
+    const steps = numberAt(p, STEP_FIELDS);
+    if (steps !== null) sum += steps;
+    if (at !== null && steps !== null) {
+      raw.push({ timestamp: at, value: steps });
+    }
+  });
+  log2("i", "collectSteps(" + date + ") \u91C7\u6837\u70B9 " + points.length + " \u4E2A\uFF0C\u53EF\u89E3\u6790 " + raw.length + " \u4E2A");
+  raw.sort((a, b) => a.timestamp - b.timestamp);
+  reportRaw(STEPS_KEY, raw, date);
+  return sum > 0 ? sum : null;
+}
+async function collectSleepMinutes(client, start, end, date) {
+  const points = await client.getFitnessDataByTime("sleep", start - DAY_MILLIS, end);
+  if (!points || points.length === 0) return null;
+  let totalMillis = 0;
+  const raw = [];
+  points.forEach((p) => {
+    const s = timestampAt(p, SLEEP_START_FIELDS);
+    const e = timestampAt(p, SLEEP_END_FIELDS);
+    if (s === null || e === null || e <= s) return;
+    const overlapStart = Math.max(s, start);
+    const overlapEnd = Math.min(e, end);
+    if (overlapEnd <= overlapStart) return;
+    totalMillis += overlapEnd - overlapStart;
+    raw.push({
+      timestamp: s,
+      value: (overlapEnd - overlapStart) / 6e4,
+      // 起止时间都写进附注：拆到当天的那一段到底从几点到几点，
+      // 光看时长是推不出来的
+      detail: formatClock(s) + " \u2192 " + formatClock(e)
+    });
+  });
+  raw.sort((a, b) => a.timestamp - b.timestamp);
+  reportRaw(SLEEP_KEY, raw, date);
+  return totalMillis > 0 ? totalMillis / 6e4 : null;
+}
+async function collectSampled(client, cloudKey, specs, start, end, date) {
+  const points = await client.getFitnessDataByTime(cloudKey, start, end);
+  specs.forEach((spec) => reportQueried(spec.metricKey, date));
+  if (!points || points.length === 0) return [];
+  const out = [];
+  specs.forEach((spec) => {
+    const raw = [];
+    points.forEach((p) => {
+      const at = timestampAt(p, ["time", "timestamp", "start_time"]);
+      if (at === null) return;
+      const value = spec.fields.length === 0 ? 1 : numberAt(p, spec.fields);
+      if (value === null) return;
+      raw.push({ timestamp: at, value });
+    });
+    if (raw.length === 0) {
+      log2("i", cloudKey + " \u7684 " + spec.fields.join("/") + " \u89E3\u6790\u4E0D\u51FA\u503C");
+      return;
+    }
+    raw.sort((a, b) => a.timestamp - b.timestamp);
+    reportRaw(spec.metricKey, raw, date);
+    let daily;
+    if (spec.mean) {
+      let sum = 0;
+      raw.forEach((r) => {
+        sum += r.value;
+      });
+      daily = sum / raw.length;
+    } else {
+      let sum = 0;
+      raw.forEach((r) => {
+        sum += r.value;
+      });
+      daily = sum;
+    }
+    if (daily > 0) out.push({ metricKey: spec.metricKey, value: daily });
+  });
+  return out;
+}
+async function login(inputs) {
+  const form = inputs || {};
+  try {
+    if (!pendingLogin) {
+      const account = form[SLOT_ACCOUNT];
+      const password = form[SLOT_PASSWORD];
+      if (!account || !password) {
+        return needPassword(account || "");
+      }
+      return await startLogin(account, password);
+    }
+    const wantsRestart = !form[SLOT_ACCOUNT] && !form[SLOT_PASSWORD] && !form[SLOT_CAPTCHA] && !form[SLOT_OTP];
+    if (wantsRestart) {
+      pendingLogin = null;
+      return needPassword("");
+    }
+    if (pendingLogin.stage === "captcha") {
+      const code = form[SLOT_CAPTCHA];
+      if (!code) return await needCaptcha(pendingLogin);
+      return await submitCaptcha(code);
+    }
+    if (pendingLogin.stage === "twoFactor") {
+      const code = form[SLOT_OTP];
+      if (!code) return needOtp(pendingLogin.hint);
+      return await submit2FA(code);
+    }
+    return await startLogin(
+      form[SLOT_ACCOUNT] || pendingLogin.account,
+      form[SLOT_PASSWORD] || pendingLogin.password
+    );
+  } catch (e) {
+    log2("e", "login failed: " + describeError(e));
+    pendingLogin = null;
+    return { type: "failure", message: "\u767B\u5F55\u5F02\u5E38\uFF1A" + describeError(e) };
+  }
+}
+function needPassword(account) {
+  return {
+    type: "needInput",
+    prompt: "\u8BF7\u8F93\u5165\u5C0F\u7C73\u8D26\u53F7\u548C\u5BC6\u7801",
+    // 密码必须掩码：登录时旁边可能有人，明文输入是实打实的泄露
+    fields: [
+      { name: SLOT_ACCOUNT, displayName: "\u5C0F\u7C73\u8D26\u53F7", secret: false, hint: account ? "\u4E0A\u6B21\u8F93\u5165\uFF1A" + account : void 0 },
+      { name: SLOT_PASSWORD, displayName: "\u5BC6\u7801", secret: true }
+    ]
+  };
+}
+async function startLogin(account, password) {
+  const session = createSession(deviceId(), "login");
+  log2("i", "\u767B\u5F55\u5F00\u59CB\uFF0Caccount=" + maskAccount(account));
+  const handshake = await serviceLogin(session);
+  if (!handshake || !handshake._sign) {
+    log2("e", "\u63E1\u624B\u5931\u8D25\uFF1A\u672A\u62FF\u5230 _sign\uFF0C\u54CD\u5E94=" + JSON.stringify(handshake || null).slice(0, 200));
+    return { type: "failure", message: "\u767B\u5F55\u63E1\u624B\u5931\u8D25\uFF1A\u65E0\u6CD5\u8FDE\u63A5\u5C0F\u7C73\u767B\u5F55\u670D\u52A1\u6216\u672A\u62FF\u5230 _sign" };
+  }
+  log2("i", "\u63E1\u624B\u6210\u529F\uFF0C\u5DF2\u62FF\u5230 _sign");
+  const hash = md5Upper(password);
+  const auth2 = await serviceLoginAuth2(session, account, hash, handshake, "");
+  log2(
+    "i",
+    "serviceLoginAuth2 \u8FD4\u56DE\uFF1Acode=" + (auth2 && auth2.code) + " \u6709 notificationUrl=" + !!(auth2 && auth2.notificationUrl) + " \u6709 captchaUrl=" + !!(auth2 && auth2.captchaUrl) + " desc=" + (auth2 && auth2.desc || "")
+  );
+  pendingLogin = {
+    stage: "password",
+    session,
+    account,
+    password,
+    handshake,
+    userId: ""
+  };
+  return await handleAuth2(auth2, account);
+}
+async function logout() {
+  sessionEpoch++;
+  pendingLogin = null;
+  currentCreds = null;
+  credsRejectedByServer = false;
+  try {
+    ctx.credentials.clear();
+  } catch (e) {
+    log2("w", "logout clear failed: " + describeError(e));
+  }
+}
+async function authState() {
+  try {
+    const creds = loadCredentials();
+    if (!isValidCreds(creds)) return { state: "loggedOut" };
+    if (credsRejectedByServer) {
+      return {
+        state: "expired",
+        message: "\u767B\u5F55\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u5C0F\u7C73\u8D26\u53F7"
+      };
+    }
+    if (creds.passToken) {
+      return creds.account ? { state: "loggedIn", accountName: creds.account } : { state: "loggedIn" };
+    }
+    return { state: "expired", message: "\u767B\u5F55\u5373\u5C06\u8FC7\u671F\uFF0C\u9700\u8981\u91CD\u65B0\u8F93\u5165\u5BC6\u7801" };
+  } catch (e) {
+    log2("e", "authState failed: " + describeError(e));
+    return { state: "loggedOut" };
+  }
+}
+async function fetch(date) {
+  const out = [];
+  try {
+    const range = dayRange(date);
+    if (!range) {
+      log2("w", "fetch \u975E\u6CD5\u65E5\u671F\uFF1A" + date);
+      return out;
+    }
     const creds = loadCredentials();
     if (!isValidCreds(creds)) {
-        return { type: 'showMessage', text: '未登录小米账号，请先在插件页登录' };
+      return { status: "authRequired", message: "\u672A\u767B\u5F55\u5C0F\u7C73\u8D26\u53F7\uFF0C\u8BF7\u5148\u5728\u63D2\u4EF6\u9875\u767B\u5F55" };
     }
-
+    const [start, end] = range;
     const client = clientFor(creds);
-    let filled = 0;
-    let empty = 0;
-    let failed = 0;
-    const today = new Date();
-
-    for (let offset = 0; offset < BACKFILL_DAYS; offset++) {
-        const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - offset);
-        const date = formatDate(d);
-        const range = dayRange(date);
-        if (!range) {
-            failed++;
-            continue;
-        }
-        try {
-            const [start, end] = range;
-            // 两个量纲的返回值是「有数据」的数，「没数据」是 null。
-            // 不能用「没抛异常」当成功：服务端对没记录的日子正常返回空列表，
-            // 那样填出来的天数会把「真的补到了」和「这天本来就没数据」混在一起，
-            // 用户看到「已回补 30 天」但列表还是空的。
-            const steps = await collectSteps(client, start, end, date);
-            const sleep = await collectSleepMinutes(client, start, end, date);
-            if (steps !== null || sleep !== null) {
-                filled++;
-            } else {
-                empty++;
-            }
-        } catch (e) {
-            log('w', '回补 ' + date + ' 失败：' + (e && e.message));
-            failed++;
-        }
+    let authFailure = null;
+    const noteAuthFailure = (e) => {
+      if (isAuthError(e)) authFailure = describeError(e);
+    };
+    try {
+      const steps = await collectSteps(client, start, end, date);
+      reportQueried(STEPS_KEY, date);
+      if (steps !== null) out.push({ metricKey: STEPS_KEY, value: steps });
+    } catch (e) {
+      noteAuthFailure(e);
+      log2("w", "\u6B65\u6570\u91C7\u96C6\u5931\u8D25\uFF08" + date + "\uFF09\uFF1A" + describeError(e));
     }
-
-    // 三种结果分开说：全成功 / 部分失败 / 一天都没取到。
-    // 「没数据」也要明确告知，否则用户会以为回补失败
-    if (failed === 0 && empty === 0) {
-        return { type: 'showMessage', text: '已回补最近 ' + filled + ' 天的原始数据' };
+    try {
+      const sleep = await collectSleepMinutes(client, start, end, date);
+      reportQueried(SLEEP_KEY, date);
+      if (sleep !== null) out.push({ metricKey: SLEEP_KEY, value: sleep });
+    } catch (e) {
+      noteAuthFailure(e);
+      log2("w", "\u7761\u7720\u91C7\u96C6\u5931\u8D25\uFF08" + date + "\uFF09\uFF1A" + describeError(e));
     }
-    if (filled === 0 && failed === 0) {
-        return {
-            type: 'showMessage',
-            text: '最近 ' + BACKFILL_DAYS + ' 天都没有找到可回补的记录',
-        };
+    const groups = groupBy(SAMPLED, (s) => s.cloudKey);
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      try {
+        const metrics = await collectSampled(client, g.key, g.items, start, end, date);
+        metrics.forEach((m) => out.push(m));
+      } catch (e) {
+        noteAuthFailure(e);
+        log2("w", g.key + " \u91C7\u96C6\u5931\u8D25\uFF08" + date + "\uFF09\uFF1A" + describeError(e));
+      }
     }
-    const parts = ['已回补 ' + filled + ' 天'];
-    if (empty > 0) parts.push(empty + ' 天无记录');
-    if (failed > 0) parts.push(failed + ' 天取数失败');
-    return { type: 'showMessage', text: parts.join('，') };
-}
-
-// ---------- 登录后续步骤 ----------
-//
-// 以下几段是 Kotlin 版 MiHealthAuth 的移植。之所以内联在 main.js 而不是
-// 单独一个 auth.js：它们与 pendingLogin 的轮次状态强耦合，
-// 拆出去只会多一层「把状态传进去再传出来」的噪音。
-
-function md5Upper(text) {
-    // 单次 MD5 转大写。ctx.crypto.md5Hex 已返回小写十六进制
-    return String(ctx.crypto.md5Hex(toUtf8(text))).toUpperCase();
-}
-
-/** 复用 util.js 的编码，但这里只为一处服务，就地内联避免多一层 import */
-function toUtf8(str) {
-    const out = [];
-    for (let i = 0; i < str.length; i++) {
-        let code = str.charCodeAt(i);
-        if (code >= 0xd800 && code <= 0xdbff && i + 1 < str.length) {
-            const low = str.charCodeAt(i + 1);
-            if (low >= 0xdc00 && low <= 0xdfff) {
-                code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
-                i++;
-            }
-        }
-        if (code < 0x80) out.push(code);
-        else if (code < 0x800) out.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
-        else if (code < 0x10000) out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
-        else out.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+    if (authFailure) {
+      credsRejectedByServer = true;
+      log2("w", "\u51ED\u636E\u5DF2\u5931\u6548\uFF0C\u672C\u8F6E\u91C7\u96C6\u4E0D\u5B8C\u6574\uFF0C\u9700\u91CD\u65B0\u767B\u5F55\uFF1A" + authFailure);
+      return {
+        status: "authRequired",
+        message: "\u767B\u5F55\u5DF2\u5931\u6548\uFF08\u5C0F\u7C73\u63A5\u53E3\u8FD4\u56DE 401 \u4E14\u65E0\u6CD5\u81EA\u52A8\u7EED\u671F\uFF09\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u5C0F\u7C73\u8D26\u53F7"
+      };
     }
+    credsRejectedByServer = false;
     return out;
+  } catch (e) {
+    log2("e", "fetch failed: " + describeError(e));
+    return { status: "failure", message: "\u91C7\u96C6\u5931\u8D25\uFF1A" + describeError(e) };
+  }
 }
-
-/**
- * 是否拿到了一套**会话自己**的 ssecurity。
- *
- * 参考实现（external/mihealth-api/login.py）的判据就是这个：
- * ```python
- * if not (isinstance(j2.get("ssecurity"), str) and len(j2["ssecurity"]) > 4):
- *     if j2.get("notificationUrl"): raise Need2FA(...)
- *     raise LoginError(...)
- * ```
- * 长度门槛 >4 是为了挡掉 `null`/`""`/占位值。
- *
- * 这是判断「密码登录这一步到底成没成」的唯一依据，**不能用 code 代替**：
- * auth2 返回 code=0 但没有 ssecurity 是常态（参考实现实测记录在 out.txt：
- * `auth2 code: 0 ssecurity: False`）。用 code 判定会把这种响应当成登录成功，
- * 落盘一个空或过期的 ssecurity，然后所有数据接口 401——
- * 用户看到「已登录但没数据」，而根因在登录这一步就已经埋下了。
- */
-function hasUsableSsecurity(auth2) {
-    const v = auth2 && auth2.ssecurity;
-    return typeof v === 'string' && v.length > 4;
-}
-
-/** 把 auth2 的响应翻译成契约结果 */
-async function handleAuth2(auth2, account) {
-    // 从进入登录轮到真正落地要经过多轮网络往返，记下代数以便写回前校验
-    const epoch = captureEpoch();
-    if (!auth2) {
-        pendingLogin = null;
-        return { type: 'failure', message: '登录请求失败，请检查网络' };
+function groupBy(items, keyOf) {
+  const order = [];
+  const map = {};
+  items.forEach((it) => {
+    const k = keyOf(it);
+    if (!map[k]) {
+      map[k] = [];
+      order.push(k);
     }
-
-    const code = typeof auth2.code === 'number' ? auth2.code : -1;
-
-    // 把 auth2 的关键字段一次打全。此前只打 code/notificationUrl/captchaUrl，
-    // 恰好漏掉了决定成败的 ssecurity 与 location，导致「登录成功却 401」无从定位
-    log(
-        'i',
-        'serviceLoginAuth2 解析：code=' + code +
-            ' ssecurity=' + (hasUsableSsecurity(auth2) ? 'len' + String(auth2.ssecurity).length : '(空或无效)') +
-            ' cUserId=' + (auth2.cUserId ? 'len' + String(auth2.cUserId).length : '(空)') +
-            ' passToken=' + (auth2.passToken ? 'len' + String(auth2.passToken).length : '(空)') +
-            ' 有 location=' + !!auth2.location +
-            ' 有 notificationUrl=' + !!auth2.notificationUrl,
-    );
-
-    // 拿到会话自己的 ssecurity 才算密码登录这一步真的成了，
-    // 此时 notificationUrl 即便有也不该再走 2FA（参考实现同序）
-    if (hasUsableSsecurity(auth2)) {
-        log('i', 'auth2 已带 ssecurity，走 STS 回调');
-        return await completeLogin(auth2, account, epoch);
-    }
-
-    // 没有 ssecurity：要么需要二次验证，要么就是登录没成
-    const notification = auth2.notificationUrl || '';
-    if (notification) {
-        log('i', '没有 ssecurity 且有 notificationUrl，进入 2FA 流程');
-        return await start2FA(notification, auth2.ssecurity || '', account);
-    }
-
-    if (code === 0) {
-        // 走到这里说明：服务端说成功，却没给可用的 ssecurity，
-        // 也没告诉我们要二次验证。继续往下走必然得到一个用不了的凭据，
-        // 不如在这里就明确失败——这正是「显示已登录、数据全空」的来源
-        log('e', 'auth2 code=0 但缺少 ssecurity，且无 notificationUrl，无法继续');
-        pendingLogin = null;
-        return {
-            type: 'failure',
-            message: '登录未完成：服务端返回成功但没有下发会话密钥（ssecurity）。' +
-                '请确认该账号已在小米运动健康官方 App 中完成过验证，然后重试。',
-        };
-    }
-
-    // 需要图片验证码：87001 = 验证码错误/缺失，70016 = 参数被拒
-    //（小米在要求验证码时也用这个码）
-    if (code === 87001 || code === 70016 || auth2.captchaUrl) {
-        log('i', '需要图片验证码，code=' + code);
-        pendingLogin.stage = 'captcha';
-        // 复用同一个 session：验证码与那次会话的 cookie（ick）绑定
-        const image = await fetchCaptcha(pendingLogin.session);
-        return needCaptcha(pendingLogin, image);
-    }
-
-    log('w', '登录被拒：code=' + code + ' desc=' + (auth2.desc || ''));
-    pendingLogin = null;
-    return { type: 'failure', message: friendlyError(code, auth2.desc || '') };
+    map[k].push(it);
+  });
+  return order.map((k) => ({ key: k, items: map[k] }));
 }
-
-async function needCaptcha(pending, imageOverride) {
-    const image = imageOverride != null ? imageOverride : await fetchCaptcha(pending.session);
-    return {
-        type: 'needInput',
-        prompt: '需要输入图片验证码',
-        // 验证码不掩码：用户要照着图抄，掩码只会让他抄错。
-        // 掩码该留给密码这种长期秘密
-        fields: [{ name: SLOT_CAPTCHA, displayName: '验证码', secret: false }],
-        captchaImage: image || undefined,
-    };
-}
-
-function needOtp(hint) {
-    return {
-        type: 'needInput',
-        prompt: hint ? '验证码已发送至 ' + hint : '需要二次验证码，请查看手机短信或邮箱',
-        fields: [{ name: SLOT_OTP, displayName: '验证码', secret: false, hint: '6 位数字' }],
-    };
-}
-
-/** 提交图片验证码：往那份已算好的表单里补一个 captCode，不重走握手 */
-async function submitCaptcha(code) {
-    const pending = pendingLogin;
-    log('i', '提交图片验证码');
-    const auth2 = await serviceLoginAuth2(
-        pending.session,
-        pending.account,
-        md5Upper(pending.password),
-        pending.handshake,
-        code,
-    );
-    return await handleAuth2(auth2, pending.account);
-}
-
-/**
- * ③ 走 STS 回调拿 serviceToken
- *
- * @param epoch 进入本次登录轮次时的会话代数，透传给 [finishLogin] 做落盘前校验。
- *   必须显式传入：它是 [handleAuth2] 的局部变量，本函数看不到外层作用域。
- */
-async function completeLogin(auth2, account, epoch) {
-    const loc = auth2.location || '';
-    if (!loc) {
-        log('e', 'passport 返回成功但没有 location，无法换 serviceToken');
-        pendingLogin = null;
-        return { type: 'failure', message: '登录成功但缺少 STS 回调地址' };
+async function health() {
+  try {
+    const creds = loadCredentials();
+    if (!isValidCreds(creds)) {
+      return { status: "broken", message: "\u672A\u767B\u5F55\u5C0F\u7C73\u8D26\u53F7" };
     }
-
-    const pending = pendingLogin;
-    // STS 这一步不能跟随跳转：serviceToken 是在该跳的 Set-Cookie 里下发的
-    const token = await fetchServiceToken(pending.session, loc, pending.userId || '');
-    log('i', 'STS 回调完成，拿到 serviceToken=' + !!token);
-    if (!token) {
-        // STS 的 Set-Cookie 已经落在 session.jar 里了，再兜一次
-        const fromJar = usableServiceToken(
-            pending.session.cookie('serviceToken', 'sts-hlth.io.mi.com') ||
-            pending.session.cookie('serviceToken', 'sts.api.io.mi.com'),
-        );
-        if (!fromJar) {
-            log('e', 'STS 回调未拿到 serviceToken，可能被风控拦截');
-            pendingLogin = null;
-            return { type: 'failure', message: '未拿到 serviceToken，可能被风控拦截' };
-        }
-        return finishLogin(auth2, fromJar, account, epoch);
-    }
-    return finishLogin(auth2, token, account, epoch);
-}
-
-/**
- * 只保留可用的 serviceToken 值。
- *
- * `EXPIRED` 是过期标记；`miothealth` 是 `.hlth.io.mi.com` 上名为 serviceToken
- * 的 sid 标记（参考实现 API.md 明确警告它不是令牌）。按 cookie 名字取值时
- * 很容易先命中这两个，带上去请求必然 401。
- */
-function usableServiceToken(value) {
-    if (!value || value === 'EXPIRED' || value === SID) return '';
-    return value;
-}
-
-/**
- * 落盘前的可用性探测。
- *
- * 「能换到 serviceToken」不等于「这对凭据能用」：ssecurity 每次会话都会变，
- * 必须与同次会话的 token 配套，拿错配的一对去请求数据接口会稳定 401。
- * 只校验字段非空就报「登录成功」，用户看到的就是「显示已登录、数据全空」。
- *
- * 所以落盘前真的打一次数据接口。数据接口在 HTTP 失败、空响应或解密失败时
- * 会抛出异常，避免把 401 误判为无数据；0 条记录则属于探测通过。
- *
- * @return 可用返回空串；不可用返回给用户看的原因
- */
-async function probeCredentials(creds) {
     const client = clientFor(creds);
     const now = Date.now();
     try {
-        // 只取一页，窗口很短：探测要快、失败要早。
-        // 只要请求没被拒，0 条也算通过——那说明鉴权与解密都是通的
-        const points = await client.getFitnessDataByTime('steps', now - DAY_MILLIS, now, 1);
-        log('i', '凭据探测通过，采样点 ' + (points ? points.length : 0) + ' 个');
-        return '';
+      const points = await client.getFitnessDataByTime("steps", now - DAY_MILLIS, now, 1);
+      if (points && points.length >= 0) {
+        credsRejectedByServer = false;
+        return { status: "healthy" };
+      }
     } catch (e) {
-        log('w', '凭据探测异常：' + describeError(e));
-        return describeError(e);
+      log2("w", "health probe failed: " + describeError(e));
+      if (isAuthError(e)) {
+        credsRejectedByServer = true;
+        return { status: "broken", message: "\u767B\u5F55\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u5C0F\u7C73\u8D26\u53F7" };
+      }
     }
+    if (!isValidCreds(loadCredentials())) {
+      return { status: "broken", message: "\u767B\u5F55\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55" };
+    }
+    if (credsRejectedByServer) {
+      return { status: "broken", message: "\u767B\u5F55\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u5C0F\u7C73\u8D26\u53F7" };
+    }
+    return { status: "degraded", message: "\u4E91\u7AEF\u63A5\u53E3\u6682\u65F6\u4E0D\u53EF\u7528" };
+  } catch (e) {
+    log2("e", "health failed: " + describeError(e));
+    return { status: "degraded", message: "\u5065\u5EB7\u68C0\u67E5\u5F02\u5E38\uFF1A" + describeError(e) };
+  }
 }
-
+async function detailUi() {
+  const blocks = [];
+  try {
+    const auth = await authState();
+    let label = "\u672A\u767B\u5F55";
+    let tone = "error";
+    let detail = "\u8BF7\u56DE\u63D2\u4EF6\u5217\u8868\u9875\u767B\u5F55";
+    if (auth.state === "loggedIn") {
+      label = "\u5DF2\u767B\u5F55";
+      tone = "ok";
+      detail = auth.accountName || "";
+    } else if (auth.state === "expired") {
+      label = "\u767B\u5F55\u5373\u5C06\u8FC7\u671F";
+      tone = "warn";
+      detail = auth.message || "";
+    }
+    blocks.push({ type: "statusCard", label: "\u767B\u5F55\u72B6\u6001", value: label, tone, detail: detail || null });
+    const recentSteps = recentValues(STEPS_KEY);
+    const recentSleep = recentValues(SLEEP_KEY);
+    if (recentSteps.length > 0) {
+      const last = recentSteps[recentSteps.length - 1];
+      blocks.push({
+        type: "statusCard",
+        label: "\u6700\u8FD1\u4E00\u6B21\u6B65\u6570",
+        value: Math.round(last.value) + " \u6B65",
+        tone: "neutral",
+        detail: last.date
+      });
+      blocks.push({
+        type: "chart",
+        title: "\u8FD1 " + recentSteps.length + " \u65E5\u6B65\u6570",
+        chart: {
+          kind: "bar",
+          bars: recentSteps.map((r) => ({ label: r.date.slice(-5), value: r.value })),
+          unit: " \u6B65",
+          // 最后一根通常是今天，高亮它让用户一眼找到当前位置
+          highlightIndex: recentSteps.length - 1
+        }
+      });
+    } else {
+      blocks.push({
+        type: "text",
+        title: "\u8FD8\u6CA1\u6709\u6B65\u6570\u6570\u636E",
+        body: "\u70B9\u4E0B\u9762\u7684\u300C\u7ACB\u5373\u540C\u6B65\u300D\u62C9\u53D6\u4ECA\u5929\u7684\u6570\u636E\u3002"
+      });
+    }
+    if (recentSleep.length > 0) {
+      const last = recentSleep[recentSleep.length - 1];
+      blocks.push({
+        type: "statusCard",
+        label: "\u6700\u8FD1\u4E00\u6B21\u7761\u7720",
+        value: (last.value / 60).toFixed(1) + " \u5C0F\u65F6",
+        tone: "neutral",
+        detail: last.date
+      });
+      blocks.push({
+        type: "chart",
+        title: "\u8FD1 " + recentSleep.length + " \u65E5\u7761\u7720",
+        chart: {
+          kind: "line",
+          // 库里存的是分钟，图上换成小时才符合日常表达
+          points: recentSleep.map((r) => ({ label: r.date.slice(-5), value: r.value / 60 })),
+          unit: " \u5C0F\u65F6"
+        }
+      });
+      blocks.push({
+        type: "text",
+        title: "\u7EDF\u8BA1\u53E3\u5F84",
+        body: "\u6309\u81EA\u7136\u65E5\u7D2F\u8BA1\u7761\u7720\u65F6\u957F\uFF0C\u8DE8\u591C\u7761\u7720\u4F1A\u62C6\u5230\u524D\u540E\u4E24\u5929\uFF0C\u6240\u4EE5\u8FD9\u91CC\u663E\u793A\u7684\u4E0D\u662F\u300C\u6628\u591C\u603B\u7761\u7720\u300D\u3002"
+      });
+    } else {
+      blocks.push({
+        type: "text",
+        title: "\u8FD8\u6CA1\u6709\u7761\u7720\u6570\u636E",
+        body: "\u6234\u624B\u73AF\u7761\u89C9\u540E\u70B9\u300C\u7ACB\u5373\u540C\u6B65\u300D\uFF0C\u7761\u7720\u624D\u4F1A\u88AB\u540C\u6B65\u8FC7\u6765\u3002"
+      });
+    }
+    const loggedIn = auth.state === "loggedIn";
+    blocks.push({
+      type: "buttonRow",
+      buttons: [
+        {
+          label: "\u7ACB\u5373\u540C\u6B65",
+          actionId: ACTION_SYNC,
+          primary: true,
+          // 没登录时同步必然失败，直接禁用比让用户点了再看报错好
+          enabled: loggedIn
+        },
+        {
+          label: "\u56DE\u8865\u8FD1 " + BACKFILL_DAYS + " \u5929",
+          actionId: ACTION_BACKFILL,
+          // 回补只补原始条目（供查看核对），不改历史聚合值与得分
+          enabled: loggedIn
+        }
+      ]
+    });
+    return blocks;
+  } catch (e) {
+    log2("e", "detailUi failed: " + describeError(e));
+    return blocks.concat([{ type: "text", title: "\u8BE6\u60C5\u9875\u6E32\u67D3\u5931\u8D25", body: describeError(e) }]);
+  }
+}
+function recentValues(metricKey) {
+  try {
+    const rows = ctx.recentMetrics(metricKey, DAYS);
+    if (!rows || rows.length === 0) return [];
+    const arr = rows.map((r) => ({ date: String(r.date || ""), value: Number(r.value) || 0 }));
+    return arr.slice(-DAYS);
+  } catch (e) {
+    log2("w", "recentMetrics(" + metricKey + ") failed: " + describeError(e));
+    return [];
+  }
+}
+async function onAction(actionId) {
+  try {
+    if (actionId === ACTION_SYNC) {
+      return { type: "triggerSync" };
+    }
+    if (actionId === ACTION_BACKFILL) {
+      return await backfillHistory();
+    }
+    return { type: "noop" };
+  } catch (e) {
+    log2("e", "onAction(" + actionId + ") failed: " + describeError(e));
+    return { type: "showMessage", text: "\u64CD\u4F5C\u5931\u8D25\uFF1A" + describeError(e) };
+  }
+}
+async function backfillHistory() {
+  const creds = loadCredentials();
+  if (!isValidCreds(creds)) {
+    return { type: "showMessage", text: "\u672A\u767B\u5F55\u5C0F\u7C73\u8D26\u53F7\uFF0C\u8BF7\u5148\u5728\u63D2\u4EF6\u9875\u767B\u5F55" };
+  }
+  const client = clientFor(creds);
+  let filled = 0;
+  let empty = 0;
+  let failed = 0;
+  const today = /* @__PURE__ */ new Date();
+  for (let offset = 0; offset < BACKFILL_DAYS; offset++) {
+    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - offset);
+    const date = formatDate(d);
+    const range = dayRange(date);
+    if (!range) {
+      failed++;
+      continue;
+    }
+    try {
+      const [start, end] = range;
+      const steps = await collectSteps(client, start, end, date);
+      const sleep = await collectSleepMinutes(client, start, end, date);
+      if (steps !== null || sleep !== null) {
+        filled++;
+      } else {
+        empty++;
+      }
+    } catch (e) {
+      log2("w", "\u56DE\u8865 " + date + " \u5931\u8D25\uFF1A" + describeError(e));
+      failed++;
+    }
+  }
+  if (failed === 0 && empty === 0) {
+    return { type: "showMessage", text: "\u5DF2\u56DE\u8865\u6700\u8FD1 " + filled + " \u5929\u7684\u539F\u59CB\u6570\u636E" };
+  }
+  if (filled === 0 && failed === 0) {
+    return {
+      type: "showMessage",
+      text: "\u6700\u8FD1 " + BACKFILL_DAYS + " \u5929\u90FD\u6CA1\u6709\u627E\u5230\u53EF\u56DE\u8865\u7684\u8BB0\u5F55"
+    };
+  }
+  const parts = ["\u5DF2\u56DE\u8865 " + filled + " \u5929"];
+  if (empty > 0) parts.push(empty + " \u5929\u65E0\u8BB0\u5F55");
+  if (failed > 0) parts.push(failed + " \u5929\u53D6\u6570\u5931\u8D25");
+  return { type: "showMessage", text: parts.join("\uFF0C") };
+}
+function md5Upper(text) {
+  return String(ctx.crypto.md5Hex(toUtf8(text))).toUpperCase();
+}
+function toUtf8(str) {
+  const out = [];
+  for (let i = 0; i < str.length; i++) {
+    let code = str.charCodeAt(i);
+    if (code >= 55296 && code <= 56319 && i + 1 < str.length) {
+      const low = str.charCodeAt(i + 1);
+      if (low >= 56320 && low <= 57343) {
+        code = 65536 + (code - 55296 << 10) + (low - 56320);
+        i++;
+      }
+    }
+    if (code < 128) out.push(code);
+    else if (code < 2048) out.push(192 | code >> 6, 128 | code & 63);
+    else if (code < 65536) out.push(224 | code >> 12, 128 | code >> 6 & 63, 128 | code & 63);
+    else out.push(240 | code >> 18, 128 | code >> 12 & 63, 128 | code >> 6 & 63, 128 | code & 63);
+  }
+  return out;
+}
+function hasUsableSsecurity(auth2) {
+  const v = auth2 && auth2.ssecurity;
+  return typeof v === "string" && v.length > 4;
+}
+async function handleAuth2(auth2, account) {
+  const epoch = captureEpoch();
+  if (!auth2) {
+    pendingLogin = null;
+    return { type: "failure", message: "\u767B\u5F55\u8BF7\u6C42\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC" };
+  }
+  const code = typeof auth2.code === "number" ? auth2.code : -1;
+  log2(
+    "i",
+    "serviceLoginAuth2 \u89E3\u6790\uFF1Acode=" + code + " ssecurity=" + (hasUsableSsecurity(auth2) ? "len" + String(auth2.ssecurity).length : "(\u7A7A\u6216\u65E0\u6548)") + " cUserId=" + (auth2.cUserId ? "len" + String(auth2.cUserId).length : "(\u7A7A)") + " passToken=" + (auth2.passToken ? "len" + String(auth2.passToken).length : "(\u7A7A)") + " \u6709 location=" + !!auth2.location + " \u6709 notificationUrl=" + !!auth2.notificationUrl
+  );
+  if (hasUsableSsecurity(auth2)) {
+    log2("i", "auth2 \u5DF2\u5E26 ssecurity\uFF0C\u8D70 STS \u56DE\u8C03");
+    return await completeLogin(auth2, account, epoch);
+  }
+  const notification = auth2.notificationUrl || "";
+  if (notification) {
+    log2("i", "\u6CA1\u6709 ssecurity \u4E14\u6709 notificationUrl\uFF0C\u8FDB\u5165 2FA \u6D41\u7A0B");
+    return await start2FA(notification, auth2.ssecurity || "", account);
+  }
+  if (code === 0) {
+    log2("e", "auth2 code=0 \u4F46\u7F3A\u5C11 ssecurity\uFF0C\u4E14\u65E0 notificationUrl\uFF0C\u65E0\u6CD5\u7EE7\u7EED");
+    pendingLogin = null;
+    return {
+      type: "failure",
+      message: "\u767B\u5F55\u672A\u5B8C\u6210\uFF1A\u670D\u52A1\u7AEF\u8FD4\u56DE\u6210\u529F\u4F46\u6CA1\u6709\u4E0B\u53D1\u4F1A\u8BDD\u5BC6\u94A5\uFF08ssecurity\uFF09\u3002\u8BF7\u786E\u8BA4\u8BE5\u8D26\u53F7\u5DF2\u5728\u5C0F\u7C73\u8FD0\u52A8\u5065\u5EB7\u5B98\u65B9 App \u4E2D\u5B8C\u6210\u8FC7\u9A8C\u8BC1\uFF0C\u7136\u540E\u91CD\u8BD5\u3002"
+    };
+  }
+  if (code === 87001 || code === 70016 || auth2.captchaUrl) {
+    log2("i", "\u9700\u8981\u56FE\u7247\u9A8C\u8BC1\u7801\uFF0Ccode=" + code);
+    pendingLogin.stage = "captcha";
+    const image = await fetchCaptcha(pendingLogin.session);
+    return needCaptcha(pendingLogin, image);
+  }
+  log2("w", "\u767B\u5F55\u88AB\u62D2\uFF1Acode=" + code + " desc=" + (auth2.desc || ""));
+  pendingLogin = null;
+  return { type: "failure", message: friendlyError(code, auth2.desc || "") };
+}
+async function needCaptcha(pending, imageOverride) {
+  const image = imageOverride != null ? imageOverride : await fetchCaptcha(pending.session);
+  return {
+    type: "needInput",
+    prompt: "\u9700\u8981\u8F93\u5165\u56FE\u7247\u9A8C\u8BC1\u7801",
+    // 验证码不掩码：用户要照着图抄，掩码只会让他抄错。
+    // 掩码该留给密码这种长期秘密
+    fields: [{ name: SLOT_CAPTCHA, displayName: "\u9A8C\u8BC1\u7801", secret: false }],
+    captchaImage: image || void 0
+  };
+}
+function needOtp(hint) {
+  return {
+    type: "needInput",
+    prompt: hint ? "\u9A8C\u8BC1\u7801\u5DF2\u53D1\u9001\u81F3 " + hint : "\u9700\u8981\u4E8C\u6B21\u9A8C\u8BC1\u7801\uFF0C\u8BF7\u67E5\u770B\u624B\u673A\u77ED\u4FE1\u6216\u90AE\u7BB1",
+    fields: [{ name: SLOT_OTP, displayName: "\u9A8C\u8BC1\u7801", secret: false, hint: "6 \u4F4D\u6570\u5B57" }]
+  };
+}
+async function submitCaptcha(code) {
+  const pending = pendingLogin;
+  log2("i", "\u63D0\u4EA4\u56FE\u7247\u9A8C\u8BC1\u7801");
+  const auth2 = await serviceLoginAuth2(
+    pending.session,
+    pending.account,
+    md5Upper(pending.password),
+    pending.handshake,
+    code
+  );
+  return await handleAuth2(auth2, pending.account);
+}
+async function completeLogin(auth2, account, epoch) {
+  const loc = auth2.location || "";
+  if (!loc) {
+    log2("e", "passport \u8FD4\u56DE\u6210\u529F\u4F46\u6CA1\u6709 location\uFF0C\u65E0\u6CD5\u6362 serviceToken");
+    pendingLogin = null;
+    return { type: "failure", message: "\u767B\u5F55\u6210\u529F\u4F46\u7F3A\u5C11 STS \u56DE\u8C03\u5730\u5740" };
+  }
+  const pending = pendingLogin;
+  const token = await fetchServiceToken(pending.session, loc, pending.userId || "");
+  log2("i", "STS \u56DE\u8C03\u5B8C\u6210\uFF0C\u62FF\u5230 serviceToken=" + !!token);
+  if (!token) {
+    const fromJar = usableServiceToken(
+      pending.session.cookie("serviceToken", "sts-hlth.io.mi.com") || pending.session.cookie("serviceToken", "sts.api.io.mi.com")
+    );
+    if (!fromJar) {
+      log2("e", "STS \u56DE\u8C03\u672A\u62FF\u5230 serviceToken\uFF0C\u53EF\u80FD\u88AB\u98CE\u63A7\u62E6\u622A");
+      pendingLogin = null;
+      return { type: "failure", message: "\u672A\u62FF\u5230 serviceToken\uFF0C\u53EF\u80FD\u88AB\u98CE\u63A7\u62E6\u622A" };
+    }
+    return finishLogin(auth2, fromJar, account, epoch);
+  }
+  return finishLogin(auth2, token, account, epoch);
+}
+function usableServiceToken(value) {
+  if (!value || value === "EXPIRED" || value === SID) return "";
+  return value;
+}
+async function probeCredentials(creds) {
+  const client = clientFor(creds);
+  const now = Date.now();
+  try {
+    const points = await client.getFitnessDataByTime("steps", now - DAY_MILLIS, now, 1);
+    log2("i", "\u51ED\u636E\u63A2\u6D4B\u901A\u8FC7\uFF0C\u91C7\u6837\u70B9 " + (points ? points.length : 0) + " \u4E2A");
+    return "";
+  } catch (e) {
+    log2("w", "\u51ED\u636E\u63A2\u6D4B\u5F02\u5E38\uFF1A" + describeError(e));
+    return describeError(e);
+  }
+}
 async function finishLogin(auth2, serviceToken, account, epoch) {
-    // cUserId / serviceToken 都要能从会话 cookie 兜底。
-    //
-    // 为什么不能只信 auth2：首次密码登录时 auth2 往往只给 ssecurity 与 location，
-    // cUserId 是 STS 那一跳的 Set-Cookie 里才下发的（实测 auth2.cUserId 为 null）。
-    // 而数据接口要求 `Cookie: cUserId=...; serviceToken=...`，
-    // cUserId 为空会稳定 401——这正是「登录显示成功、数据全空」的另一种成因。
-    const session = pendingLogin && pendingLogin.session;
-    const fromJar = (name) => {
-        try {
-            return (session && session.cookie(name)) || '';
-        } catch (e) {
-            return '';
-        }
-    };
-
-    const creds = {
-        ssecurity: auth2.ssecurity || '',
-        serviceToken: serviceToken || usableServiceToken(fromJar('serviceToken')),
-        cUserId: auth2.cUserId || fromJar('cUserId'),
-        userId: auth2.userId ? String(auth2.userId) : fromJar('userId'),
-        passToken: auth2.passToken || fromJar('passToken'),
-        account,
-    };
-    if (!creds.ssecurity) {
-        log('e', '缺少 ssecurity，无法派生 sessionKey');
-        pendingLogin = null;
-        return { type: 'failure', message: '登录已通过但缺少 ssecurity，无法解密数据接口' };
+  const session = pendingLogin && pendingLogin.session;
+  const fromJar = (name) => {
+    try {
+      return session && session.cookie(name) || "";
+    } catch (e) {
+      return "";
     }
-    if (!creds.cUserId) {
-        // 宁可在这一步明确失败，也不要拿着空 cUserId 去请求、再让用户看一堆 401
-        log('e', '缺少 cUserId：auth2 与会话 cookie 都没有');
-        pendingLogin = null;
-        return {
-            type: 'failure',
-            message: '登录已通过但没有拿到用户标识（cUserId），无法访问数据接口。请重试登录。',
-        };
-    }
-    if (epoch !== sessionEpoch) {
-        // 期间用户登出：不落盘，也不报成功
-        log('w', '登录期间用户已登出，凭据不落盘');
-        pendingLogin = null;
-        return { type: 'failure', message: '登录已取消' };
-    }
-
-    log(
-        'i',
-        '准备落盘：ssecurity=len' + creds.ssecurity.length +
-            ' serviceToken=len' + creds.serviceToken.length +
-            ' cUserId=len' + creds.cUserId.length +
-            ' passToken=len' + creds.passToken.length,
-    );
-
-    // 落盘前先验证这对凭据真的能取数，避免「登录成功但永远没数据」
-    const probeError = await probeCredentials(creds);
-    if (probeError) {
-        pendingLogin = null;
-        return {
-            type: 'failure',
-            message: '登录已通过，但用这套凭据访问小米健康数据接口被拒绝（' + probeError + '）。' +
-                '这通常意味着账号需要在小米运动健康官方 App 里重新授权一次，然后回来重试登录。',
-        };
-    }
-
-    saveCredentials(creds);
+  };
+  const creds = {
+    ssecurity: auth2.ssecurity || "",
+    serviceToken: serviceToken || usableServiceToken(fromJar("serviceToken")),
+    cUserId: auth2.cUserId || fromJar("cUserId"),
+    userId: auth2.userId ? String(auth2.userId) : fromJar("userId"),
+    passToken: auth2.passToken || fromJar("passToken"),
+    account
+  };
+  if (!creds.ssecurity) {
+    log2("e", "\u7F3A\u5C11 ssecurity\uFF0C\u65E0\u6CD5\u6D3E\u751F sessionKey");
     pendingLogin = null;
-    log('i', '登录成功，凭据已保存，account=' + maskAccount(account));
-    return { type: 'success' };
+    return { type: "failure", message: "\u767B\u5F55\u5DF2\u901A\u8FC7\u4F46\u7F3A\u5C11 ssecurity\uFF0C\u65E0\u6CD5\u89E3\u5BC6\u6570\u636E\u63A5\u53E3" };
+  }
+  if (!creds.cUserId) {
+    log2("e", "\u7F3A\u5C11 cUserId\uFF1Aauth2 \u4E0E\u4F1A\u8BDD cookie \u90FD\u6CA1\u6709");
+    pendingLogin = null;
+    return {
+      type: "failure",
+      message: "\u767B\u5F55\u5DF2\u901A\u8FC7\u4F46\u6CA1\u6709\u62FF\u5230\u7528\u6237\u6807\u8BC6\uFF08cUserId\uFF09\uFF0C\u65E0\u6CD5\u8BBF\u95EE\u6570\u636E\u63A5\u53E3\u3002\u8BF7\u91CD\u8BD5\u767B\u5F55\u3002"
+    };
+  }
+  if (epoch !== sessionEpoch) {
+    log2("w", "\u767B\u5F55\u671F\u95F4\u7528\u6237\u5DF2\u767B\u51FA\uFF0C\u51ED\u636E\u4E0D\u843D\u76D8");
+    pendingLogin = null;
+    return { type: "failure", message: "\u767B\u5F55\u5DF2\u53D6\u6D88" };
+  }
+  log2(
+    "i",
+    "\u51C6\u5907\u843D\u76D8\uFF1Assecurity=len" + creds.ssecurity.length + " serviceToken=len" + creds.serviceToken.length + " cUserId=len" + creds.cUserId.length + " passToken=len" + creds.passToken.length
+  );
+  const probeError = await probeCredentials(creds);
+  if (probeError) {
+    pendingLogin = null;
+    return {
+      type: "failure",
+      message: "\u767B\u5F55\u5DF2\u901A\u8FC7\uFF0C\u4F46\u7528\u8FD9\u5957\u51ED\u636E\u8BBF\u95EE\u5C0F\u7C73\u5065\u5EB7\u6570\u636E\u63A5\u53E3\u88AB\u62D2\u7EDD\uFF08" + probeError + "\uFF09\u3002\u8FD9\u901A\u5E38\u610F\u5473\u7740\u8D26\u53F7\u9700\u8981\u5728\u5C0F\u7C73\u8FD0\u52A8\u5065\u5EB7\u5B98\u65B9 App \u91CC\u91CD\u65B0\u6388\u6743\u4E00\u6B21\uFF0C\u7136\u540E\u56DE\u6765\u91CD\u8BD5\u767B\u5F55\u3002"
+    };
+  }
+  saveCredentials(creds);
+  pendingLogin = null;
+  log2("i", "\u767B\u5F55\u6210\u529F\uFF0C\u51ED\u636E\u5DF2\u4FDD\u5B58\uFF0Caccount=" + maskAccount(account));
+  return { type: "success" };
 }
-
-/**
- * 触发二次验证码下发。
- *
- * `flag` 语义：**4 = 手机短信，8 = 邮箱**。必须按 flag 选端点，
- * 写死邮箱会得到 `{code:2, flag:4}`（要求改用手机）。
- */
 async function start2FA(notificationUrl, auth2Ssecurity, account) {
-    const pending = pendingLogin;
-    const abs = absoluteUrl(ACCOUNT, notificationUrl);
-
-    const ctxParam = queryParamOf(abs, 'context');
-    // identity 的 UA 要带真实 userId，参考实现从这里取
-    const identityUserId = queryParamOf(abs, 'userId');
-
-    // authStart 是 identity 会话的起点：它返回 302 跳到 identity 域，
-    // identity 会话 cookie 是在那些跳转的 Set-Cookie 里种下的。
-    //
-    // 交给宿主的会话自动跟随即可：会话挂了 CookieJar，重定向每一跳都会
-    // 自动带上并接收 cookie。这一步曾经必须手写逐跳，是因为当时宿主没有
-    // CookieJar，OkHttp 跟随重定向会把 Cookie 头剔除，会话因此建不起来。
-    try {
-        const startRes = await pending.session.send('GET', abs, {
-            userAgent: identityUa(deviceId(), identityUserId),
-            headers: { Referer: ACCOUNT + '/' },
-        });
-        log('i', 'authStart 状态=' + (startRes && startRes.status));
-    } catch (e) {
-        log('w', 'start2FA: authStart failed: ' + (e && e.message));
-    }
-
-    const listUrl =
-        IDENTITY +
-        '/list?sid=' + encodeURIComponent(SID) +
-        '&supportedMask=0&_locale=zh_CN' +
-        '&context=' + encodeURIComponent(ctxParam);
-    const listRes = await pending.session.send('GET', listUrl, {
-        userAgent: identityUa(deviceId(), identityUserId),
-        headers: { Referer: ACCOUNT + '/', 'Content-Type': 'application/x-www-form-urlencoded' },
+  const pending = pendingLogin;
+  const abs = absoluteUrl(ACCOUNT, notificationUrl);
+  const ctxParam = queryParamOf(abs, "context");
+  const identityUserId = queryParamOf(abs, "userId");
+  try {
+    const startRes = await pending.session.send("GET", abs, {
+      userAgent: identityUa(deviceId(), identityUserId),
+      headers: { Referer: ACCOUNT + "/" }
     });
-    const listJson = parseMiapi(listRes.body);
-    if (!listJson) {
-        log('e', '2FA 的 /list 返回无法解析：' + String(listRes.body || '').slice(0, 200));
-        pendingLogin = null;
-        return { type: 'failure', message: '无法获取二次验证方式' };
-    }
-
-    const flag = typeof listJson.flag === 'number' ? listJson.flag : 4;
-    const method = flag === 8 ? 'Email' : 'Phone';
-    log('i', '2FA 方式：flag=' + flag + ' method=' + method + ' context=' + (ctxParam || '(空)'));
-
-    // 触发下发
-    //
-    // 这两步的分工在旧实现里就定死了，不能合并：
-    // - verifyPhone/verifyEmail：GET，参数走 query，作用是让服务端把这次会话
-    //   标记成「正在走某个验证方式」，不带上它 sendPhoneTicket 会因会话未就绪而失败
-    // - sendPhoneTicket：POST，**参数必须在 body 里**（retry/icode/_json）
-    //
-    // 早先版本把 sendPhoneTicket 的参数全塞进 query、body 留空，
-    // 服务端拿不到 _json=true 就不会真发短信，插件这边只看到一次 200，误以为发成功了。
-    //
-    // `_dc` 必须带且必须每次不同：GET 且路径完全相同，中间层会按 URL 缓存，
-    // 缓存命中时会直接跳转到 `/auth/verifyPhone?...&userid=0` 这种缺参数的形式，
-    // 下面是 `{"code":10012,"desc":"非法请求"}`，且不发短信。
-    // 日志里 10:34 与 10:54 两次都是 10012，就是这个原因。
-    const verifyUrl =
-        IDENTITY + '/auth/verify' + method +
-        '?_dc=' + Date.now() +
-        '&_flag=' + flag + '&_json=true' +
-        '&sid=' + encodeURIComponent(SID) +
-        '&context=' + encodeURIComponent(ctxParam || '');
-    const verifyRes = await pending.session.send('GET', verifyUrl, {
-        userAgent: identityUa(deviceId(), identityUserId),
-        headers: { Referer: ACCOUNT + '/' },
-        // identity 端点偶发挂住（日志里有过等 37 秒才返回超时的情况），
-        // 默认 30s 叠加重试会拖到 60s 以上，直接吃掉宿主的单次调用预算
-        timeoutMs: IDENTITY_TIMEOUT_MS,
-    });
-    log(
-        'i',
-        'verify' + method + ' 状态=' + (verifyRes && verifyRes.status) +
-            ' body=' + String((verifyRes && verifyRes.body) || '').replace(/^&&&START&&&/, '').slice(0, 200),
-    );
-
-    if (method === 'Phone') {
-        const sendUrl = IDENTITY + '/auth/sendPhoneTicket';
-        const sendRes = await pending.session.send('POST', sendUrl, {
-            userAgent: identityUa(deviceId(), identityUserId),
-            headers: { Referer: ACCOUNT + '/', 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: 'retry=0&icode=&_json=true',
-            contentType: 'application/x-www-form-urlencoded',
-            timeoutMs: IDENTITY_TIMEOUT_MS,
-        });
-        // 这一步的返回值是判断「短信到底发没发」的唯一依据：
-        // 200 不代表发出去了，必须看 body 里的 code 与 desc
-        log(
-            'i',
-            'sendPhoneTicket 状态=' + (sendRes && sendRes.status) +
-                ' body=' + String((sendRes && sendRes.body) || '').replace(/^&&&START&&&/, '').slice(0, 300),
-        );
-    }
-
-    const hint = ['mask', 'notification', 'email', 'phone', 'address']
-        .map((k) => listJson[k])
-        .find((v) => typeof v === 'string' && v !== '') || '';
-
-    pendingLogin = {
-        stage: 'twoFactor',
-        session: pending.session,
-        account: pending.account,
-        password: pending.password,
-        handshake: pending.handshake,
-        userId: identityUserId,
-        context: ctxParam,
-        flag,
-        method,
-        hint,
-        auth2Ssecurity,
-    };
-
-    return needOtp(hint);
-}
-
-/** 提交二次验证码并在已认证会话里把凭据凑齐 */
-async function submit2FA(code) {
-    const pending = pendingLogin;
-    const identityUserId = pending.userId || '';
-
-    // 记下进入时的会话代数：2FA 链路里有多轮网络往返，
-    // 期间用户完全可能点了登出。写回凭据前必须比对代数，否则会把刚清掉的凭据装回去。
-    const epoch = captureEpoch();
-
-    // 提交验证码。location 有三个来源：JSON 字段 → 响应头 → 响应原文，
-    // 只读 JSON 会把「验证码通过但没拿到跳转地址」误判成失败
-    const verifyUrl =
-        IDENTITY + '/auth/verify' + pending.method +
-        '?_dc=' + Date.now() +
-        '&_flag=' + pending.flag +
-        '&_json=true&sid=' + encodeURIComponent(SID) +
-        '&context=' + encodeURIComponent(pending.context || '');
-    const res = await pending.session.send('POST', verifyUrl, {
-        userAgent: identityUa(deviceId(), identityUserId),
-        headers: { Referer: ACCOUNT + '/', 'Content-Type': 'application/x-www-form-urlencoded' },
-        body:
-            '_flag=' + pending.flag +
-            '&ticket=' + encodeURIComponent(String(code).trim()) +
-            '&trust=false&_json=true',
-        contentType: 'application/x-www-form-urlencoded',
-        followRedirects: false,
-    });
-
-    const json = parseMiapi(res.body);
-    const vcode = json && typeof json.code === 'number' ? json.code : 0;
-    let loc = (json && json.location) || (res.headers && res.headers['location']) || '';
-    if (!loc) {
-        const m = String(res.body || '').match(/location\s*[:=]\s*["']([^"']+)/);
-        if (m) loc = m[1];
-    }
-    log('i', '提交 2FA 验证码：code=' + vcode + ' 有 location=' + !!loc);
-
-    if (vcode !== 0 && !loc) {
-        return {
-            type: 'failure',
-            message: '验证码校验未通过（code=' + vcode + ' ' + ((json && json.desc) || '') + '）',
-        };
-    }
-    if (!loc) {
-        return { type: 'failure', message: '验证码通过但未拿到跳转地址' };
-    }
-
-    // 访问 location 建立已认证会话，**整条跳转链必须走完**。
-    //
-    // 认证 cookie（passToken / cUserId / userId / passInfo）是在中间某一跳的
-    // Set-Cookie 里种下的，最后一跳才给出 serviceToken。少走一跳就少一份 cookie。
-    //
-    // 这里照搬旧 Kotlin 版 `followRedirectsManually` 的做法：关掉宿主自动跟随，
-    // 自己逐跳 GET，每跳都用 identity UA。不要「聪明地」在 STS 前停下——
-    // 那样会漏掉最后一跳下发的 serviceToken。
-    //
-    // 每跳必须把响应体读完再继续。宿主已经读完了（responseToJson 取的是字节），
-    // 这一点和 OkHttp 手工调用时「不读完 body 会中断连接」的坑是同一件事。
-    try {
-        let current = absoluteUrl(ACCOUNT, loc);
-        for (let hop = 0; hop < 10; hop++) {
-            const r = await pending.session.send('GET', current, {
-                userAgent: identityUa(deviceId(), identityUserId),
-                followRedirects: false,
-            });
-            const status = (r && r.status) || 0;
-            const next = (r && r.headers && r.headers['location']) || '';
-            log(
-                'd',
-                '认证跳转 hop' + hop + ' http=' + status +
-                    ' setCookie=' + ((r && r.setCookie) || []).length +
-                    ' next=' + (next ? next.slice(0, 80) : '-'),
-            );
-            if (status < 300 || status >= 400 || !next) break;
-
-            // 按 RFC 3986 以**当前这一跳**为基准解析相对地址。
-            // 之前这里写成 absoluteUrl(ACCOUNT, next)，把站点根当基准，
-            // 一旦服务端给的是 `serviceLoginAuth2/end` 这类相对路径就会跳错，
-            // 跳错后服务端又回同一个相对值，于是打成死循环、一个 cookie 都收不到。
-            const resolved = absoluteUrl(current, next);
-            if (resolved === current) {
-                log('w', '认证跳转原地返回，停止：' + shortUrl(current));
-                break;
-            }
-            current = resolved;
-        }
-    } catch (e) {
-        log('w', 'submit2FA: visit location failed: ' + describeError(e));
-    }
-
-    // 2FA 之后是否真的有登录态，全看这几个 cookie。
-    // 缺 passToken 就只剩「重做 serviceLogin」一条路，而那条路实测常返回没有 ssecurity，
-    // 于是最终报「缺少 ssecurity」。把 cookie 名字直接打出来，比事后猜要省事得多
-    log('i', '2FA 后会话 cookie=[' + pending.session.names().join(',') + ']');
-
-    const jar = { value: (n, domain) => pending.session.cookie(n, domain) };
-    let cUserId = jar.value('cUserId') || '';
-    let passToken = jar.value('passToken') || '';
-    let userId = jar.value('userId') || '';
-    let serviceToken = jar.value('serviceToken', 'sts-hlth.io.mi.com') ||
-        jar.value('serviceToken', 'sts.api.io.mi.com') || '';
-    // `.hlth.io.mi.com` 上有个同名 cookie 存的是 sid 标记（miothealth），
-    // 它不是真令牌；`EXPIRED` 同理。按名字取值很容易命中它们，
-    // 带上去请求数据接口必然 401，所以在这里就判空
-    if (serviceToken === SID || serviceToken === 'EXPIRED') {
-        log('w', '会话里的 serviceToken 是标记值（' + serviceToken + '），按空处理');
-        serviceToken = '';
-    }
-
-    // ── 第 1 条路：重做 serviceLogin ──
-    // 2FA 通过后会话已认证，再问一次就能拿到 ssecurity。
-    //
-    // 前提是**请求要带上 jar 里的整组 cookie**（尤其 passToken），
-    // 见 API.md 第 ②a 步：「带 cookie {passToken, cUserId, userId} 重发
-    // serviceLogin → 返回 ssecurity」。早期这里手工塞了一个 userId 头，
-    // 反而把整组 cookie 覆盖掉了，于是稳定拿到不带 ssecurity 的响应。
-    let ssecurity = '';
-    try {
-        const again = await serviceLoginRaw(pending.session);
-        const againJson = again && again.json;
-        // 把原始响应打全：这里正是判断「为什么拿不到 ssecurity」的唯一证据。
-        // 之前截断到 400 字符，location 一长就把关键字段挤出去了
-        log(
-            'i',
-            '重做 serviceLogin 原始响应：status=' + (again && again.status) +
-                ' body=' + String((again && again.raw) || '').replace(/^&&&START&&&/, '').slice(0, 1200),
-        );
-        if (againJson) {
-            // 只认 ssecurity。
-            //
-            // 2FA 之后服务端返回的字段名是 `psecurity`（实测账号 19730365244：
-            // "Qq218KjztVL8nCULl6LUmg=="），它和 ssecurity 一样是 base64 16 字节，
-            // 但**不能当会话密钥用**：拿它派生 sessionKey 去打数据接口会稳定 401
-            // （日志实测：`重做 serviceLogin 取到会话密钥，字段=psecurity` 之后
-            // 紧接着 `GET data/... -> 401`）。
-            //
-            // 真正可用的是这次响应里同时下发的 passToken —— 它能换到配套的
-            // ssecurity + serviceToken，所以下面走 passToken 续期这条路。
-            ssecurity = againJson.ssecurity || '';
-            if (ssecurity) {
-                log('i', '重做 serviceLogin 取到 ssecurity，长度=' + ssecurity.length);
-            } else if (againJson.psecurity) {
-                log('i', '重做响应只有 psecurity（不能当会话密钥用），改走 passToken 续期');
-            }
-            if (!cUserId) cUserId = againJson.cUserId || '';
-            if (!passToken) passToken = againJson.passToken || '';
-            if (!userId) userId = againJson.userId ? String(againJson.userId) : '';
-            // ⚠️ 必须**无条件**用这次重做响应的 location 重新换 serviceToken。
-            //
-            // ssecurity 与 serviceToken 必须来自**同一次会话**：
-            // sessionKey = SHA256(ssecurity + nonce)，服务端拿这对值验签，
-            // 混用两次会话的凭据会稳定 401。
-            //
-            // 而 2FA 通过时的跳转链已经下发过一个 serviceToken，如果这里写成
-            // 「没有才去换」（`if (!serviceToken)`），就会保留那个旧令牌，
-            // 配上重做才拿到的 ssecurity，两者不配套 → 数据接口全 401。
-            // 参考实现 login.py:finish_2fa 正是无条件重换，这里必须对齐。
-            if (againJson.location) {
-                const renewed = await fetchServiceToken(
-                    pending.session, againJson.location, identityUserId,
-                );
-                if (renewed) {
-                    log('i', '按重做响应的 location 重新换取 serviceToken，长度=' + renewed.length +
-                        (serviceToken ? '（覆盖前长度=' + serviceToken.length + '）' : ''));
-                    serviceToken = renewed;
-                }
-            }
-        }
-        let cookieNames = pending.session.names().join(',');
-        log(
-            'i',
-            '重做 serviceLogin：code=' + (againJson && againJson.code) +
-                ' 有 ssecurity=' + !!ssecurity +
-                ' 有 passToken=' + !!passToken +
-                ' passToken长度=' + passToken.length +
-                ' 有 serviceToken=' + !!serviceToken +
-                ' 会话 cookie=[' + cookieNames + ']',
-        );
-    } catch (e) {
-        log('w', 'submit2FA: redo serviceLogin failed: ' + describeError(e));
-    }
-
-    // ── 第 2 条路：从 passInfo cookie 解析 ──
-    // 服务端有时只把 ssecurity 塞进这个 cookie，响应体里没有
-    if (!ssecurity) {
-        const passInfoRaw = jar.value('passInfo');
-        ssecurity = extractSsecurity(passInfoRaw);
-        // passInfo 是「有没有」与「解不解析得出来」两件事，必须分开记：
-        // cookie 不存在说明服务端压根没下发，存在却解不出说明解析规则要补
-        log(
-            'i',
-            'passInfo 兜底：' +
-                (passInfoRaw ? '有值(长度' + String(passInfoRaw).length + ')' : '不存在') +
-                ' 解析出 ssecurity=' + (ssecurity ? 'len' + ssecurity.length : '否'),
-        );
-    }
-
-    // ── 第 3 条路：用 passToken 独立换一套完整凭据 ──
-    // 这条路是给「日常续期」用的，逻辑最简单也最稳，
-    // 不依赖当前这个已经被 2FA 搅过的会话
-    if (!ssecurity && passToken) {
-        const refreshed = await refreshWithPassToken(passToken, cUserId, userId, pending.account);
-        if (isValidCreds(refreshed)) {
-            pendingLogin = null;
-            if (epoch !== sessionEpoch) {
-                // 期间已登出：凭据不能落盘，但也别报成功误导用户
-                return { type: 'failure', message: '登录已取消' };
-            }
-            // 与 finishLogin 同一口径：落盘前必须真的能取到数，
-            // 否则又是一次「显示已登录、数据全空」
-            const refreshProbeError = await probeCredentials(refreshed);
-            if (refreshProbeError) {
-                return {
-                    type: 'failure',
-                    message: '免密续期拿到的凭据无法访问数据接口（' + refreshProbeError + '），' +
-                        '请在小米运动健康官方 App 中重新授权后再试。',
-                };
-            }
-            saveCredentials(refreshed);
-            log('i', '经 passToken 续期登录成功，凭据已保存');
-            return { type: 'success' };
-        }
-    }
-
-    if (!ssecurity || !serviceToken) {
-        pendingLogin = null;
-        // 拿不到 ssecurity 就派生不出 sessionKey，任何数据接口都会失败，
-        // 必须让用户看到原因而不是静默返回空数据
-        log(
-            'e',
-            '2FA 未能凑齐凭据：缺' + (ssecurity ? 'serviceToken' : 'ssecurity') +
-                '（passToken长度=' + passToken.length +
-                ' cUserId长度=' + cUserId.length +
-                ' userId长度=' + userId.length + '）',
-        );
-        return {
-            type: 'failure',
-            message: '二次验证已通过，但未能换到可用的会话密钥（缺' +
-                (ssecurity ? 'serviceToken' : 'ssecurity') + '）。' +
-                '请确认该账号已在小米运动健康官方 App 中正常登录过，然后重试。',
-        };
-    }
-
+    log2("i", "authStart \u72B6\u6001=" + (startRes && startRes.status));
+  } catch (e) {
+    log2("w", "start2FA: authStart failed: " + describeError(e));
+  }
+  const listUrl = IDENTITY + "/list?sid=" + encodeURIComponent(SID) + "&supportedMask=0&_locale=zh_CN&context=" + encodeURIComponent(ctxParam);
+  const listRes = await pending.session.send("GET", listUrl, {
+    userAgent: identityUa(deviceId(), identityUserId),
+    headers: { Referer: ACCOUNT + "/", "Content-Type": "application/x-www-form-urlencoded" }
+  });
+  const listJson = parseMiapi(listRes.body);
+  if (!listJson) {
+    log2("e", "2FA \u7684 /list \u8FD4\u56DE\u65E0\u6CD5\u89E3\u6790\uFF1A" + String(listRes.body || "").slice(0, 200));
     pendingLogin = null;
-    if (epoch !== sessionEpoch) {
-        // 期间已登出：凭据不落盘，按「已取消」返回
-        return { type: 'failure', message: '登录已取消' };
-    }
-
-    const twoFactorCreds = {
-        ssecurity,
-        serviceToken,
-        cUserId,
-        userId,
-        passToken,
-        account: pending.account,
+    return { type: "failure", message: "\u65E0\u6CD5\u83B7\u53D6\u4E8C\u6B21\u9A8C\u8BC1\u65B9\u5F0F" };
+  }
+  const flag = typeof listJson.flag === "number" ? listJson.flag : 4;
+  const method = flag === 8 ? "Email" : "Phone";
+  log2("i", "2FA \u65B9\u5F0F\uFF1Aflag=" + flag + " method=" + method + " context=" + (ctxParam || "(\u7A7A)"));
+  const verifyUrl = IDENTITY + "/auth/verify" + method + "?_dc=" + Date.now() + "&_flag=" + flag + "&_json=true&sid=" + encodeURIComponent(SID) + "&context=" + encodeURIComponent(ctxParam || "");
+  const verifyRes = await pending.session.send("GET", verifyUrl, {
+    userAgent: identityUa(deviceId(), identityUserId),
+    headers: { Referer: ACCOUNT + "/" },
+    // identity 端点偶发挂住（日志里有过等 37 秒才返回超时的情况），
+    // 默认 30s 叠加重试会拖到 60s 以上，直接吃掉宿主的单次调用预算
+    timeoutMs: IDENTITY_TIMEOUT_MS
+  });
+  log2(
+    "i",
+    "verify" + method + " \u72B6\u6001=" + (verifyRes && verifyRes.status) + " body=" + String(verifyRes && verifyRes.body || "").replace(/^&&&START&&&/, "").slice(0, 200)
+  );
+  if (method === "Phone") {
+    const sendUrl = IDENTITY + "/auth/sendPhoneTicket";
+    const sendRes = await pending.session.send("POST", sendUrl, {
+      userAgent: identityUa(deviceId(), identityUserId),
+      headers: { Referer: ACCOUNT + "/", "Content-Type": "application/x-www-form-urlencoded" },
+      body: "retry=0&icode=&_json=true",
+      contentType: "application/x-www-form-urlencoded",
+      timeoutMs: IDENTITY_TIMEOUT_MS
+    });
+    log2(
+      "i",
+      "sendPhoneTicket \u72B6\u6001=" + (sendRes && sendRes.status) + " body=" + String(sendRes && sendRes.body || "").replace(/^&&&START&&&/, "").slice(0, 300)
+    );
+  }
+  const hint = ["mask", "notification", "email", "phone", "address"].map((k) => listJson[k]).find((v) => typeof v === "string" && v !== "") || "";
+  pendingLogin = {
+    stage: "twoFactor",
+    session: pending.session,
+    account: pending.account,
+    password: pending.password,
+    handshake: pending.handshake,
+    userId: identityUserId,
+    context: ctxParam,
+    flag,
+    method,
+    hint,
+    auth2Ssecurity
+  };
+  return needOtp(hint);
+}
+async function submit2FA(code) {
+  const pending = pendingLogin;
+  const identityUserId = pending.userId || "";
+  const epoch = captureEpoch();
+  const verifyUrl = IDENTITY + "/auth/verify" + pending.method + "?_dc=" + Date.now() + "&_flag=" + pending.flag + "&_json=true&sid=" + encodeURIComponent(SID) + "&context=" + encodeURIComponent(pending.context || "");
+  const res = await pending.session.send("POST", verifyUrl, {
+    userAgent: identityUa(deviceId(), identityUserId),
+    headers: { Referer: ACCOUNT + "/", "Content-Type": "application/x-www-form-urlencoded" },
+    body: "_flag=" + pending.flag + "&ticket=" + encodeURIComponent(String(code).trim()) + "&trust=false&_json=true",
+    contentType: "application/x-www-form-urlencoded",
+    followRedirects: false
+  });
+  const json = parseMiapi(res.body);
+  const vcode = json && typeof json.code === "number" ? json.code : 0;
+  let loc = json && json.location || res.headers && res.headers["location"] || "";
+  if (!loc) {
+    const m = String(res.body || "").match(/location\s*[:=]\s*["']([^"']+)/);
+    if (m) loc = m[1];
+  }
+  log2("i", "\u63D0\u4EA4 2FA \u9A8C\u8BC1\u7801\uFF1Acode=" + vcode + " \u6709 location=" + !!loc);
+  if (vcode !== 0 && !loc) {
+    return {
+      type: "failure",
+      message: "\u9A8C\u8BC1\u7801\u6821\u9A8C\u672A\u901A\u8FC7\uFF08code=" + vcode + " " + (json && json.desc || "") + "\uFF09"
     };
-
-    // 与 finishLogin 同一口径：ssecurity 与 serviceToken 分别来自重做 serviceLogin
-    // 和会话 cookie，两者是否配套只有真打一次接口才知道
-    const twoFactorProbeError = await probeCredentials(twoFactorCreds);
-    if (twoFactorProbeError) {
+  }
+  if (!loc) {
+    return { type: "failure", message: "\u9A8C\u8BC1\u7801\u901A\u8FC7\u4F46\u672A\u62FF\u5230\u8DF3\u8F6C\u5730\u5740" };
+  }
+  try {
+    let current = absoluteUrl(ACCOUNT, loc);
+    for (let hop = 0; hop < 10; hop++) {
+      const r = await pending.session.send("GET", current, {
+        userAgent: identityUa(deviceId(), identityUserId),
+        followRedirects: false
+      });
+      const status = r && r.status || 0;
+      const next = r && r.headers && r.headers["location"] || "";
+      log2(
+        "d",
+        "\u8BA4\u8BC1\u8DF3\u8F6C hop" + hop + " http=" + status + " setCookie=" + (r && r.setCookie || []).length + " next=" + (next ? next.slice(0, 80) : "-")
+      );
+      if (status < 300 || status >= 400 || !next) break;
+      const resolved = absoluteUrl(current, next);
+      if (resolved === current) {
+        log2("w", "\u8BA4\u8BC1\u8DF3\u8F6C\u539F\u5730\u8FD4\u56DE\uFF0C\u505C\u6B62\uFF1A" + shortUrl(current));
+        break;
+      }
+      current = resolved;
+    }
+  } catch (e) {
+    log2("w", "submit2FA: visit location failed: " + describeError(e));
+  }
+  log2("i", "2FA \u540E\u4F1A\u8BDD cookie=[" + pending.session.names().join(",") + "]");
+  const jar = { value: (n, domain) => pending.session.cookie(n, domain) };
+  let cUserId = jar.value("cUserId") || "";
+  let passToken = jar.value("passToken") || "";
+  let userId = jar.value("userId") || "";
+  let serviceToken = jar.value("serviceToken", "sts-hlth.io.mi.com") || jar.value("serviceToken", "sts.api.io.mi.com") || "";
+  if (serviceToken === SID || serviceToken === "EXPIRED") {
+    log2("w", "\u4F1A\u8BDD\u91CC\u7684 serviceToken \u662F\u6807\u8BB0\u503C\uFF08" + serviceToken + "\uFF09\uFF0C\u6309\u7A7A\u5904\u7406");
+    serviceToken = "";
+  }
+  let ssecurity = "";
+  try {
+    const again = await serviceLoginRaw(pending.session);
+    const againJson = again && again.json;
+    log2(
+      "i",
+      "\u91CD\u505A serviceLogin \u539F\u59CB\u54CD\u5E94\uFF1Astatus=" + (again && again.status) + " body=" + String(again && again.raw || "").replace(/^&&&START&&&/, "").slice(0, 1200)
+    );
+    if (againJson) {
+      ssecurity = againJson.ssecurity || "";
+      if (ssecurity) {
+        log2("i", "\u91CD\u505A serviceLogin \u53D6\u5230 ssecurity\uFF0C\u957F\u5EA6=" + ssecurity.length);
+      } else if (againJson.psecurity) {
+        log2("i", "\u91CD\u505A\u54CD\u5E94\u53EA\u6709 psecurity\uFF08\u4E0D\u80FD\u5F53\u4F1A\u8BDD\u5BC6\u94A5\u7528\uFF09\uFF0C\u6539\u8D70 passToken \u7EED\u671F");
+      }
+      if (!cUserId) cUserId = againJson.cUserId || "";
+      if (!passToken) passToken = againJson.passToken || "";
+      if (!userId) userId = againJson.userId ? String(againJson.userId) : "";
+      if (againJson.location) {
+        const renewed = await fetchServiceToken(
+          pending.session,
+          againJson.location,
+          identityUserId
+        );
+        if (renewed) {
+          log2("i", "\u6309\u91CD\u505A\u54CD\u5E94\u7684 location \u91CD\u65B0\u6362\u53D6 serviceToken\uFF0C\u957F\u5EA6=" + renewed.length + (serviceToken ? "\uFF08\u8986\u76D6\u524D\u957F\u5EA6=" + serviceToken.length + "\uFF09" : ""));
+          serviceToken = renewed;
+        }
+      }
+    }
+    const cookieNames = pending.session.names().join(",");
+    log2(
+      "i",
+      "\u91CD\u505A serviceLogin\uFF1Acode=" + (againJson && againJson.code) + " \u6709 ssecurity=" + !!ssecurity + " \u6709 passToken=" + !!passToken + " passToken\u957F\u5EA6=" + passToken.length + " \u6709 serviceToken=" + !!serviceToken + " \u4F1A\u8BDD cookie=[" + cookieNames + "]"
+    );
+  } catch (e) {
+    log2("w", "submit2FA: redo serviceLogin failed: " + describeError(e));
+  }
+  if (!ssecurity) {
+    const passInfoRaw = jar.value("passInfo");
+    ssecurity = extractSsecurity(passInfoRaw);
+    log2(
+      "i",
+      "passInfo \u515C\u5E95\uFF1A" + (passInfoRaw ? "\u6709\u503C(\u957F\u5EA6" + String(passInfoRaw).length + ")" : "\u4E0D\u5B58\u5728") + " \u89E3\u6790\u51FA ssecurity=" + (ssecurity ? "len" + ssecurity.length : "\u5426")
+    );
+  }
+  if (!ssecurity && passToken) {
+    const refreshed = await refreshWithPassToken(passToken, cUserId, userId, pending.account);
+    if (isValidCreds(refreshed)) {
+      pendingLogin = null;
+      if (epoch !== sessionEpoch) {
+        return { type: "failure", message: "\u767B\u5F55\u5DF2\u53D6\u6D88" };
+      }
+      const refreshProbeError = await probeCredentials(refreshed);
+      if (refreshProbeError) {
         return {
-            type: 'failure',
-            message: '二次验证已通过，但这套凭据访问数据接口被拒绝（' + twoFactorProbeError + '），' +
-                '请在小米运动健康官方 App 中重新授权后再试。',
+          type: "failure",
+          message: "\u514D\u5BC6\u7EED\u671F\u62FF\u5230\u7684\u51ED\u636E\u65E0\u6CD5\u8BBF\u95EE\u6570\u636E\u63A5\u53E3\uFF08" + refreshProbeError + "\uFF09\uFF0C\u8BF7\u5728\u5C0F\u7C73\u8FD0\u52A8\u5065\u5EB7\u5B98\u65B9 App \u4E2D\u91CD\u65B0\u6388\u6743\u540E\u518D\u8BD5\u3002"
         };
+      }
+      saveCredentials(refreshed);
+      log2("i", "\u7ECF passToken \u7EED\u671F\u767B\u5F55\u6210\u529F\uFF0C\u51ED\u636E\u5DF2\u4FDD\u5B58");
+      return { type: "success" };
     }
-
-    saveCredentials(twoFactorCreds);
-    log('i', '2FA 登录成功，凭据已保存，account=' + maskAccount(pending.account));
-    return { type: 'success' };
+  }
+  if (!ssecurity || !serviceToken) {
+    pendingLogin = null;
+    log2(
+      "e",
+      "2FA \u672A\u80FD\u51D1\u9F50\u51ED\u636E\uFF1A\u7F3A" + (ssecurity ? "serviceToken" : "ssecurity") + "\uFF08passToken\u957F\u5EA6=" + passToken.length + " cUserId\u957F\u5EA6=" + cUserId.length + " userId\u957F\u5EA6=" + userId.length + "\uFF09"
+    );
+    return {
+      type: "failure",
+      message: "\u4E8C\u6B21\u9A8C\u8BC1\u5DF2\u901A\u8FC7\uFF0C\u4F46\u672A\u80FD\u6362\u5230\u53EF\u7528\u7684\u4F1A\u8BDD\u5BC6\u94A5\uFF08\u7F3A" + (ssecurity ? "serviceToken" : "ssecurity") + "\uFF09\u3002\u8BF7\u786E\u8BA4\u8BE5\u8D26\u53F7\u5DF2\u5728\u5C0F\u7C73\u8FD0\u52A8\u5065\u5EB7\u5B98\u65B9 App \u4E2D\u6B63\u5E38\u767B\u5F55\u8FC7\uFF0C\u7136\u540E\u91CD\u8BD5\u3002"
+    };
+  }
+  pendingLogin = null;
+  if (epoch !== sessionEpoch) {
+    return { type: "failure", message: "\u767B\u5F55\u5DF2\u53D6\u6D88" };
+  }
+  const twoFactorCreds = {
+    ssecurity,
+    serviceToken,
+    cUserId,
+    userId,
+    passToken,
+    account: pending.account
+  };
+  const twoFactorProbeError = await probeCredentials(twoFactorCreds);
+  if (twoFactorProbeError) {
+    return {
+      type: "failure",
+      message: "\u4E8C\u6B21\u9A8C\u8BC1\u5DF2\u901A\u8FC7\uFF0C\u4F46\u8FD9\u5957\u51ED\u636E\u8BBF\u95EE\u6570\u636E\u63A5\u53E3\u88AB\u62D2\u7EDD\uFF08" + twoFactorProbeError + "\uFF09\uFF0C\u8BF7\u5728\u5C0F\u7C73\u8FD0\u52A8\u5065\u5EB7\u5B98\u65B9 App \u4E2D\u91CD\u65B0\u6388\u6743\u540E\u518D\u8BD5\u3002"
+    };
+  }
+  saveCredentials(twoFactorCreds);
+  log2("i", "2FA \u767B\u5F55\u6210\u529F\uFF0C\u51ED\u636E\u5DF2\u4FDD\u5B58\uFF0Caccount=" + maskAccount(pending.account));
+  return { type: "success" };
 }
-
-/**
- * 从 `passInfo` cookie 里解析 `ssecurity`。
- *
- * 它是一个 URL-encoded 的 JSON，也可能是 base64 过的，三种形态都试一遍。
- */
 function extractSsecurity(passInfo) {
-    if (!passInfo) return '';
-    const candidates = [passInfo];
+  if (!passInfo) return "";
+  const candidates = [passInfo];
+  try {
+    candidates.push(decodeURIComponent(passInfo));
+  } catch (e) {
+  }
+  try {
+    const bytes = b64decode(passInfo);
+    if (bytes && bytes.length > 0) {
+      let text = "";
+      for (let i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i] & 255);
+      if (/^[\x09\x0a\x0d\x20-\x7e]*$/.test(text)) candidates.push(text);
+    }
+  } catch (e) {
+  }
+  for (let i = 0; i < candidates.length; i++) {
+    const text = candidates[i];
     try {
-        candidates.push(decodeURIComponent(passInfo));
+      const o = JSON.parse(text);
+      if (o && typeof o.ssecurity === "string" && o.ssecurity) return o.ssecurity;
     } catch (e) {
-        // 非法 percent 编码，跳过
     }
-    try {
-        // base64 解出来可能是二进制，只有在能当文本用时才有意义
-        const bytes = b64decode(passInfo);
-        if (bytes && bytes.length > 0) {
-            let text = '';
-            for (let i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i] & 0xff);
-            if (/^[\x09\x0a\x0d\x20-\x7e]*$/.test(text)) candidates.push(text);
-        }
-    } catch (e) {
-        // 不是合法 base64
+    const m1 = text.match(/"ssecurity"\s*:\s*"([^"]+)"/);
+    if (m1) return m1[1];
+    const m2 = text.match(/(?:^|[&;\s])ssecurity=([^&;\s"']+)/);
+    if (m2) {
+      try {
+        return decodeURIComponent(m2[1]);
+      } catch (e) {
+        return m2[1];
+      }
     }
-
-    for (let i = 0; i < candidates.length; i++) {
-        const text = candidates[i];
-        try {
-            const o = JSON.parse(text);
-            if (o && typeof o.ssecurity === 'string' && o.ssecurity) return o.ssecurity;
-        } catch (e) {
-            // 不是 JSON，继续用正则试
-        }
-        const m1 = text.match(/"ssecurity"\s*:\s*"([^"]+)"/);
-        if (m1) return m1[1];
-        // passInfo 也可能是 "ssecurity=xxx&cUserId=yyy" 这种 query 串
-        const m2 = text.match(/(?:^|[&;\s])ssecurity=([^&;\s"']+)/);
-        if (m2) {
-            try {
-                return decodeURIComponent(m2[1]);
-            } catch (e) {
-                return m2[1];
-            }
-        }
-    }
-    return '';
+  }
+  return "";
 }
-
-/** 取 URL 查询参数（不依赖 URLSearchParams，QuickJS 里不一定有） */
 function queryParamOf(url, name) {
-    const idx = String(url).indexOf('?');
-    if (idx < 0) return '';
-    const pairs = String(url).slice(idx + 1).split('&');
-    for (let i = 0; i < pairs.length; i++) {
-        const eq = pairs[i].indexOf('=');
-        const k = eq < 0 ? pairs[i] : pairs[i].slice(0, eq);
-        if (k === name) {
-            const v = eq < 0 ? '' : pairs[i].slice(eq + 1);
-            try {
-                return decodeURIComponent(v);
-            } catch (e) {
-                return v;
-            }
-        }
+  const idx = String(url).indexOf("?");
+  if (idx < 0) return "";
+  const pairs = String(url).slice(idx + 1).split("&");
+  for (let i = 0; i < pairs.length; i++) {
+    const eq = pairs[i].indexOf("=");
+    const k = eq < 0 ? pairs[i] : pairs[i].slice(0, eq);
+    if (k === name) {
+      const v = eq < 0 ? "" : pairs[i].slice(eq + 1);
+      try {
+        return decodeURIComponent(v);
+      } catch (e) {
+        return v;
+      }
     }
-    return '';
+  }
+  return "";
 }
-
-/** 错误码到用户可读文案。70016 看起来像风控，实际多是账号侧需要先在官方 App 验证 */
 function friendlyError(code, desc) {
-    if (code === 70016) {
-        return '登录验证失败（70016）：小米拒绝了本次请求，通常是账号触发了风控或需要先在官方 App 完成一次验证';
-    }
-    if (code === 70002) return '账号或密码错误';
-    if (code === 70003) return '账号不存在';
-    if (code === 87001) return '验证码输入错误，请重新填写';
-    return '登录失败（' + code + '）：' + (desc || '未知错误');
+  if (code === 70016) {
+    return "\u767B\u5F55\u9A8C\u8BC1\u5931\u8D25\uFF0870016\uFF09\uFF1A\u5C0F\u7C73\u62D2\u7EDD\u4E86\u672C\u6B21\u8BF7\u6C42\uFF0C\u901A\u5E38\u662F\u8D26\u53F7\u89E6\u53D1\u4E86\u98CE\u63A7\u6216\u9700\u8981\u5148\u5728\u5B98\u65B9 App \u5B8C\u6210\u4E00\u6B21\u9A8C\u8BC1";
+  }
+  if (code === 70002) return "\u8D26\u53F7\u6216\u5BC6\u7801\u9519\u8BEF";
+  if (code === 70003) return "\u8D26\u53F7\u4E0D\u5B58\u5728";
+  if (code === 87001) return "\u9A8C\u8BC1\u7801\u8F93\u5165\u9519\u8BEF\uFF0C\u8BF7\u91CD\u65B0\u586B\u5199";
+  return "\u767B\u5F55\u5931\u8D25\uFF08" + code + "\uFF09\uFF1A" + (desc || "\u672A\u77E5\u9519\u8BEF");
 }
+export {
+  authState,
+  detailUi,
+  fetch,
+  health,
+  login,
+  logout,
+  onAction
+};

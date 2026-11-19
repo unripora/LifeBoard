@@ -100,7 +100,10 @@ class SourceResolver(private val scope: PanelScope) {
      */
     suspend fun resolve(key: String): SourceRef {
         val customs = scope.customSources()
-        val resolved = SourceKeys.resolve(key) { id -> customs.firstOrNull { it.id == id } }
+        val resolved = SourceKeys.resolve(
+            key = key,
+            lookup = SourceKeys.CustomSourceLookup { id -> customs.firstOrNull { it.id == id } },
+        )
 
         return when (resolved) {
             is SourceKeys.Resolved.Ok -> enrichPlugin(resolved.ref, key)

@@ -21,6 +21,7 @@ import com.lifeboard.shared.db.Daily_record
 import com.lifeboard.shared.db.Dashboard_card
 import com.lifeboard.shared.db.Dashboard_tab
 import com.lifeboard.shared.db.Metric
+import com.lifeboard.shared.db.Metric_meta
 import com.lifeboard.shared.db.Notification_log
 import com.lifeboard.shared.db.Plugin_raw_record
 import com.lifeboard.shared.db.Raw_notification
@@ -35,6 +36,7 @@ import com.lifeboard.shared.repository.model.CaptureRuleRecord
 import com.lifeboard.shared.repository.model.CustomSourceRecord
 import com.lifeboard.shared.repository.model.DashboardCard
 import com.lifeboard.shared.repository.model.DashboardTab
+import com.lifeboard.shared.repository.model.MetricMeta
 import com.lifeboard.shared.repository.model.NotificationLogRecord
 import com.lifeboard.shared.repository.model.PluginRawRecord
 import com.lifeboard.shared.repository.model.RawNotificationRecord
@@ -177,14 +179,29 @@ object SqldelightMappers {
      * 所以这里只用 `sourceType` 解析源。**不能用 bucket 列反推 SourceRef**：
      * 一个源可以同时有多个量纲，bucket 只说明这一行的口径。
      */
-    suspend fun Metric.toModel(lookup: SourceKeys.CustomSourceLookup): MetricRecord {
-        val ref = resolveOrThrow(sourceType, lookup, where = "metric.sourceType")
+    suspend fun Metric.toModel(
+        lookup: SourceKeys.CustomSourceLookup,
+        metaLookup: SourceKeys.MetricMetaLookup? = null,
+    ): MetricRecord {
+        val ref = resolveOrThrow(sourceType, lookup, where = "metric.sourceType", metaLookup = metaLookup)
         return MetricRecord(
             source = ref,
             date = date,
             value = value_,
         )
     }
+
+    // ---- 插件指标元数据 ----
+
+    fun Metric_meta.toModel(): MetricMeta = MetricMeta(
+        sourceType = sourceType,
+        pluginId = pluginId,
+        metricKey = metricKey,
+        displayName = displayName,
+        unit = unit,
+        bucket = bucket,
+        updatedAt = updatedAt,
+    )
 
     fun Source_health.toModel(source: SourceRef): SourceHealth = SourceHealth(
         source = source,
@@ -431,7 +448,8 @@ object SqldelightMappers {
         key: String,
         lookup: SourceKeys.CustomSourceLookup,
         where: String,
-    ): SourceRef = when (val r = SourceKeys.resolve(key, lookup)) {
+        metaLookup: SourceKeys.MetricMetaLookup? = null,
+    ): SourceRef = when (val r = SourceKeys.resolve(key, lookup, metaLookup)) {
         is SourceKeys.Resolved.Ok -> r.ref
         is SourceKeys.Resolved.Fallback -> throw IllegalStateException("$where 解析失败：${r.reason}")
     }

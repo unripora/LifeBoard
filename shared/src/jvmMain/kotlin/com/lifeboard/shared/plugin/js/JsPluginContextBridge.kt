@@ -68,25 +68,7 @@ class JsPluginContextBridge(
     }
 
     /** 注册到 JS 的函数名清单，交给 [JsRuntime.registerHostFunctions]。 */
-    fun functionNames(): List<String> = listOf(
-        "ctx.credentials.get",
-        "ctx.credentials.put",
-        "ctx.credentials.remove",
-        "ctx.credentials.clear",
-        "ctx.files.read",
-        "ctx.files.write",
-        "ctx.files.readBase64",
-        "ctx.files.writeBase64",
-        "ctx.files.list",
-        "ctx.recentMetrics",
-        "ctx.reportRawRecords",
-        "ctx.reportMetricQueried",
-        "ctx.log.d",
-        "ctx.log.i",
-        "ctx.log.w",
-        "ctx.log.e",
-        "ctx.pluginId",
-    )
+    fun functionNames(): List<String> = JsHostFunctions.CONTEXT
 
     /**
      * 把本对象注册给运行时。调用后 JS 侧即可使用 `ctx.*`。
@@ -258,7 +240,9 @@ class JsPluginContextBridge(
             arr.put(
                 PluginJsonObject().apply {
                     put("date", s.date)
-                    put("value", s.value.toString())
+                    // value 必须是数字：插件要拿它算均值、画趋势图，
+                    // 下发字符串会让 `a.value + b.value` 变成字符串拼接
+                    put("value", s.value)
                 }
             )
         }

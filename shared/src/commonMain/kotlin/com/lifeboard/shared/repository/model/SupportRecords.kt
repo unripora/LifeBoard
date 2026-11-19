@@ -68,6 +68,29 @@ data class PluginRawRecord(
 )
 
 /**
+ * 插件指标的元数据。
+ *
+ * 插件在运行时声明自己的指标（`MetricSpec`），这份声明此前只活在内存里，
+ * 一重启就丢；读取侧只能从 key 反推，于是展示名拼成 `pluginId·metricKey`
+ * 这种包名，量纲认不出就一律当 `COUNT`，心率被标成「次」。
+ *
+ * 落库后读取侧能拿到真实的 [displayName]、[bucket] 与 [unit]。
+ *
+ * @param sourceType 完整落库键 `PLUGIN_{pluginId}:{metricKey}`，同时是主键
+ * @param pluginId 拆出来存，让「某插件的全部指标」能走索引，不必对 sourceType 做 LIKE
+ * @param bucket 与 `metric.bucket` 列同一取值；两处必须一致，否则同一行会被两种口径解读
+ */
+data class MetricMeta(
+    val sourceType: String,
+    val pluginId: String,
+    val metricKey: String,
+    val displayName: String,
+    val unit: String,
+    val bucket: String,
+    val updatedAt: Long = 0L,
+)
+
+/**
  * 分应用屏幕使用时长。
  *
  * 为什么不塞进 `MetricRecord`：`metric` 的主键是 (sourceType, date, bucket)，

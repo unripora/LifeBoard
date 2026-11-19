@@ -83,23 +83,7 @@ class JsHttpBridge(
      */
     private val sessionClients = ConcurrentHashMap<String, OkHttpClient>()
 
-    fun functionNames(): List<String> = listOf(
-        "ctx.http.get",
-        "ctx.http.post",
-        "ctx.http.request",
-        "ctx.http.form",
-        "ctx.http.postForm",
-        "ctx.http.lastError",
-        "ctx.http.session",
-        "ctx.http.setHeader",
-        "ctx.http.setUserAgent",
-        "ctx.http.setFollowRedirects",
-        "ctx.http.cookieGet",
-        "ctx.http.cookieSet",
-        "ctx.http.cookieRemove",
-        "ctx.http.cookieClear",
-        "ctx.http.cookieAll",
-    )
+    fun functionNames(): List<String> = JsHostFunctions.HTTP
 
     fun install(rt: JsRuntime) {
         rt.registerHostFunctions(functionNames(), this)
@@ -553,8 +537,15 @@ class JsHttpBridge(
         val isText = isTextual(response.body?.contentType())
         val bodyText = if (isText) String(bodyBytes, Charsets.UTF_8) else ""
         val obj = PluginJsonObject()
-        obj.put("status", response.code.toString())
-        obj.put("ok", response.isSuccessful.toString())
+        // status / ok 必须以**原生类型**下发，不能是字符串。
+        //
+        // 早先这里写的是 `response.code.toString()` / `response.isSuccessful.toString()`，
+        // 于是插件拿到 `{status: "401", ok: "false"}`。JS 里非空字符串是真值，
+        // `!res.ok` 恒为假——401 被当成成功，插件继续去解密那段明文错误响应，
+        // 最后在 JSON.parse 处报「Unexpected end of JSON input」。
+        // 用户看到的是「数据格式错误」，真实原因却是「凭据已失效」。
+        obj.put("status", response.code)
+        obj.put("ok", response.isSuccessful)
         obj.put("body", bodyText)
         if (isText) {
             obj.putNull("bodyBase64")

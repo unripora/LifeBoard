@@ -107,6 +107,18 @@ actual class PluginJsonObject actual constructor() {
         map[key] = JsonPrimitive(value)
     }
 
+    actual fun put(key: String, value: Int) {
+        map[key] = JsonPrimitive(value)
+    }
+
+    actual fun put(key: String, value: Double) {
+        map[key] = JsonPrimitive(value)
+    }
+
+    actual fun put(key: String, value: Boolean) {
+        map[key] = JsonPrimitive(value)
+    }
+
     actual fun put(key: String, value: PluginJsonObject) {
         map[key] = value.toJsonElement()
     }
@@ -231,6 +243,18 @@ actual class PluginJsonArray actual constructor() {
     }
 
     actual fun put(value: String) {
+        list.add(JsonPrimitive(value))
+    }
+
+    actual fun put(value: Double) {
+        list.add(JsonPrimitive(value))
+    }
+
+    actual fun put(value: Int) {
+        list.add(JsonPrimitive(value))
+    }
+
+    actual fun put(value: Boolean) {
         list.add(JsonPrimitive(value))
     }
 
