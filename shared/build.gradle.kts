@@ -130,3 +130,25 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 }
+
+// `JsHostFunctionContractTest` 会读取仓库里的 `js-plugins/types/ctx.d.ts`，
+// 校验 TS 声明与宿主实际注入的 `ctx.*` 函数集一致。
+//
+// 那个文件不在 Gradle 的任何 sourceSet 里，默认不参与任务输入计算，
+// 于是出现「改了 ctx.d.ts，测试却显示 UP-TO-DATE 不重跑」——
+// 测试看着是绿的，实际根本没执行，这条防线等于不存在。
+// 所以必须显式声明为输入。
+tasks.matching { it.name == "desktopTest" }.configureEach {
+    inputs.file(rootProject.file("js-plugins/types/ctx.d.ts"))
+        .withPropertyName("jsPluginCtxTypeDeclaration")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+
+    // `MiHealthBundleSmokeTest` 会在真实 QuickJS 里加载这份构建产物。
+    // 同理，产物不在 sourceSet 里，不声明成输入就会「改了产物但测试不重跑」。
+    // 文件可能不存在（还没跑过 npm run build），用 optional 避免配置阶段失败。
+    val bundle = rootProject.file("js-plugins/mihealth/main.js")
+    inputs.files(files(bundle))
+        .withPropertyName("miHealthJsBundle")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+        .optional()
+}

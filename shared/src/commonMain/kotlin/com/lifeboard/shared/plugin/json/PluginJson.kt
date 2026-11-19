@@ -68,6 +68,27 @@ expect class PluginJsonObject() {
     /** 写入一个字符串值 */
     fun put(key: String, value: String)
 
+    /**
+     * 写入一个整数值。
+     *
+     * **必须与 [put] 的字符串重载并存**：HTTP 桥接把响应状态码交给插件的
+     * `res.status`，若写成字符串 `"401"`，插件里 `res.status === 401`
+     * 恒为假、`res.status >= 300` 却为真，同一份代码在不同判断下给出矛盾结果。
+     */
+    fun put(key: String, value: Int)
+
+    /** 写入一个浮点值（指标数值实际都是 `Double`）。 */
+    fun put(key: String, value: Double)
+
+    /**
+     * 写入一个布尔值。
+     *
+     * **不能用字符串代替**：`res.ok` 若下发 `"false"`，插件里 `!res.ok`
+     * 求值为假（非空字符串是真值），于是 401 被当成成功继续解析响应体，
+     * 最终报「JSON 格式错误」而不是「凭据失效」——错误信息与真实原因完全脱节。
+     */
+    fun put(key: String, value: Boolean)
+
     /** 写入一个对象值 */
     fun put(key: String, value: PluginJsonObject)
 
@@ -137,6 +158,18 @@ expect class PluginJsonArray() {
     fun put(value: PluginJsonArray)
 
     fun put(value: String)
+
+    /**
+     * 写入一个数值。
+     *
+     * 与 [PluginJsonObject.put] 的 Int/Boolean 重载同理：数组里的数值
+     * 若以字符串形态下发，插件侧的求和、均值、比较会静默算错。
+     */
+    fun put(value: Double)
+
+    fun put(value: Int)
+
+    fun put(value: Boolean)
 
     override fun toString(): String
 }

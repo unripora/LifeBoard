@@ -78,15 +78,20 @@ sealed interface SourceRef {
      *
      * @param pluginId 插件全局唯一标识，反向域名式，如 `dev.foo.mihealth`，不得含 `:`
      * @param metricKey 插件内唯一的指标键，如 `steps`，不得含 `:`
+     * @param unitOverride 插件声明的单位，如 `次/分`。为 null 时退回 [bucket] 的默认单位。
+     *   量纲（[bucket]）是**枚举里的有限几种**，插件能产出的单位远多于它
+     *   （心率是「次/分」但量纲只能落到 COUNT，睡眠是「小时」但量纲是 DURATION_MINUTES），
+     *   所以单位必须允许插件自己给，不能一律由量纲派生。
      */
     data class Plugin(
         val pluginId: String,
         val metricKey: String,
         override val displayName: String,
         override val bucket: MetricBucket,
+        val unitOverride: String? = null,
     ) : SourceRef {
         override val key: String get() = pluginKey(pluginId, metricKey)
-        override val unit: String get() = bucket.unit
+        override val unit: String get() = unitOverride?.takeIf { it.isNotBlank() } ?: bucket.unit
         override val isCustom: Boolean get() = false
         override val isPlugin: Boolean get() = true
     }

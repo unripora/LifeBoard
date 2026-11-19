@@ -38,16 +38,16 @@ class SchemaMigrationChainTest {
         DatabaseDriverFactory(migrate = true).create(dbFile.absolutePath)
 
     @Test
-    fun 全新建库后版本为18() {
+    fun 全新建库后版本为19() {
         assertEquals(
-            18L,
+            19L,
             newDriver().longValue("PRAGMA user_version"),
-            "目标版本必须与 Room 的 v18 一致",
+            "目标版本必须与最新迁移链一致；18.sqm 引入了 metric_meta",
         )
     }
 
     @Test
-    fun 建库后16张业务表全部存在() {
+    fun 建库后17张业务表全部存在() {
         val names = newDriver().stringColumn(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
         )
@@ -55,7 +55,7 @@ class SchemaMigrationChainTest {
             "task", "daily_record", "metric", "streak", "notification_log", "source_health",
             "raw_notification", "capture_rule", "custom_source", "app_usage",
             "plugin_credential", "dashboard_tab", "dashboard_card", "app_log",
-            "plugin_raw_record", "plugin_metric_query",
+            "plugin_raw_record", "plugin_metric_query", "metric_meta",
         ).forEach { assertTrue(it in names, "缺表 $it，实际有：$names") }
 
         // M0 探针已删，不该再出现在正式库里
@@ -83,6 +83,7 @@ class SchemaMigrationChainTest {
             "index_plugin_raw_record_pluginId_date",
             "index_plugin_raw_record_pluginId_date_metricKey",
             "index_plugin_metric_query_pluginId_date",
+            "index_metric_meta_pluginId",
         ).forEach { assertTrue(it in defined, "缺索引 $it，实际有：$defined") }
 
         // v13->v14 把 (tabId, type) 从 UNIQUE 改成普通索引。
@@ -123,7 +124,7 @@ class SchemaMigrationChainTest {
     }
 
     @Test
-    fun 从v1空库逐版本迁移到18() {
+    fun 从v1空库逐版本迁移到19() {
         // 按 v1 的结构手工建一个「最老的库」：只有 6 张表、3 个索引，
         // 没有任何后来新增的列
         val driver = DatabaseDriverFactory(migrate = false).create(dbFile.absolutePath)
@@ -138,12 +139,19 @@ class SchemaMigrationChainTest {
                 "VALUES ('老任务', 'SCREEN_TIME', 'FLAG', 1.0, 1.0, 0, 0, 1440, 1)",
             0,
         )
+        // 也插一条老指标：18.sqm 新增 metric_meta 但不该动 metric 里的任何一行
+        driver.execute(
+            null,
+            "INSERT INTO metric (sourceType, date, bucket, value) " +
+                "VALUES ('SCREEN_TIME', '2026-11-01', 'DURATION_MINUTES', 123.5)",
+            0,
+        )
 
-        // 一次性跨完 1 -> 18，SQLDelight 会按顺序跑所有 .sqm
-        LifeBoardDb.Schema.migrate(driver, 1L, 18L).value
-        driver.writeUserVersion(18)
+        // 一次性跨完 1 -> 19，SQLDelight 会按顺序跑所有 .sqm
+        LifeBoardDb.Schema.migrate(driver, 1L, 19L).value
+        driver.writeUserVersion(19)
 
-        assertEquals(18L, driver.longValue("PRAGMA user_version"))
+        assertEquals(19L, driver.longValue("PRAGMA user_version"))
 
         // 后来新增的表都该出现
         val tables = driver.stringColumn(
@@ -152,7 +160,7 @@ class SchemaMigrationChainTest {
         listOf(
             "raw_notification", "capture_rule", "custom_source", "app_usage",
             "plugin_credential", "dashboard_tab", "dashboard_card", "app_log",
-            "plugin_raw_record", "plugin_metric_query",
+            "plugin_raw_record", "plugin_metric_query", "metric_meta",
         ).forEach { assertTrue(it in tables, "迁移后缺表 $it，实际有：$tables") }
 
         // 老任务仍在，新列拿到的是迁移里写的默认值
@@ -164,6 +172,16 @@ class SchemaMigrationChainTest {
             ),
             "老任务必须保留，且新列取迁移里声明的默认值",
         )
+
+        // 老指标必须原样保留：新增表不能碰既有数据。
+        // 逐列比较、且都按字符串比：`row()` 用的是 getString，
+        // REAL 列读回来是 "123.5" 而不是 123.5，直接比 Double 会误报不等
+        val oldMetric = driver.row("SELECT sourceType, date, bucket, value FROM metric")
+        assertEquals(4, oldMetric.size, "老指标应只有 1 行 4 列，实际：$oldMetric")
+        assertEquals("SCREEN_TIME", oldMetric[0]?.toString(), "老指标的 sourceType 被改了")
+        assertEquals("2026-11-01", oldMetric[1]?.toString(), "老指标的 date 被改了")
+        assertEquals("DURATION_MINUTES", oldMetric[2]?.toString(), "老指标的 bucket 被改了")
+        assertEquals("123.5", oldMetric[3]?.toString(), "老指标的 value 被改了")
 
         // 迁移后的结构必须能接受新表写入（11.sqm 重建过的 dashboard_card 尤其要验）
         driver.execute(
@@ -182,6 +200,20 @@ class SchemaMigrationChainTest {
             1L,
             driver.longValue("SELECT count(*) FROM dashboard_card"),
             "迁移后的 dashboard_card 应能正常写入",
+        )
+
+        // 新表也要能写：这是 18.sqm 引入的表，迁移后必须可用
+        driver.execute(
+            null,
+            "INSERT INTO metric_meta " +
+                "(sourceType, pluginId, metricKey, displayName, unit, bucket, updatedAt) " +
+                "VALUES ('PLUGIN_p:hr', 'p', 'hr', '心率', '次/分', 'COUNT', 0)",
+            0,
+        )
+        assertEquals(
+            1L,
+            driver.longValue("SELECT count(*) FROM metric_meta"),
+            "迁移后 metric_meta 应能正常写入",
         )
     }
 

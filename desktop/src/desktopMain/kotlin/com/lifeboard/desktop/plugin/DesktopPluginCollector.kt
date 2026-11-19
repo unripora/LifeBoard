@@ -9,6 +9,7 @@ import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.shared.plugin.host.HostPluginContext
 import com.lifeboard.shared.repository.MetricStore
+import com.lifeboard.shared.repository.model.MetricMeta
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -94,6 +95,15 @@ class DesktopPluginCollector(
 
         val today = Dates.todayString()
         val context = buildContext(entry.pluginId)
+
+        // 把插件声明的指标元数据落库。
+        //
+        // 必须放在采集之前：即使这一轮采集失败（断网、凭据过期），
+        // 元数据也该已经写进去——否则读取侧连「这个插件有哪些指标、
+        // 心率该显示成什么单位」都不知道，只能继续用拼接的假展示名。
+        // 写入本身是 REPLACE，重复调用无副作用。
+        persistMetricMeta(entry)
+
         val result = try {
             // withCollectDate 把日期绑到上下文上：插件上报裸记录时要用它，
             // 而插件自己拿不到「宿主的今天」——各端时区可能不同
@@ -165,6 +175,45 @@ class DesktopPluginCollector(
             is FetchResult.Failure -> {
                 markHealth(entry, healthy = false, message = result.message.ifBlank { "采集失败" })
                 false
+            }
+        }
+    }
+
+    /**
+     * 把插件声明的指标元数据写进 `metric_meta`。
+     *
+     * ## 为什么每次采集都写
+     *
+     * 插件是运行时装进来的，宿主没有任何「插件安装完成」的可靠时点
+     * （用户可能直接替换 `.jsplugin` 文件）。采集是唯一稳定会走到的地方，
+     * 而 REPLACE 语义让重复写入无副作用。
+     *
+     * ## 失败不影响采集
+     *
+     * 元数据只影响展示名与单位。写不进去最多是「心率又显示成次」，
+     * 不该让整轮数据采集跟着失败，所以这里吞掉异常只记日志。
+     */
+    private suspend fun persistMetricMeta(entry: LoadedEntry) {
+        val now = System.currentTimeMillis()
+        for ((metricKey, spec) in entry.metrics) {
+            try {
+                metricStore.saveMetricMeta(
+                    MetricMeta(
+                        sourceType = SourceRef.pluginKey(entry.pluginId, metricKey),
+                        pluginId = entry.pluginId,
+                        metricKey = metricKey,
+                        displayName = spec.displayName,
+                        unit = spec.unit,
+                        // 必须与写进 metric.bucket 的取同一来源，
+                        // 否则同一行数据会被两种口径解读
+                        bucket = spec.bucket.name,
+                        updatedAt = now,
+                    ),
+                )
+            } catch (e: Exception) {
+                AppLogger.warn(
+                    "写入插件指标元数据失败：${entry.pluginId}/$metricKey（${e.message ?: e::class.simpleName}）",
+                )
             }
         }
     }

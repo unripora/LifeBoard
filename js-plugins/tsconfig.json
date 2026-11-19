@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+
+    // 关键：只给 ES2020 标准库。
+    // 不引入 "DOM" 或 "node" 的 lib/types —— 插件跑在 QuickJS 里，
+    // 没有 URL / TextEncoder / Buffer / fetch 这些全局对象。
+    // 让 TS 在它们上报错，正是这份配置要挡住的主要问题。
+    "lib": ["ES2020"],
+    "types": [],
+
+    // esbuild 负责转译，tsc 只做类型检查
+    "noEmit": true,
+
+    // 严格模式：插件的容错逻辑大量依赖 null 判断，
+    // 关掉 strictNullChecks 等于放弃一半的类型收益。
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": false,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+
+    // 允许 default import 写在前面，与 esbuild 打包行为一致
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+
+    // 允许 `import { x } from './util.js'` 解析到 util.ts。
+    // 插件源码里必须写 .js 后缀（QuickJS 按相对路径解析 ESM），
+    // 而磁盘上是 .ts，这里做一次映射。
+    "allowImportingTsExtensions": false,
+    "verbatimModuleSyntax": true
+  },
+  "include": ["types/**/*.d.ts", "types/__typecheck__/**/*.ts", "mihealth/**/*.ts"],
+  "exclude": ["mihealth/main.js", "node_modules", "_debug"]
+}

@@ -8,6 +8,7 @@ import com.lifeboard.shared.repository.MetricStore
 import com.lifeboard.shared.repository.SourceKeys
 import com.lifeboard.shared.repository.model.AppUsageRecord
 import com.lifeboard.shared.repository.model.AppUsageSum
+import com.lifeboard.shared.repository.model.MetricMeta
 import com.lifeboard.shared.repository.sqldelight.SqldelightMappers.toAppUsageSum
 import com.lifeboard.shared.repository.sqldelight.SqldelightMappers.toModel
 import com.lifeboard.shared.repository.sqldelight.SqldelightMappers.toRow
@@ -28,14 +29,27 @@ class SqldelightMetricStore(
 
     private val q: MetricQueries = db.metricQueries
 
+    /**
+     * 读指标时把 `metric_meta` 一起接进解析链。
+     *
+     * 不接的话，插件指标的展示名会一直是 `pluginId·metricKey` 这种包名，
+     * 量纲也一律退化成 COUNT——心率被标成「次」。
+     *
+     * 每次读取都查一次单条 meta 看着浪费，但这是 `SourceKeys.resolve`
+     * 的签名决定的（它只接受按 key 查）。列表场景应改用
+     * `SourceKeys.resolveAll` 并一次性传入 [getMetricMetas] 的结果，
+     * 避免逐条往返。
+     */
+    private val metaLookup = SourceKeys.MetricMetaLookup { key -> getMetricMeta(key) }
+
     override suspend fun getMetricsByDate(date: String): List<MetricRecord> =
-        q.selectMetricsByDate(date).executeAsList().map { it.toModel(lookup) }
+        q.selectMetricsByDate(date).executeAsList().map { it.toModel(lookup, metaLookup) }
 
     override suspend fun getMetric(sourceKey: String, date: String, bucket: String): MetricRecord? =
-        q.selectMetric(sourceKey, date, bucket).executeAsOneOrNull()?.toModel(lookup)
+        q.selectMetric(sourceKey, date, bucket).executeAsOneOrNull()?.toModel(lookup, metaLookup)
 
     override suspend fun getMetricsInRange(from: String, to: String): List<MetricRecord> =
-        q.selectMetricsInRange(from, to).executeAsList().map { it.toModel(lookup) }
+        q.selectMetricsInRange(from, to).executeAsList().map { it.toModel(lookup, metaLookup) }
 
     override suspend fun getSourceRange(
         sourceKey: String,
@@ -43,7 +57,8 @@ class SqldelightMetricStore(
         from: String,
         to: String,
     ): List<MetricRecord> =
-        q.selectSourceRange(sourceKey, bucket, from, to).executeAsList().map { it.toModel(lookup) }
+        q.selectSourceRange(sourceKey, bucket, from, to).executeAsList()
+            .map { it.toModel(lookup, metaLookup) }
 
     override suspend fun latestDateWithBucket(
         sourceKey: String,
@@ -66,6 +81,37 @@ class SqldelightMetricStore(
 
     override suspend fun deleteMetricsBySource(sourceKey: String): Int =
         q.deleteMetricsBySource(sourceKey).await().toInt()
+
+    // ---- 插件指标元数据 ----
+
+    override suspend fun getMetricMeta(sourceType: String): MetricMeta? =
+        q.selectMetricMeta(sourceType).executeAsOneOrNull()?.toModel()
+
+    override suspend fun getMetricMetas(sourceTypes: Collection<String>): Map<String, MetricMeta> {
+        // 空集合要提前返回：`IN ?` 在空列表上生成的 SQL 是 `IN ()`，
+        // SQLite 直接语法错误。而调用方在「还没有任何插件指标」时必然传空
+        if (sourceTypes.isEmpty()) return emptyMap()
+        val distinct = sourceTypes.distinct()
+        return q.selectMetricMetaIn(distinct)
+            .executeAsList()
+            .map { it.toModel() }
+            .associateBy { it.sourceType }
+    }
+
+    override suspend fun saveMetricMeta(meta: MetricMeta) {
+        q.insertMetricMeta(
+            sourceType = meta.sourceType,
+            pluginId = meta.pluginId,
+            metricKey = meta.metricKey,
+            displayName = meta.displayName,
+            unit = meta.unit,
+            bucket = meta.bucket,
+            updatedAt = meta.updatedAt,
+        )
+    }
+
+    override suspend fun deleteMetricMetaByPlugin(pluginId: String): Int =
+        q.deleteMetricMetaByPlugin(pluginId).await().toInt()
 
     override fun observeSourceHealth(): Flow<List<SourceHealth>> =
         q.observeSourceHealth().asListFlow().map { rows -> rows.map { it.model(lookup) } }

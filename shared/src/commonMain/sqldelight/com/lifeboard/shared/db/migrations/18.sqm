@@ -1,0 +1,38 @@
+-- v18 -> v19：新增 metric_meta，落库插件在运行时声明的指标元数据。
+--
+-- ## 为什么需要这张表
+--
+-- 插件的指标是运行时装配的，宿主编译期不知道有哪些。此前这份元数据
+-- （MetricSpec 的 displayName / bucket / unit）只活在内存里，一重启就没了，
+-- 于是读取侧只能靠 key 猜：
+--
+--   - displayName 拼成 "com.foo.bar·STEPS"，用户看到的是包名；
+--   - bucket 靠 `MetricBucket.entries.firstOrNull { it.name == metricKey }` 反解，
+--     插件的自定义 key（如 OBS_HEART_RATE）一律认不出，全部退化成 COUNT，
+--     心率于是被标成「次」。
+--
+-- 本表把它持久化，读取侧查得到就显示真名与真实量纲。
+--
+-- ## 为什么不改 metric 表
+--
+-- `metric` 主键是 (sourceType, date, bucket)，历史数据全部按这个口径落库。
+-- 把元数据拆到独立表，既不用改主键、也不用迁移任何历史行；
+-- 而且 meta 是「每源一条」的低频数据，混进按天增长的 metric 只会重复膨胀。
+--
+-- ## 为什么 sourceType 也存一遍
+--
+-- 它是 `PLUGIN_{pluginId}:{metricKey}` 的完整键，同时主键。
+-- 把 pluginId / metricKey 再拆成两列并存，是为了「按插件查全部指标」
+-- 能走一次索引，不必对 sourceType 做 LIKE 前缀匹配。
+CREATE TABLE `metric_meta` (
+    `sourceType` TEXT NOT NULL,
+    `pluginId` TEXT NOT NULL,
+    `metricKey` TEXT NOT NULL,
+    `displayName` TEXT NOT NULL,
+    `unit` TEXT NOT NULL,
+    `bucket` TEXT NOT NULL,
+    `updatedAt` INTEGER NOT NULL,
+    PRIMARY KEY(`sourceType`)
+);
+
+CREATE INDEX IF NOT EXISTS `index_metric_meta_pluginId` ON `metric_meta` (`pluginId`);

@@ -51,6 +51,19 @@ object SourceKeys {
         suspend fun find(id: Long): SourceRef.Custom?
     }
 
+    /**
+     * 查插件指标元数据的入口。
+     *
+     * 有了它，插件指标的展示名与量纲就来自插件自己的声明，
+     * 而不是从 key 反推出来的 `pluginId·metricKey` 与猜出来的 COUNT。
+     *
+     * 与 [CustomSourceLookup] 一样抽成参数而不是直接依赖数据库：
+     * 没有数据库的调用方（纯逻辑测试、迁移脚本）传 null 即可退回旧行为。
+     */
+    fun interface MetricMetaLookup {
+        suspend fun find(sourceType: String): com.lifeboard.shared.repository.model.MetricMeta?
+    }
+
     /** 内置源列表（不含 MANUAL，MANUAL 只在兜底时出现） */
     val builtinSources: List<SourceRef.Builtin> =
         SourceType.entries.map { builtinRef(it) }
@@ -86,7 +99,11 @@ object SourceKeys {
      * 顺序不能乱：内置优先是因为它的 key 最短最不可能撞；
      * 自建必须在插件之前，因为两者前缀不同但历史数据里可能出现过交叉。
      */
-    suspend fun resolve(key: String, lookup: CustomSourceLookup): Resolved {
+    suspend fun resolve(
+        key: String,
+        lookup: CustomSourceLookup,
+        metaLookup: MetricMetaLookup? = null,
+    ): Resolved {
         resolveBuiltin(key)?.let { return Resolved.Ok(it) }
 
         SourceRef.parseCustomId(key)?.let { id ->
@@ -98,7 +115,23 @@ object SourceKeys {
         }
 
         SourceRef.parsePluginKey(key)?.let { (pluginId, metricKey) ->
-            return Resolved.Ok(pluginRef(pluginId, metricKey))
+            // 优先用插件自己声明的元数据：查询得到的展示名与量纲才是真的。
+            // 查不到（插件还没采集过一次、或已被卸载）时退回从 key 猜，
+            // 保证老数据仍然能显示出来，不会因为缺 meta 就整条消失
+            val meta = metaLookup?.find(key)
+            return Resolved.Ok(
+                if (meta != null) {
+                    pluginRef(
+                        pluginId = pluginId,
+                        metricKey = metricKey,
+                        displayName = meta.displayName,
+                        bucket = runCatching { MetricBucket.valueOf(meta.bucket) }.getOrNull(),
+                        unit = meta.unit,
+                    )
+                } else {
+                    pluginRef(pluginId, metricKey)
+                },
+            )
         }
 
         // 旧数据里可能存着历史上写死过的未知键。
@@ -115,12 +148,31 @@ object SourceKeys {
      * 自建源表一次全读再配 key，避免 N 个任务查 N 次库——
      * 面板首页每帧都可能重建任务列表，逐个查询会把主线程拖慢到肉眼可见。
      */
-    suspend fun resolveAll(keys: Collection<String>, customs: List<SourceRef.Custom>): Map<String, SourceRef> {
+    suspend fun resolveAll(
+        keys: Collection<String>,
+        customs: List<SourceRef.Custom>,
+        metas: Map<String, com.lifeboard.shared.repository.model.MetricMeta> = emptyMap(),
+    ): Map<String, SourceRef> {
         val byKey = customs.associateBy { it.key }
         return keys.distinct().associateWith { key ->
             resolveBuiltin(key)
                 ?: byKey[key]
-                ?: SourceRef.parsePluginKey(key)?.let { (pluginId, metricKey) -> pluginRef(pluginId, metricKey) }
+                ?: SourceRef.parsePluginKey(key)?.let { (pluginId, metricKey) ->
+                    // 元数据由调用方一次性批量查出后传入：逐条查库会让
+                    // 「面板每帧重建卡片列表」变成 N 次数据库往返
+                    val meta = metas[key]
+                    if (meta != null) {
+                        pluginRef(
+                            pluginId = pluginId,
+                            metricKey = metricKey,
+                            displayName = meta.displayName,
+                            bucket = runCatching { MetricBucket.valueOf(meta.bucket) }.getOrNull(),
+                            unit = meta.unit,
+                        )
+                    } else {
+                        pluginRef(pluginId, metricKey)
+                    }
+                }
                 ?: builtinRef(SourceType.MANUAL)
         }
     }
@@ -128,15 +180,26 @@ object SourceKeys {
     /**
      * 插件源引用。
      *
-     * 插件是运行时装的，宿主这里拿不到它声明的展示名与量纲，
-     * 只能用 key 反解出的 pluginId / metricKey 兜一个最小引用；
-     * 真正的元数据在插件注册表接入后再补齐。
+     * [displayName] 与 [bucket] 由调用方从 `metric_meta` 传入时才是真值；
+     * 传 null 表示「这个插件还没采集过、meta 表里没有」，此时退化成
+     * `pluginId·metricKey` 与按枚举名反推的量纲——**这是兜底，不是常态**。
+     *
+     * 兜底的量纲为什么是 COUNT：`MetricSpec.bucketOf` 只认 `MetricBucket`
+     * 的枚举名，插件的自定义 key（`OBS_HEART_RATE` 之类）一律认不出。
+     * 真实的量纲必须来自插件声明并落库，见 `metric_meta`。
      */
-    private fun pluginRef(pluginId: String, metricKey: String): SourceRef.Plugin =
+    private fun pluginRef(
+        pluginId: String,
+        metricKey: String,
+        displayName: String? = null,
+        bucket: MetricBucket? = null,
+        unit: String? = null,
+    ): SourceRef.Plugin =
         SourceRef.Plugin(
             pluginId = pluginId,
             metricKey = metricKey,
-            displayName = "$pluginId·$metricKey",
-            bucket = MetricSpec.bucketOf(metricKey) ?: MetricBucket.COUNT,
+            displayName = displayName ?: "$pluginId·$metricKey",
+            bucket = bucket ?: MetricSpec.bucketOf(metricKey) ?: MetricBucket.COUNT,
+            unitOverride = unit,
         )
 }

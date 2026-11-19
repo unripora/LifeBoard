@@ -25,3 +25,26 @@ docs/
 mihealth-log.txt
 .trae/rules/编码规范.md
 dist/
+
+# JS 插件构建链
+js-plugins/node_modules/
+js-plugins/package-lock.json
+# 插件打包产物（由 npm run package 生成，可按版本重出）
+js-plugins/*.jsplugin
+
+# 本地调试产生的小米凭据与验证码：
+# cred.json 里是真实的 ssecurity / service_token / passToken，等同账号口令，
+# 一旦进版本库就是永久泄露（即便后续删除，历史里仍在）。
+js-plugins/_debug/
+
+# 插件导出的真实凭据（含 ssecurity / pass_token 与手机号），永不入库
+mihealth_credential.json
+
+# JVM / R8 的调试转储（replay_pid*.log），体积数 MB 且每次构建可重新生成
+replay_pid*.log
+
+# 本地运行时数据库与截图，属个人数据
+db.db
+db.db-shm
+db.db-wal
+*.png

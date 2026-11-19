@@ -51,12 +51,15 @@ class DriverBehaviourTest {
 
     @Test
     fun 迁移后版本被写回() {
+        // 用 Schema.version 而不是字面量：每加一个 .sqm 都要回来改数字，
+        // 漏改一处就会变成「测试还停在旧版本上绿着」，而新迁移根本没跑过
+        val latest = LifeBoardDb.Schema.version
         val driver = DatabaseDriverFactory(migrate = true).create(dbFile.absolutePath)
-        assertEquals(18L, driver.pragma("PRAGMA user_version"))
-        // 重开同一文件：应识别为「已是 18」，不再重复建表
+        assertEquals(latest, driver.pragma("PRAGMA user_version"))
+        // 重开同一文件：应识别为「已是最新」，不再重复建表
         driver.close()
         val again = DatabaseDriverFactory(migrate = true).create(dbFile.absolutePath)
-        assertEquals(18L, again.pragma("PRAGMA user_version"))
+        assertEquals(latest, again.pragma("PRAGMA user_version"))
     }
 
     @Test
@@ -87,14 +90,15 @@ class DriverBehaviourTest {
         seed.execute(null, "PRAGMA user_version = 1", 0)
         seed.close()
 
-        // 用生产路径打开：应自动迁移到 18 并写回版本
+        // 用生产路径打开：应自动迁移到最新版并写回版本
+        val latest = LifeBoardDb.Schema.version
         val migrated = DatabaseDriverFactory(migrate = true).create(dbFile.absolutePath)
-        assertEquals(18L, migrated.pragma("PRAGMA user_version"), "迁移后必须把 user_version 写成 18")
+        assertEquals(latest, migrated.pragma("PRAGMA user_version"), "迁移后必须把 user_version 写成 $latest")
         migrated.close()
 
         // 再开一次：不该重复迁移（重复跑 11.sqm 的表重建会丢数据/报错）
         val reopened = DatabaseDriverFactory(migrate = true).create(dbFile.absolutePath)
-        assertEquals(18L, reopened.pragma("PRAGMA user_version"))
+        assertEquals(latest, reopened.pragma("PRAGMA user_version"))
     }
 
     @Test
