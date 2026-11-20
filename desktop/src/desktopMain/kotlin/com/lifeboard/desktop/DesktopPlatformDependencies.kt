@@ -201,7 +201,13 @@ object DesktopPlatformDependencies {
      * 依然活着——表现是「装好的插件列表里看不见，内存却一直涨」。
      */
     private val pluginRepository: DesktopPluginRepository by lazy {
-        DesktopPluginRepository(settings, credentials)
+        DesktopPluginRepository(
+            settings = settings,
+            credentials = credentials,
+            // 卸载/清空数据要删库里的历史采集，两份 Store 与界面读的是同一个库
+            pluginStore = stores.pluginStore,
+            metricStore = stores.metricStore,
+        )
     }
 
     /**
@@ -751,8 +757,17 @@ internal class DesktopRawRecordSink(
 
         // 再归约成当天值。量纲必须取插件自己声明的那个：
         // `metric` 表主键是 (sourceType, date, bucket)，猜会一路掉到 COUNT，
-        // 与查询侧对不上，写进去的数据就永远读不回来
+        // 与查询侧对不上，写进去的数据就永远读不回来。
+        //
+        // 归约方式同样取插件声明（`MetricSpec.aggregate`）：心率求和会变成几千，
+        // 睡眠按段求和会翻倍。没声明的一律累加，与旧行为一致
         val spec = repository().find(pluginId)?.metrics?.get(metricKey) ?: return
+        val daily = when (spec.aggregate) {
+            com.lifeboard.plugin.api.MetricAggregate.SUM -> records.sumOf { it.value }
+            com.lifeboard.plugin.api.MetricAggregate.AVERAGE -> records.sumOf { it.value } / records.size
+            com.lifeboard.plugin.api.MetricAggregate.LATEST ->
+                records.maxByOrNull { it.timestamp }?.value ?: return
+        }
         runCatching {
             stores.metricStore.saveMetric(
                 com.lifeboard.core.model.MetricRecord(
@@ -763,7 +778,7 @@ internal class DesktopRawRecordSink(
                         bucket = spec.bucket,
                     ),
                     date = date,
-                    value = records.sumOf { it.value },
+                    value = daily,
                 ),
             )
         }.onFailure {

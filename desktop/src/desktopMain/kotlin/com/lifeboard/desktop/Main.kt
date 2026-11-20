@@ -15,7 +15,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
@@ -348,6 +347,9 @@ private fun DesktopRoot(deps: PlatformDependencies) {
         // 桌面端没有顶栏，任务指示环只能画在页签行右端。
         // 不打开的话插件同步那十几秒界面毫无动静，用户分不清在干活还是卡死
         showTaskIndicator = true,
+        // 传给根节点的主题。少了这一行，设置页里点「色系」会写库成功、
+        // 但整棵树取色仍用默认值，看上去就是点了没反应
+        appearance = appearance,
     )
 
     // 编辑层。放在 [App] 之后，Compose 的绘制顺序就是「后声明的画在上面」

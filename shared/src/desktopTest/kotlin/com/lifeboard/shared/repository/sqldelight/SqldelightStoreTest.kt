@@ -445,4 +445,87 @@ class SqldelightStoreTest {
 
         assertEquals(2, store.clearAllMetricQueries())
     }
+
+    @Test
+    fun 卸载时按插件清空条目与痕迹() = runBlocking {
+        val store = SqldelightPluginStore(open())
+        fun row(pluginId: String, seq: Int) =
+            com.lifeboard.shared.repository.model.PluginRawRecord(
+                pluginId = pluginId, date = "2026-11-13", metricKey = "STEPS",
+                timestamp = seq.toLong(), value = seq.toDouble(), seq = seq,
+            )
+        store.insertRawRecords(listOf(row("p1", 0), row("p1", 1), row("p2", 0)))
+        store.recordMetricQueries("p1", "2026-11-13", listOf("STEPS"))
+        store.recordMetricQueries("p2", "2026-11-13", listOf("STEPS"))
+
+        assertEquals(2, store.deleteRawRecordsByPlugin("p1"))
+        assertEquals(1, store.deleteMetricQueriesByPlugin("p1"))
+
+        // 只清 p1：别的插件的数据一个字节都不能受影响
+        assertTrue(store.getRawRecords("p1", "2026-11-01", "2026-11-30").isEmpty())
+        assertEquals(1, store.getRawRecords("p2", "2026-11-01", "2026-11-30").size)
+        assertTrue(store.getMetricQueries("p1", "2026-11-01", "2026-11-30").isEmpty())
+        assertEquals(listOf("STEPS"), store.getMetricQueries("p2", "2026-11-01", "2026-11-30"))
+    }
+
+    @Test
+    fun 清除插件数据覆盖凭据历史与私有目录() = runBlocking {
+        val db = open()
+        val pluginStore = SqldelightPluginStore(db)
+        val metricStore = SqldelightMetricStore(db, lookup)
+
+        fun metricOf(pluginId: String, value: Double) = MetricRecord(
+            source = SourceRef.Plugin(pluginId, "STEPS", "步数", MetricBucket.COUNT),
+            date = "2026-11-13",
+            value = value,
+        )
+        metricStore.saveMetric(metricOf("p1", 1000.0))
+        metricStore.saveMetric(metricOf("p2", 500.0))
+        metricStore.saveMetricMeta(
+            com.lifeboard.shared.repository.model.MetricMeta(
+                sourceType = SourceRef.pluginKey("p1", "STEPS"),
+                pluginId = "p1", metricKey = "STEPS",
+                displayName = "步数", unit = "步", bucket = MetricBucket.COUNT.name,
+            ),
+        )
+        metricStore.saveSourceHealth(
+            com.lifeboard.core.model.SourceHealth(
+                source = SourceRef.Plugin("p1", "STEPS", "步数", MetricBucket.COUNT),
+                healthy = true,
+            ),
+        )
+        pluginStore.saveCredential(
+            com.lifeboard.shared.repository.model.PluginCredentialRecord(
+                pluginId = "p1", slot = "account", cipherText = "cipher", updatedAt = 1L,
+            ),
+        )
+        pluginStore.insertRawRecords(
+            listOf(
+                com.lifeboard.shared.repository.model.PluginRawRecord(
+                    pluginId = "p1", date = "2026-11-13", metricKey = "STEPS",
+                    timestamp = 1L, value = 1.0,
+                ),
+            ),
+        )
+        pluginStore.recordMetricQueries("p1", "2026-11-13", listOf("STEPS"))
+
+        var deletedDir: String? = null
+        com.lifeboard.shared.repository.PluginDataPurger(
+            pluginStore = pluginStore,
+            metricStore = metricStore,
+            clearCredentials = { id -> pluginStore.deleteCredentialsByPlugin(id) },
+            deleteDataDir = { deletedDir = it },
+        ).purge("p1", listOf("STEPS"))
+
+        assertEquals("p1", deletedDir)
+        assertNull(pluginStore.getCredential("p1", "account"))
+        assertTrue(pluginStore.getRawRecords("p1", "2026-11-01", "2026-11-30").isEmpty())
+        assertTrue(pluginStore.getMetricQueries("p1", "2026-11-01", "2026-11-30").isEmpty())
+        assertNull(metricStore.getMetricMeta(SourceRef.pluginKey("p1", "STEPS")))
+
+        // 历史指标：p1 清空，p2 保留
+        val rows = metricStore.getMetricsInRange("2026-11-01", "2026-11-30")
+        assertTrue(rows.none { it.source.key == SourceRef.pluginKey("p1", "STEPS") })
+        assertTrue(rows.any { it.source.key == SourceRef.pluginKey("p2", "STEPS") })
+    }
 }

@@ -537,9 +537,16 @@ var DAYS = 7;
 var BACKFILL_DAYS = 30;
 var ACTION_SYNC = "sync_now";
 var ACTION_BACKFILL = "backfill";
+var AGGREGATED_PATH = "/app/v1/data/get_aggregated_fitness_data_by_time";
 var STEPS_KEY = "STEPS";
 var SLEEP_KEY = "SLEEP_MINUTES";
+var SLEEP_DEEP_RATIO_KEY = "SLEEP_DEEP_RATIO";
+var SLEEP_EFFICIENCY_KEY = "SLEEP_EFFICIENCY";
+var SLEEP_AWAKE_COUNT_KEY = "SLEEP_AWAKE_COUNT";
+var SLEEP_BEDTIME_KEY = "SLEEP_BEDTIME";
+var SLEEP_REGULARITY_KEY = "SLEEP_REGULARITY";
 var OBS_HEART_RATE = "OBS_HEART_RATE";
+var OBS_RESTING_HR = "OBS_RESTING_HEART_RATE";
 var OBS_SPO2 = "OBS_SPO2";
 var OBS_STRESS = "OBS_STRESS";
 var OBS_CALORIES = "OBS_CALORIES";
@@ -547,27 +554,82 @@ var OBS_DISTANCE = "OBS_DISTANCE";
 var OBS_STAND = "OBS_STAND";
 var OBS_INTENSITY = "OBS_INTENSITY";
 var OBS_WEIGHT = "OBS_WEIGHT";
+var OBS_BMI = "OBS_BMI";
+var OBS_BODY_FAT = "OBS_BODY_FAT_RATE";
+var OBS_MUSCLE = "OBS_MUSCLE_RATE";
+var OBS_MOISTURE = "OBS_MOISTURE_RATE";
+var OBS_BONE_MASS = "OBS_BONE_MASS";
+var OBS_BASAL = "OBS_BASAL_METABOLISM";
+var OBS_PROTEIN = "OBS_PROTEIN_RATE";
+var OBS_VISCERAL_FAT = "OBS_VISCERAL_FAT";
+var OBS_TRAINING_LOAD = "OBS_TRAINING_LOAD";
+var OBS_TRAINING_LEVEL = "OBS_TRAINING_LEVEL";
 var OBS_VO2_MAX = "OBS_VO2_MAX";
 var OBS_PAI = "OBS_PAI";
 var OBS_BLOOD_SYSTOLIC = "OBS_BLOOD_SYSTOLIC";
 var OBS_BLOOD_DIASTOLIC = "OBS_BLOOD_DIASTOLIC";
 var OBS_BLOOD_SUGAR = "OBS_BLOOD_SUGAR";
+var OBS_MUSCLE_MASS = "OBS_MUSCLE_MASS";
+var OBS_PROTEIN_MASS = "OBS_PROTEIN_MASS";
+var OBS_MOISTURE_MASS = "OBS_BODY_MOISTURE_MASS";
+var OBS_SKELETAL_MUSCLE = "OBS_SKELETAL_MUSCLE_MASS";
+var OBS_BODY_AGE = "OBS_BODY_AGE";
+var OBS_BODY_SCORE = "OBS_BODY_SCORE";
+var OBS_STRESS_GRADE = "OBS_STRESS_GRADE";
+var OBS_STAND_DURATION = "OBS_STAND_DURATION";
+var OBS_ENERGY = "OBS_ENERGY";
+var OBS_HEADSET_NOISE = "OBS_HEADSET_NOISE";
+var OBS_MENSTRUATION = "OBS_MENSTRUATION";
+var GOAL_STEPS = "GOAL_STEPS";
+var GOAL_CALORIES = "GOAL_CALORIES";
+var GOAL_ACTIVE_MINUTES = "GOAL_ACTIVE_MINUTES";
+var GOAL_STAND_HOURS = "GOAL_STAND_HOURS";
 var SAMPLED = [
   { cloudKey: "heart_rate", metricKey: OBS_HEART_RATE, fields: ["bpm", "heart_rate"], mean: true },
+  // 静息心率是每天一条的「当日结论值」，用最新一条而不是均值
+  { cloudKey: "resting_heart_rate", metricKey: OBS_RESTING_HR, fields: ["bpm"], mean: false },
   { cloudKey: "spo2", metricKey: OBS_SPO2, fields: ["spo2"], mean: true },
   { cloudKey: "stress", metricKey: OBS_STRESS, fields: ["stress_value", "stress"], mean: true },
-  { cloudKey: "calories", metricKey: OBS_CALORIES, fields: ["calories"], mean: false },
-  { cloudKey: "distance", metricKey: OBS_DISTANCE, fields: ["distance"], mean: false },
+  // 官方 com.xiaomi.stress.delta 的 grade：1 放松 / 2 轻度 / 3 中度 / 4 重度。
+  // 明细里本来就有，按最新一条取，代表「当天最后测到的压力档位」
+  { cloudKey: "stress", metricKey: OBS_STRESS_GRADE, fields: ["grade"], mean: false },
   { cloudKey: "valid_stand", metricKey: OBS_STAND, fields: [], mean: false },
+  // 官方统计口径是「站立时长(分钟)」，用每小时区间长度换算出总分钟数
+  { cloudKey: "valid_stand", metricKey: OBS_STAND_DURATION, fields: [], mean: false, duration: true },
   { cloudKey: "intensity", metricKey: OBS_INTENSITY, fields: [], mean: false },
-  { cloudKey: "weight", metricKey: OBS_WEIGHT, fields: ["weight"], mean: true },
+  // 体重与身体成分：同一次称重记录里带全部字段
+  { cloudKey: "weight", metricKey: OBS_WEIGHT, fields: ["weight"], mean: false },
+  { cloudKey: "weight", metricKey: OBS_BMI, fields: ["bmi"], mean: false },
+  { cloudKey: "weight", metricKey: OBS_BODY_FAT, fields: ["body_fat_rate"], mean: false },
+  { cloudKey: "weight", metricKey: OBS_MUSCLE, fields: ["muscle_rate"], mean: false },
+  { cloudKey: "weight", metricKey: OBS_MOISTURE, fields: ["moisture_rate"], mean: false },
+  { cloudKey: "weight", metricKey: OBS_BONE_MASS, fields: ["bone_mass"], mean: false },
+  { cloudKey: "weight", metricKey: OBS_BASAL, fields: ["basal_metabolism"], mean: false },
+  { cloudKey: "weight", metricKey: OBS_PROTEIN, fields: ["protein_rate"], mean: false },
+  { cloudKey: "weight", metricKey: OBS_VISCERAL_FAT, fields: ["visceral_fat"], mean: false },
+  // 官方 com.xiaomi.weight.instantaneous 里还有这 6 项（质量类 + 身体年龄/得分）
+  { cloudKey: "weight", metricKey: OBS_MUSCLE_MASS, fields: ["muscle_mass"], mean: false },
+  { cloudKey: "weight", metricKey: OBS_PROTEIN_MASS, fields: ["protein_mass"], mean: false },
+  { cloudKey: "weight", metricKey: OBS_MOISTURE_MASS, fields: ["body_moisture_mass"], mean: false },
+  { cloudKey: "weight", metricKey: OBS_SKELETAL_MUSCLE, fields: ["skeletal_muscle_mass"], mean: false },
+  { cloudKey: "weight", metricKey: OBS_BODY_AGE, fields: ["body_age"], mean: false },
+  { cloudKey: "weight", metricKey: OBS_BODY_SCORE, fields: ["body_score"], mean: false },
+  // 训练负荷：wtl_sum 是当日负荷量，level 是 1~5 的档位
+  { cloudKey: "training_load", metricKey: OBS_TRAINING_LOAD, fields: ["wtl_sum"], mean: false },
+  { cloudKey: "training_load", metricKey: OBS_TRAINING_LEVEL, fields: ["current_train_load_level"], mean: false },
   { cloudKey: "vo2_max", metricKey: OBS_VO2_MAX, fields: ["vo2_max"], mean: true },
   { cloudKey: "pai", metricKey: OBS_PAI, fields: ["pai", "value"], mean: true },
   { cloudKey: "blood_pressure", metricKey: OBS_BLOOD_SYSTOLIC, fields: ["systolic"], mean: true },
   { cloudKey: "blood_pressure", metricKey: OBS_BLOOD_DIASTOLIC, fields: ["diastolic"], mean: true },
-  { cloudKey: "blood_sugar", metricKey: OBS_BLOOD_SUGAR, fields: ["value", "blood_sugar"], mean: true }
+  { cloudKey: "blood_sugar", metricKey: OBS_BLOOD_SUGAR, fields: ["value", "blood_sugar"], mean: true },
+  // CloudKey 全集里剩下的三个数据源（小米官方 CloudKey.getCloudRequestKey 有对应项）
+  { cloudKey: "energy", metricKey: OBS_ENERGY, fields: ["energy"], mean: false },
+  { cloudKey: "headset", metricKey: OBS_HEADSET_NOISE, fields: ["noise", "noise_value", "db", "volume"], mean: true },
+  { cloudKey: "menstruation", metricKey: OBS_MENSTRUATION, fields: [], mean: false }
 ];
 var STEP_FIELDS = ["steps", "step", "count", "value"];
+var STEP_DISTANCE_FIELDS = ["distance"];
+var STEP_CALORIE_FIELDS = ["calories"];
 var POINT_TIME_FIELDS = ["time", "timestamp", "start_time", "startTime"];
 var SLEEP_START_FIELDS = ["bedtime", "device_bedtime", "start_time", "startTime"];
 var SLEEP_END_FIELDS = ["device_wake_up_time", "wake_up_time", "end_time", "endTime"];
@@ -789,7 +851,22 @@ function clientFor(creds) {
     }
     return out;
   }
-  return { getFitnessDataByTime, currentCreds: () => current };
+  async function getDailyGoals(startTimeMillis, endTimeMillis) {
+    const resp = await callApi(session, current, "GET", AGGREGATED_PATH, {
+      data: JSON.stringify({
+        tag: "daily_fitness",
+        key: "goal",
+        startTime: startTimeMillis,
+        endTime: endTimeMillis,
+        reverse: true
+      })
+    });
+    if (!resp || typeof resp !== "object") throw new Error("\u805A\u5408\u63A5\u53E3\u8FD4\u56DE\u4E0D\u662F JSON \u5BF9\u8C61");
+    const body = resp.result || resp;
+    const list = body.data_list || body.dataPoints || [];
+    return list.slice().sort((a, b) => Number(a.time) - Number(b.time));
+  }
+  return { getFitnessDataByTime, getDailyGoals, currentCreds: () => current };
 }
 function payloadOf(point) {
   if (!point) return {};
@@ -883,10 +960,14 @@ async function collectSteps(client, start, end, date) {
   const points = await client.getFitnessDataByTime("steps", start, end);
   if (!points || points.length === 0) {
     log2("i", "collectSteps(" + date + ") \u63A5\u53E3\u8FD4\u56DE 0 \u4E2A\u91C7\u6837\u70B9");
-    return null;
+    return [];
   }
   const raw = [];
+  const rawDistance = [];
+  const rawCalories = [];
   let sum = 0;
+  let distance = 0;
+  let calories = 0;
   points.forEach((p) => {
     const at = timestampAt(p, ["time", "timestamp"]);
     const steps = numberAt(p, STEP_FIELDS);
@@ -894,36 +975,150 @@ async function collectSteps(client, start, end, date) {
     if (at !== null && steps !== null) {
       raw.push({ timestamp: at, value: steps });
     }
+    const d = numberAt(p, STEP_DISTANCE_FIELDS);
+    if (d !== null) {
+      distance += d;
+      if (at !== null) rawDistance.push({ timestamp: at, value: d });
+    }
+    const c = numberAt(p, STEP_CALORIE_FIELDS);
+    if (c !== null) {
+      calories += c;
+      if (at !== null) rawCalories.push({ timestamp: at, value: c });
+    }
   });
-  log2("i", "collectSteps(" + date + ") \u91C7\u6837\u70B9 " + points.length + " \u4E2A\uFF0C\u53EF\u89E3\u6790 " + raw.length + " \u4E2A");
+  log2(
+    "i",
+    "collectSteps(" + date + ") \u91C7\u6837\u70B9 " + points.length + " \u4E2A\uFF0C\u53EF\u89E3\u6790 " + raw.length + " \u4E2A\uFF0C\u8DDD\u79BB " + Math.round(distance) + " \u7C73\uFF0C\u70ED\u91CF " + calories.toFixed(1) + " kcal"
+  );
   raw.sort((a, b) => a.timestamp - b.timestamp);
   reportRaw(STEPS_KEY, raw, date);
-  return sum > 0 ? sum : null;
+  rawDistance.sort((a, b) => a.timestamp - b.timestamp);
+  reportRaw(OBS_DISTANCE, rawDistance, date);
+  rawCalories.sort((a, b) => a.timestamp - b.timestamp);
+  reportRaw(OBS_CALORIES, rawCalories, date);
+  const out = [];
+  if (sum > 0) out.push({ metricKey: STEPS_KEY, value: sum });
+  if (points.length > 0) {
+    out.push({ metricKey: OBS_DISTANCE, value: Math.round(distance) });
+    out.push({ metricKey: OBS_CALORIES, value: Math.round(calories * 10) / 10 });
+  }
+  return out;
 }
-async function collectSleepMinutes(client, start, end, date) {
-  const points = await client.getFitnessDataByTime("sleep", start - DAY_MILLIS, end);
-  if (!points || points.length === 0) return null;
-  let totalMillis = 0;
-  const raw = [];
+function sameSleep(a, b) {
+  const overlap = Math.min(a.endMs, b.endMs) - Math.max(a.startMs, b.startMs);
+  if (overlap <= 0) return false;
+  const shorter = Math.min(a.endMs - a.startMs, b.endMs - b.startMs);
+  return shorter > 0 && overlap / shorter >= 0.5;
+}
+function richerSleep(a, b) {
+  const score = (s) => (s.hasStages ? 2 : 0) + (s.awakeCount > 0 ? 1 : 0);
+  return score(b) > score(a) ? b : a;
+}
+function bedtimeMinute(timestampMs) {
+  const d = new Date(timestampMs);
+  const minute = d.getHours() * 60 + d.getMinutes();
+  return minute < 12 * 60 ? minute + 24 * 60 : minute;
+}
+function sleepRegularity(todayBedMinute) {
+  const rows = recentValues(SLEEP_BEDTIME_KEY);
+  const values = rows.map((r) => r.value).filter((v) => isFinite(v) && v > 0);
+  values.push(todayBedMinute);
+  if (values.length < 3) return null;
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  const variance = values.reduce((a, b) => a + (b - mean) * (b - mean), 0) / values.length;
+  const std = Math.sqrt(variance);
+  return Math.max(0, Math.round(100 - std / 3));
+}
+async function collectSleep(client, date) {
+  const keys = [
+    SLEEP_KEY,
+    SLEEP_DEEP_RATIO_KEY,
+    SLEEP_EFFICIENCY_KEY,
+    SLEEP_AWAKE_COUNT_KEY,
+    SLEEP_BEDTIME_KEY,
+    SLEEP_REGULARITY_KEY
+  ];
+  keys.forEach((k) => reportQueried(k, date));
+  const start = dayStart(date);
+  if (start === null) return { metrics: [], hasData: false };
+  const prevNoon = start - 12 * 60 * 60 * 1e3;
+  const nextStart = new Date(start);
+  nextStart.setDate(nextStart.getDate() + 1);
+  const end = Math.min(nextStart.getTime() - 1, Date.now());
+  const points = await client.getFitnessDataByTime("sleep", prevNoon, end);
+  if (!points || points.length === 0) return { metrics: [], hasData: false };
+  const sessions = [];
   points.forEach((p) => {
     const s = timestampAt(p, SLEEP_START_FIELDS);
     const e = timestampAt(p, SLEEP_END_FIELDS);
     if (s === null || e === null || e <= s) return;
-    const overlapStart = Math.max(s, start);
-    const overlapEnd = Math.min(e, end);
-    if (overlapEnd <= overlapStart) return;
-    totalMillis += overlapEnd - overlapStart;
-    raw.push({
-      timestamp: s,
-      value: (overlapEnd - overlapStart) / 6e4,
-      // 起止时间都写进附注：拆到当天的那一段到底从几点到几点，
-      // 光看时长是推不出来的
-      detail: formatClock(s) + " \u2192 " + formatClock(e)
-    });
+    const rawDuration = numberAt(p, ["duration"]);
+    const deep2 = numberAt(p, ["sleep_deep_duration"]) || 0;
+    const light = numberAt(p, ["sleep_light_duration"]) || 0;
+    const rem = numberAt(p, ["sleep_rem_duration"]) || 0;
+    const duration = rawDuration !== null && rawDuration > 0 ? rawDuration : (e - s) / 6e4;
+    const session = {
+      startMs: s,
+      endMs: e,
+      duration,
+      deep: deep2,
+      light,
+      rem,
+      awakeCount: numberAt(p, ["awake_count"]) || 0,
+      awakeDuration: numberAt(p, ["sleep_awake_duration"]) || 0,
+      hasStages: deep2 + light + rem > 0
+    };
+    const idx = sessions.findIndex((k) => sameSleep(k, session));
+    if (idx >= 0) {
+      sessions[idx] = richerSleep(sessions[idx], session);
+    } else {
+      sessions.push(session);
+    }
   });
-  raw.sort((a, b) => a.timestamp - b.timestamp);
+  const nightly = sessions.filter((s) => formatDate(new Date(s.endMs)) === date);
+  if (nightly.length === 0) return { metrics: [], hasData: false };
+  nightly.sort((a, b) => a.startMs - b.startMs);
+  const raw = nightly.map((s) => {
+    const parts = [formatClock(s.startMs) + " \u2192 " + formatClock(s.endMs)];
+    if (s.hasStages) {
+      parts.push("\u6DF1" + Math.round(s.deep) + " \u6D45" + Math.round(s.light) + " REM" + Math.round(s.rem));
+    }
+    if (s.awakeDuration > 0) parts.push("\u6E05\u9192" + Math.round(s.awakeDuration) + "\u5206");
+    return {
+      timestamp: s.startMs,
+      value: Math.round(s.duration * 10) / 10,
+      detail: parts.join(" \xB7 ")
+    };
+  });
   reportRaw(SLEEP_KEY, raw, date);
-  return totalMillis > 0 ? totalMillis / 6e4 : null;
+  const total = nightly.reduce((a, s) => a + s.duration, 0);
+  const deep = nightly.reduce((a, s) => a + s.deep, 0);
+  const inBed = nightly.reduce((a, s) => a + (s.endMs - s.startMs) / 6e4, 0);
+  const awakeCount = nightly.reduce((a, s) => a + s.awakeCount, 0);
+  const bedtime = bedtimeMinute(nightly[0].startMs);
+  const metrics = [{ metricKey: SLEEP_KEY, value: total }];
+  if (deep > 0 && total > 0) {
+    metrics.push({ metricKey: SLEEP_DEEP_RATIO_KEY, value: Math.round(deep / total * 1e3) / 10 });
+  }
+  if (inBed > 0 && total > 0) {
+    metrics.push({
+      metricKey: SLEEP_EFFICIENCY_KEY,
+      value: Math.min(100, Math.round(total / inBed * 1e3) / 10)
+    });
+  }
+  if (awakeCount > 0) {
+    metrics.push({ metricKey: SLEEP_AWAKE_COUNT_KEY, value: awakeCount });
+  }
+  metrics.push({ metricKey: SLEEP_BEDTIME_KEY, value: bedtime });
+  const regularity = sleepRegularity(bedtime);
+  if (regularity !== null) {
+    metrics.push({ metricKey: SLEEP_REGULARITY_KEY, value: regularity });
+  }
+  log2(
+    "i",
+    "\u7761\u7720 " + date + "\uFF1A" + nightly.length + " \u6BB5\uFF0C\u603B\u8BA1 " + Math.round(total) + " \u5206\u949F\uFF0C\u6DF1\u7761\u5360\u6BD4 " + (total > 0 ? Math.round(deep / total * 100) : 0) + "%"
+  );
+  return { metrics, hasData: true };
 }
 async function collectSampled(client, cloudKey, specs, start, end, date) {
   const points = await client.getFitnessDataByTime(cloudKey, start, end);
@@ -935,32 +1130,84 @@ async function collectSampled(client, cloudKey, specs, start, end, date) {
     points.forEach((p) => {
       const at = timestampAt(p, ["time", "timestamp", "start_time"]);
       if (at === null) return;
+      if (spec.duration) {
+        const s = timestampAt(p, ["start_time", "startTime", "time"]);
+        const e = timestampAt(p, ["end_time", "endTime"]);
+        if (s === null || e === null || e <= s) return;
+        raw.push({ timestamp: s, value: (e - s) / 6e4, detail: formatClock(s) + " \u2192 " + formatClock(e) });
+        return;
+      }
       const value = spec.fields.length === 0 ? 1 : numberAt(p, spec.fields);
       if (value === null) return;
       raw.push({ timestamp: at, value });
     });
     if (raw.length === 0) {
-      log2("i", cloudKey + " \u7684 " + spec.fields.join("/") + " \u89E3\u6790\u4E0D\u51FA\u503C");
+      log2("i", cloudKey + " \u7684 " + (spec.fields.join("/") || "(\u4E8B\u4EF6\u578B)") + " \u89E3\u6790\u4E0D\u51FA\u503C");
       return;
     }
     raw.sort((a, b) => a.timestamp - b.timestamp);
     reportRaw(spec.metricKey, raw, date);
-    let daily;
     if (spec.mean) {
       let sum = 0;
       raw.forEach((r) => {
         sum += r.value;
       });
-      daily = sum / raw.length;
-    } else {
+      const avg = sum / raw.length;
+      if (avg > 0) out.push({ metricKey: spec.metricKey, value: avg });
+    } else if (spec.duration || spec.fields.length === 0) {
       let sum = 0;
       raw.forEach((r) => {
         sum += r.value;
       });
-      daily = sum;
+      if (sum > 0) out.push({ metricKey: spec.metricKey, value: sum });
+    } else {
+      const latest = raw[raw.length - 1].value;
+      out.push({ metricKey: spec.metricKey, value: latest });
     }
-    if (daily > 0) out.push({ metricKey: spec.metricKey, value: daily });
   });
+  return out;
+}
+async function collectDailyGoals(client, date) {
+  const keys = [GOAL_STEPS, GOAL_CALORIES, GOAL_ACTIVE_MINUTES, GOAL_STAND_HOURS];
+  keys.forEach((k) => reportQueried(k, date));
+  const range = dayRange(date);
+  if (!range) return [];
+  const [start, end] = range;
+  let items;
+  try {
+    items = await client.getDailyGoals(start, end);
+  } catch (e) {
+    log2("i", "daily_fitness/goal \u53D6\u4E0D\u5230\uFF08" + date + "\uFF09\uFF1A" + describeError(e));
+    return [];
+  }
+  if (items.length === 0) return [];
+  const latest = items[items.length - 1];
+  const payload = payloadOf(latest);
+  const goals = {};
+  const goalItems = payload.goal_items || [];
+  goalItems.forEach((g) => {
+    const field = Number(g && g.field);
+    const achieved = Number(g && g.achieved_value);
+    if (isFinite(field) && isFinite(achieved)) goals[field] = achieved;
+  });
+  const stand = payload.stand_goal;
+  if (stand && isFinite(Number(stand.field))) {
+    goals[Number(stand.field)] = Number(stand.achieved_value);
+  }
+  const map = [
+    [1, GOAL_STEPS],
+    [2, GOAL_CALORIES],
+    [3, GOAL_STAND_HOURS],
+    [4, GOAL_ACTIVE_MINUTES]
+  ];
+  const out = [];
+  map.forEach(([field, key]) => {
+    const v = goals[field];
+    if (v === void 0 || !isFinite(v)) return;
+    reportRaw(key, [{ timestamp: start, value: v }], date);
+    out.push({ metricKey: key, value: v });
+  });
+  log2("i", "\u6BCF\u65E5\u76EE\u6807\uFF08" + date + "\uFF09\u89E3\u6790\u5230 " + out.length + " \u9879");
   return out;
 }
 async function login(inputs) {
@@ -1084,17 +1331,16 @@ async function fetch(date) {
       if (isAuthError(e)) authFailure = describeError(e);
     };
     try {
-      const steps = await collectSteps(client, start, end, date);
-      reportQueried(STEPS_KEY, date);
-      if (steps !== null) out.push({ metricKey: STEPS_KEY, value: steps });
+      const stepMetrics = await collectSteps(client, start, end, date);
+      [STEPS_KEY, OBS_DISTANCE, OBS_CALORIES].forEach((k) => reportQueried(k, date));
+      stepMetrics.forEach((m) => out.push(m));
     } catch (e) {
       noteAuthFailure(e);
       log2("w", "\u6B65\u6570\u91C7\u96C6\u5931\u8D25\uFF08" + date + "\uFF09\uFF1A" + describeError(e));
     }
     try {
-      const sleep = await collectSleepMinutes(client, start, end, date);
-      reportQueried(SLEEP_KEY, date);
-      if (sleep !== null) out.push({ metricKey: SLEEP_KEY, value: sleep });
+      const sleep = await collectSleep(client, date);
+      sleep.metrics.forEach((m) => out.push(m));
     } catch (e) {
       noteAuthFailure(e);
       log2("w", "\u7761\u7720\u91C7\u96C6\u5931\u8D25\uFF08" + date + "\uFF09\uFF1A" + describeError(e));
@@ -1109,6 +1355,13 @@ async function fetch(date) {
         noteAuthFailure(e);
         log2("w", g.key + " \u91C7\u96C6\u5931\u8D25\uFF08" + date + "\uFF09\uFF1A" + describeError(e));
       }
+    }
+    try {
+      const goals = await collectDailyGoals(client, date);
+      goals.forEach((m) => out.push(m));
+    } catch (e) {
+      noteAuthFailure(e);
+      log2("w", "\u6BCF\u65E5\u76EE\u6807\u91C7\u96C6\u5931\u8D25\uFF08" + date + "\uFF09\uFF1A" + describeError(e));
     }
     if (authFailure) {
       credsRejectedByServer = true;
@@ -1239,8 +1492,40 @@ async function detailUi() {
       blocks.push({
         type: "text",
         title: "\u7EDF\u8BA1\u53E3\u5F84",
-        body: "\u6309\u81EA\u7136\u65E5\u7D2F\u8BA1\u7761\u7720\u65F6\u957F\uFF0C\u8DE8\u591C\u7761\u7720\u4F1A\u62C6\u5230\u524D\u540E\u4E24\u5929\uFF0C\u6240\u4EE5\u8FD9\u91CC\u663E\u793A\u7684\u4E0D\u662F\u300C\u6628\u591C\u603B\u7761\u7720\u300D\u3002"
+        body: "\u6309\u9192\u6765\u65E5\u7EDF\u8BA1\u6574\u591C\u7761\u7720\uFF1A\u6628\u665A 22:43 \u7761\u5230\u4ECA\u65E9 07:58 \u7B97\u4ECA\u5929\u8FD9\u4E00\u6761\uFF1B\u540C\u4E00\u591C\u7684\u591A\u6761\u8BB0\u5F55\uFF08\u624B\u673A\u7B97\u6CD5 + \u624B\u73AF\u6C47\u603B\uFF09\u5DF2\u5408\u5E76\uFF0C\u4E0D\u4F1A\u91CD\u590D\u7D2F\u52A0\u3002"
       });
+      const deepRatio = recentValues(SLEEP_DEEP_RATIO_KEY);
+      const efficiency = recentValues(SLEEP_EFFICIENCY_KEY);
+      const regularity = recentValues(SLEEP_REGULARITY_KEY);
+      const detailCards = [];
+      if (deepRatio.length > 0) {
+        detailCards.push({
+          type: "statusCard",
+          label: "\u6DF1\u7761\u5360\u6BD4",
+          value: deepRatio[deepRatio.length - 1].value.toFixed(1) + " %",
+          tone: "neutral",
+          detail: deepRatio[deepRatio.length - 1].date
+        });
+      }
+      if (efficiency.length > 0) {
+        detailCards.push({
+          type: "statusCard",
+          label: "\u7761\u7720\u6548\u7387",
+          value: efficiency[efficiency.length - 1].value.toFixed(1) + " %",
+          tone: "neutral",
+          detail: efficiency[efficiency.length - 1].date
+        });
+      }
+      if (regularity.length > 0) {
+        detailCards.push({
+          type: "statusCard",
+          label: "\u5165\u7761\u89C4\u5F8B\u6027",
+          value: Math.round(regularity[regularity.length - 1].value) + " \u5206",
+          tone: "neutral",
+          detail: regularity[regularity.length - 1].date
+        });
+      }
+      detailCards.forEach((b) => blocks.push(b));
     } else {
       blocks.push({
         type: "text",
@@ -1319,8 +1604,24 @@ async function backfillHistory() {
     try {
       const [start, end] = range;
       const steps = await collectSteps(client, start, end, date);
-      const sleep = await collectSleepMinutes(client, start, end, date);
-      if (steps !== null || sleep !== null) {
+      const sleep = await collectSleep(client, date);
+      let other = 0;
+      const groups = groupBy(SAMPLED, (s) => s.cloudKey);
+      for (let i = 0; i < groups.length; i++) {
+        const g = groups[i];
+        try {
+          other += (await collectSampled(client, g.key, g.items, start, end, date)).length;
+        } catch (e) {
+          log2("w", "\u56DE\u8865 " + g.key + "\uFF08" + date + "\uFF09\u5931\u8D25\uFF1A" + describeError(e));
+        }
+      }
+      let goalCount = 0;
+      try {
+        goalCount = (await collectDailyGoals(client, date)).length;
+      } catch (e) {
+        log2("w", "\u56DE\u8865\u6BCF\u65E5\u76EE\u6807\uFF08" + date + "\uFF09\u5931\u8D25\uFF1A" + describeError(e));
+      }
+      if (steps.length > 0 || sleep.hasData || other > 0 || goalCount > 0) {
         filled++;
       } else {
         empty++;

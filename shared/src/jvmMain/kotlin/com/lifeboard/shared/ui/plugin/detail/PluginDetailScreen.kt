@@ -52,6 +52,10 @@ private sealed interface Danger {
     data object Uninstall : Danger {
         override val label = "卸载"
     }
+
+    data object ClearData : Danger {
+        override val label = "清除数据"
+    }
 }
 
 /**
@@ -172,11 +176,12 @@ fun PluginDetailScreen(
         DangerDialog(
             action = action,
             displayName = state.info?.displayName.orEmpty(),
-            onConfirm = {
+            onConfirm = { clearData ->
                 when (action) {
                     Danger.Revoke -> vm.revokeTrust()
                     Danger.ClearCredentials -> vm.clearCredentials()
-                    Danger.Uninstall -> vm.uninstall()
+                    Danger.ClearData -> vm.clearPluginData()
+                    Danger.Uninstall -> vm.uninstall(clearData)
                 }
                 danger = null
             },
@@ -272,11 +277,14 @@ private fun OperationSection(info: PluginDetailInfo, onDanger: (Danger) -> Unit)
             if (info.needsLogin) {
                 OutlinedButton(onClick = { onDanger(Danger.ClearCredentials) }) { Text("清除凭据") }
             }
+            // 数据可能来自已停止使用的插件，所以不挂在 trusted 条件下：
+            // 「清不干净」和「还在不在用」是两件事
+            OutlinedButton(onClick = { onDanger(Danger.ClearData) }) { Text("清除数据") }
             OutlinedButton(onClick = { onDanger(Danger.Uninstall) }) { Text("卸载") }
         }
 
         Text(
-            "「停止使用」停止调度但保留数据与凭据；「卸载」删除插件包，凭据与私有数据同样保留。",
+            "「停止使用」停止调度但保留数据与凭据；「卸载」默认保留数据与凭据，重装后可以直接接着用。",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -313,7 +321,8 @@ private fun LabeledValue(label: String, value: String, error: Boolean = false) {
 private fun DangerDialog(
     action: Danger,
     displayName: String,
-    onConfirm: () -> Unit,
+    /** clearData 只对卸载有意义，其余操作忽略 */
+    onConfirm: (clearData: Boolean) -> Unit,
     onCancel: () -> Unit,
 ) {
     val body = when (action) {
@@ -321,11 +330,17 @@ private fun DangerDialog(
             "将停止 ${displayName} 的采集，之后不再拉取数据。" +
                 "已采集的数据、卡片与保存的凭据都保留，重新信任后可继续使用。"
         Danger.ClearCredentials ->
-            "将删除 ${displayName} 保存的登录凭据，无法恢复。" +
-                "下次同步前需要回到列表页重新登录，插件本身和数据不受影响。"
+            "将删除 ${displayName} 保存的登录凭据，无法恢复。\n\n" +
+                "与「登出」的区别：登出由插件自己执行，清什么由插件决定；" +
+                "这里由宿主直接把凭据全部删掉。插件本身与已采集的数据不受影响，" +
+                "下次同步前需要回到列表页重新登录。"
+        Danger.ClearData ->
+            "将删除 ${displayName} 的私有文件、登录凭据与已采集的历史数据，" +
+                "卡片与趋势图里属于它的数据也会一起消失。插件包与信任关系保留，可以重新登录再采。"
         Danger.Uninstall ->
-            "将停止使用并删除 ${displayName} 的插件包，之后可以重新安装。" +
-                "已保存的凭据和插件私有数据会保留。"
+            "将停止使用并删除 ${displayName} 的插件包，之后可以重新安装。\n\n" +
+                "「仅卸载」保留已采集的数据、私有文件与登录凭据，重装后可以直接接着用；" +
+                "「卸载并清除数据」会把这些一起删掉。"
     }
 
     AlertDialog(
@@ -333,8 +348,17 @@ private fun DangerDialog(
         title = { Text(action.label) },
         text = { Text(body) },
         confirmButton = {
-            TextButton(onClick = onConfirm) {
-                Text(action.label, color = MaterialTheme.colorScheme.error)
+            Row {
+                if (action is Danger.Uninstall) {
+                    TextButton(onClick = { onConfirm(false) }) { Text("仅卸载") }
+                    TextButton(onClick = { onConfirm(true) }) {
+                        Text("卸载并清除数据", color = MaterialTheme.colorScheme.error)
+                    }
+                } else {
+                    TextButton(onClick = { onConfirm(false) }) {
+                        Text(action.label, color = MaterialTheme.colorScheme.error)
+                    }
+                }
             }
         },
         dismissButton = { TextButton(onClick = onCancel) { Text("取消") } },

@@ -91,11 +91,25 @@ const BACKFILL_DAYS = 30;
 const ACTION_SYNC = 'sync_now';
 const ACTION_BACKFILL = 'backfill';
 
+/** 每日目标达成的聚合端点（与逐点查询的 by_time 不是同一个） */
+const AGGREGATED_PATH = '/app/v1/data/get_aggregated_fitness_data_by_time';
+
 /** 指标 key，与 manifest.json 声明保持一致 */
 const STEPS_KEY = 'STEPS';
+/**
+ * 睡眠总时长（分钟）。口径是「**这一夜**睡了多久」：
+ * 按醒来日期归属，昨晚 22:43 睡到今早 07:58 算今天这一条。
+ * 早先按自然日裁剪会把一夜拆成两天、还会把同夜的两条记录各算一遍。
+ */
 const SLEEP_KEY = 'SLEEP_MINUTES';
+const SLEEP_DEEP_RATIO_KEY = 'SLEEP_DEEP_RATIO';
+const SLEEP_EFFICIENCY_KEY = 'SLEEP_EFFICIENCY';
+const SLEEP_AWAKE_COUNT_KEY = 'SLEEP_AWAKE_COUNT';
+const SLEEP_BEDTIME_KEY = 'SLEEP_BEDTIME';
+const SLEEP_REGULARITY_KEY = 'SLEEP_REGULARITY';
 
 const OBS_HEART_RATE = 'OBS_HEART_RATE';
+const OBS_RESTING_HR = 'OBS_RESTING_HEART_RATE';
 const OBS_SPO2 = 'OBS_SPO2';
 const OBS_STRESS = 'OBS_STRESS';
 const OBS_CALORIES = 'OBS_CALORIES';
@@ -103,11 +117,46 @@ const OBS_DISTANCE = 'OBS_DISTANCE';
 const OBS_STAND = 'OBS_STAND';
 const OBS_INTENSITY = 'OBS_INTENSITY';
 const OBS_WEIGHT = 'OBS_WEIGHT';
+const OBS_BMI = 'OBS_BMI';
+const OBS_BODY_FAT = 'OBS_BODY_FAT_RATE';
+const OBS_MUSCLE = 'OBS_MUSCLE_RATE';
+const OBS_MOISTURE = 'OBS_MOISTURE_RATE';
+const OBS_BONE_MASS = 'OBS_BONE_MASS';
+const OBS_BASAL = 'OBS_BASAL_METABOLISM';
+const OBS_PROTEIN = 'OBS_PROTEIN_RATE';
+const OBS_VISCERAL_FAT = 'OBS_VISCERAL_FAT';
+const OBS_TRAINING_LOAD = 'OBS_TRAINING_LOAD';
+const OBS_TRAINING_LEVEL = 'OBS_TRAINING_LEVEL';
 const OBS_VO2_MAX = 'OBS_VO2_MAX';
 const OBS_PAI = 'OBS_PAI';
 const OBS_BLOOD_SYSTOLIC = 'OBS_BLOOD_SYSTOLIC';
 const OBS_BLOOD_DIASTOLIC = 'OBS_BLOOD_DIASTOLIC';
 const OBS_BLOOD_SUGAR = 'OBS_BLOOD_SUGAR';
+
+// 体重秤的其余官方字段（见小米开放平台「com.xiaomi.weight.instantaneous」）
+const OBS_MUSCLE_MASS = 'OBS_MUSCLE_MASS';
+const OBS_PROTEIN_MASS = 'OBS_PROTEIN_MASS';
+const OBS_MOISTURE_MASS = 'OBS_BODY_MOISTURE_MASS';
+const OBS_SKELETAL_MUSCLE = 'OBS_SKELETAL_MUSCLE_MASS';
+const OBS_BODY_AGE = 'OBS_BODY_AGE';
+const OBS_BODY_SCORE = 'OBS_BODY_SCORE';
+
+// 压力等级（官方 com.xiaomi.stress.delta 的 grade 字段）
+const OBS_STRESS_GRADE = 'OBS_STRESS_GRADE';
+// 站立时长（官方 com.xiaomi.valid_stand.statistics 的 active_duration）
+const OBS_STAND_DURATION = 'OBS_STAND_DURATION';
+// 能量（CloudKey 全集里的 energy key）
+const OBS_ENERGY = 'OBS_ENERGY';
+// 耳机噪声（CloudKey 全集里的 headset key）
+const OBS_HEADSET_NOISE = 'OBS_HEADSET_NOISE';
+// 经期（CloudKey 全集里的 menstruation key）
+const OBS_MENSTRUATION = 'OBS_MENSTRUATION';
+
+// 每日目标达成（aggregated fitness · daily_fitness/goal 的 field 映射）
+const GOAL_STEPS = 'GOAL_STEPS';
+const GOAL_CALORIES = 'GOAL_CALORIES';
+const GOAL_ACTIVE_MINUTES = 'GOAL_ACTIVE_MINUTES';
+const GOAL_STAND_HOURS = 'GOAL_STAND_HOURS';
 
 /** 采样类指标定义。 */
 interface SampledSpec {
@@ -116,8 +165,20 @@ interface SampledSpec {
     metricKey: string;
     /** 候选数值字段；为空表示**事件型**，记录存在本身就按 1 计 */
     fields: string[];
-    /** 日值按均值折算（心率）还是累加（热量） */
+    /**
+     * 日值怎么折：
+     * - true：取当天均值（心率、血氧、压力这类「典型水平」）
+     * - false：取**时间上最新的一条**（静息心率、体重、身体成分、训练负荷、
+     *   血压这类「一天一次结论」）。早先这里是累加，会把称重记录相加
+     */
     mean: boolean;
+    /**
+     * 把每条记录折算成「分钟数」而不是计数。
+     *
+     * 官方站立统计口径是 `active_duration`（分钟），而明细里只有
+     * `{start_time, end_time}` 区间，需要用区间长度换算出时长。
+     */
+    duration?: boolean;
 }
 
 /**
@@ -127,26 +188,67 @@ interface SampledSpec {
  * 实测 `valid_stand` 只有 `{start_time,end_time}`、`intensity` 只有 `{time}`，
  * 硬找一个数值字段只会得到 null。
  *
- * 血压拆成收缩压/舒张压两行但共用 `blood_pressure` 这个 cloudKey：
- * 一次请求就能同时供给两个指标，按指标各查一次等于翻倍请求。
+ * 同一 cloudKey 允许多行（血压、体重组成）：一次请求就能同时供给多个指标，
+ * 按指标各查一次等于翻倍请求。
+ *
+ * ## 为什么没有 `distance` / `calories`
+ *
+ * 实测 `distance` 作为独立 key 请求返回 **0 条**，`calories` 虽然能返回，
+ * 但与 steps 采样点里的 `calories` 是**两套口径**（前者是活动热量，
+ * 后者是同一段时间的步数热量）。两个都收会让同一个 metricKey 一天写两次、
+ * 后写的覆盖前写的。统一取 steps 采样点里的那份，见 [collectSteps]。
  */
 const SAMPLED: SampledSpec[] = [
     { cloudKey: 'heart_rate', metricKey: OBS_HEART_RATE, fields: ['bpm', 'heart_rate'], mean: true },
+    // 静息心率是每天一条的「当日结论值」，用最新一条而不是均值
+    { cloudKey: 'resting_heart_rate', metricKey: OBS_RESTING_HR, fields: ['bpm'], mean: false },
     { cloudKey: 'spo2', metricKey: OBS_SPO2, fields: ['spo2'], mean: true },
     { cloudKey: 'stress', metricKey: OBS_STRESS, fields: ['stress_value', 'stress'], mean: true },
-    { cloudKey: 'calories', metricKey: OBS_CALORIES, fields: ['calories'], mean: false },
-    { cloudKey: 'distance', metricKey: OBS_DISTANCE, fields: ['distance'], mean: false },
+    // 官方 com.xiaomi.stress.delta 的 grade：1 放松 / 2 轻度 / 3 中度 / 4 重度。
+    // 明细里本来就有，按最新一条取，代表「当天最后测到的压力档位」
+    { cloudKey: 'stress', metricKey: OBS_STRESS_GRADE, fields: ['grade'], mean: false },
     { cloudKey: 'valid_stand', metricKey: OBS_STAND, fields: [], mean: false },
+    // 官方统计口径是「站立时长(分钟)」，用每小时区间长度换算出总分钟数
+    { cloudKey: 'valid_stand', metricKey: OBS_STAND_DURATION, fields: [], mean: false, duration: true },
     { cloudKey: 'intensity', metricKey: OBS_INTENSITY, fields: [], mean: false },
-    { cloudKey: 'weight', metricKey: OBS_WEIGHT, fields: ['weight'], mean: true },
+
+    // 体重与身体成分：同一次称重记录里带全部字段
+    { cloudKey: 'weight', metricKey: OBS_WEIGHT, fields: ['weight'], mean: false },
+    { cloudKey: 'weight', metricKey: OBS_BMI, fields: ['bmi'], mean: false },
+    { cloudKey: 'weight', metricKey: OBS_BODY_FAT, fields: ['body_fat_rate'], mean: false },
+    { cloudKey: 'weight', metricKey: OBS_MUSCLE, fields: ['muscle_rate'], mean: false },
+    { cloudKey: 'weight', metricKey: OBS_MOISTURE, fields: ['moisture_rate'], mean: false },
+    { cloudKey: 'weight', metricKey: OBS_BONE_MASS, fields: ['bone_mass'], mean: false },
+    { cloudKey: 'weight', metricKey: OBS_BASAL, fields: ['basal_metabolism'], mean: false },
+    { cloudKey: 'weight', metricKey: OBS_PROTEIN, fields: ['protein_rate'], mean: false },
+    { cloudKey: 'weight', metricKey: OBS_VISCERAL_FAT, fields: ['visceral_fat'], mean: false },
+    // 官方 com.xiaomi.weight.instantaneous 里还有这 6 项（质量类 + 身体年龄/得分）
+    { cloudKey: 'weight', metricKey: OBS_MUSCLE_MASS, fields: ['muscle_mass'], mean: false },
+    { cloudKey: 'weight', metricKey: OBS_PROTEIN_MASS, fields: ['protein_mass'], mean: false },
+    { cloudKey: 'weight', metricKey: OBS_MOISTURE_MASS, fields: ['body_moisture_mass'], mean: false },
+    { cloudKey: 'weight', metricKey: OBS_SKELETAL_MUSCLE, fields: ['skeletal_muscle_mass'], mean: false },
+    { cloudKey: 'weight', metricKey: OBS_BODY_AGE, fields: ['body_age'], mean: false },
+    { cloudKey: 'weight', metricKey: OBS_BODY_SCORE, fields: ['body_score'], mean: false },
+
+    // 训练负荷：wtl_sum 是当日负荷量，level 是 1~5 的档位
+    { cloudKey: 'training_load', metricKey: OBS_TRAINING_LOAD, fields: ['wtl_sum'], mean: false },
+    { cloudKey: 'training_load', metricKey: OBS_TRAINING_LEVEL, fields: ['current_train_load_level'], mean: false },
+
     { cloudKey: 'vo2_max', metricKey: OBS_VO2_MAX, fields: ['vo2_max'], mean: true },
     { cloudKey: 'pai', metricKey: OBS_PAI, fields: ['pai', 'value'], mean: true },
     { cloudKey: 'blood_pressure', metricKey: OBS_BLOOD_SYSTOLIC, fields: ['systolic'], mean: true },
     { cloudKey: 'blood_pressure', metricKey: OBS_BLOOD_DIASTOLIC, fields: ['diastolic'], mean: true },
     { cloudKey: 'blood_sugar', metricKey: OBS_BLOOD_SUGAR, fields: ['value', 'blood_sugar'], mean: true },
+
+    // CloudKey 全集里剩下的三个数据源（小米官方 CloudKey.getCloudRequestKey 有对应项）
+    { cloudKey: 'energy', metricKey: OBS_ENERGY, fields: ['energy'], mean: false },
+    { cloudKey: 'headset', metricKey: OBS_HEADSET_NOISE, fields: ['noise', 'noise_value', 'db', 'volume'], mean: true },
+    { cloudKey: 'menstruation', metricKey: OBS_MENSTRUATION, fields: [], mean: false },
 ];
 
 const STEP_FIELDS = ['steps', 'step', 'count', 'value'];
+const STEP_DISTANCE_FIELDS = ['distance'];
+const STEP_CALORIE_FIELDS = ['calories'];
 /**
  * 采样点的时间字段候选。
  *
@@ -196,6 +298,8 @@ interface CollectClient {
         endTimeMillis: number,
         maxPages?: number,
     ): Promise<CloudPoint[]>;
+    /** 每日目标达成：走聚合端点 `get_aggregated_fitness_data_by_time` */
+    getDailyGoals(startTimeMillis: number, endTimeMillis: number): Promise<any[]>;
     currentCreds(): Creds;
 }
 
@@ -629,7 +733,31 @@ function clientFor(creds: Creds): CollectClient {
         return out;
     }
 
-    return { getFitnessDataByTime, currentCreds: () => current };
+    /**
+     * 每日目标达成。
+     *
+     * 直接走 [callApi] 而不是 [callWithRetry]：后者的 401 分支会去走
+     * passToken 续期流程，而这里失败属于「这个账号没有目标统计」的常见情况，
+     * 不该被当成凭据失效去续期（续期成功后依然拿不到，于是被误报成 401）。
+     */
+    async function getDailyGoals(startTimeMillis: number, endTimeMillis: number): Promise<any[]> {
+        const resp = await callApi(session, current, 'GET', AGGREGATED_PATH, {
+            data: JSON.stringify({
+                tag: 'daily_fitness',
+                key: 'goal',
+                startTime: startTimeMillis,
+                endTime: endTimeMillis,
+                reverse: true,
+            }),
+        });
+        if (!resp || typeof resp !== 'object') throw new Error('聚合接口返回不是 JSON 对象');
+        const body = resp.result || resp;
+        const list = body.data_list || body.dataPoints || [];
+        // 服务端给的是倒序，转成时间升序，方便取「最新一天」
+        return list.slice().sort((a: any, b: any) => Number(a.time) - Number(b.time));
+    }
+
+    return { getFitnessDataByTime, getDailyGoals, currentCreds: () => current };
 }
 
 // ---------- 采样点解析 ----------
@@ -759,26 +887,38 @@ function reportRaw(metricKey: string, records: RawRecord[], date: string): void 
 }
 
 /**
- * 当日步数。
+ * 当日步数，顺带取同一条采样点里的距离与热量。
  *
- * 步数接口返回的是采样点（通常按小时间隔），需要累加。
+ * 步数接口返回的是采样点（通常按分钟级），需要累加。
  * 聚合前把每个采样点原样上报：用户想核对「1253 步是怎么来的」时
  * 需要的正是这些点，聚合之后就再也拿不到了。
+ *
+ * ## 距离与热量为什么在这里取
+ *
+ * 实测 `distance` 作为独立 key 请求返回 **0 条**：它根本不是独立数据源，
+ * 而是每个 steps 采样点里自带的字段（`{time, steps, distance, calories}`）。
+ * 早先按独立 key 请求既拿不到数据，还白多一次网络往返。
+ *
+ * @return 当天有数据的指标列表（步数为 0 也会返回，代表「今天确实没动」）
  */
 async function collectSteps(
     client: CollectClient,
     start: number,
     end: number,
     date: string,
-): Promise<number | null> {
+): Promise<PluginMetric[]> {
     const points = await client.getFitnessDataByTime('steps', start, end);
     if (!points || points.length === 0) {
         log('i', 'collectSteps(' + date + ') 接口返回 0 个采样点');
-        return null;
+        return [];
     }
 
     const raw: RawRecord[] = [];
+    const rawDistance: RawRecord[] = [];
+    const rawCalories: RawRecord[] = [];
     let sum = 0;
+    let distance = 0;
+    let calories = 0;
     points.forEach((p) => {
         const at = timestampAt(p, ['time', 'timestamp']);
         const steps = numberAt(p, STEP_FIELDS);
@@ -787,68 +927,239 @@ async function collectSteps(
         if (at !== null && steps !== null) {
             raw.push({ timestamp: at, value: steps });
         }
+        const d = numberAt(p, STEP_DISTANCE_FIELDS);
+        if (d !== null) {
+            distance += d;
+            if (at !== null) rawDistance.push({ timestamp: at, value: d });
+        }
+        const c = numberAt(p, STEP_CALORIE_FIELDS);
+        if (c !== null) {
+            calories += c;
+            if (at !== null) rawCalories.push({ timestamp: at, value: c });
+        }
     });
 
-    log('i', 'collectSteps(' + date + ') 采样点 ' + points.length + ' 个，可解析 ' + raw.length + ' 个');
+    log(
+        'i',
+        'collectSteps(' + date + ') 采样点 ' + points.length + ' 个，可解析 ' + raw.length +
+            ' 个，距离 ' + Math.round(distance) + ' 米，热量 ' + calories.toFixed(1) + ' kcal',
+    );
     raw.sort((a, b) => a.timestamp - b.timestamp);
     reportRaw(STEPS_KEY, raw, date);
+    rawDistance.sort((a, b) => a.timestamp - b.timestamp);
+    reportRaw(OBS_DISTANCE, rawDistance, date);
+    rawCalories.sort((a, b) => a.timestamp - b.timestamp);
+    reportRaw(OBS_CALORIES, rawCalories, date);
 
-    return sum > 0 ? sum : null;
+    // 步数用 >0 判断（真的没走路时不该写一条 0），距离与热量只要有采样点就是有效值
+    const out: PluginMetric[] = [];
+    if (sum > 0) out.push({ metricKey: STEPS_KEY, value: sum });
+    if (points.length > 0) {
+        out.push({ metricKey: OBS_DISTANCE, value: Math.round(distance) });
+        out.push({ metricKey: OBS_CALORIES, value: Math.round(calories * 10) / 10 });
+    }
+    return out;
 }
 
 /**
- * 当日睡眠分钟数。
+ * 一次睡眠会话（醒来后由云端合并成一条）。
  *
- * 口径是「**这一自然日里睡着的分钟数**」，不是「昨夜总睡眠」：
- * 23:00 睡到次日 07:00 会被拆成前一天 60 分钟 + 当天 420 分钟。
- * 这样两天不重复计数。
- *
- * 查询窗口向前多取一天：前一晚入睡、当天凌晨结束的睡眠段，
- * 起点落在目标日之前，不向前取就会被窗口过滤掉。
+ * 同一次睡眠在接口里可能出现**两条记录**：手机算法版本（带 `items` 分期、
+ * `awake_count`）与手环版本的汇总（只有总时长）。早先两条都算，睡眠翻倍。
  */
-async function collectSleepMinutes(
+interface SleepSession {
+    startMs: number;
+    endMs: number;
+    /** 实际睡着分钟数（接口的 duration，已扣掉清醒段） */
+    duration: number;
+    deep: number;
+    light: number;
+    rem: number;
+    awakeCount: number;
+    awakeDuration: number;
+    /** 有没有分期明细；没有时只有总时长 */
+    hasStages: boolean;
+}
+
+/** 两次会话是否属于同一夜：重叠时长占较短一次的一半以上 */
+function sameSleep(a: SleepSession, b: SleepSession): boolean {
+    const overlap = Math.min(a.endMs, b.endMs) - Math.max(a.startMs, b.startMs);
+    if (overlap <= 0) return false;
+    const shorter = Math.min(a.endMs - a.startMs, b.endMs - b.startMs);
+    return shorter > 0 && overlap / shorter >= 0.5;
+}
+
+/** 同一夜里留哪条：优先带分期明细的，其次清醒次数更完整的 */
+function richerSleep(a: SleepSession, b: SleepSession): SleepSession {
+    const score = (s: SleepSession) => (s.hasStages ? 2 : 0) + (s.awakeCount > 0 ? 1 : 0);
+    return score(b) > score(a) ? b : a;
+}
+
+/** 本地时刻 → 分钟数。凌晨 0~12 点算作「前一天的延续」（+24h），跨零点仍单调 */
+function bedtimeMinute(timestampMs: number): number {
+    const d = new Date(timestampMs);
+    const minute = d.getHours() * 60 + d.getMinutes();
+    return minute < 12 * 60 ? minute + 24 * 60 : minute;
+}
+
+/**
+ * 入睡规律性（0~100，插件按近 7 天入睡时间计算）。
+ *
+ * 小米云端没有直接给出这个分数，这里用「入睡时间标准差」折算：
+ * 每偏离 3 分钟扣 1 分，波动一小时约 80 分。样本少于 3 天不计算——
+ * 两三天的波动没有参考意义。
+ */
+function sleepRegularity(todayBedMinute: number): number | null {
+    const rows = recentValues(SLEEP_BEDTIME_KEY);
+    const values = rows.map((r) => r.value).filter((v) => isFinite(v) && v > 0);
+    values.push(todayBedMinute);
+    if (values.length < 3) return null;
+    const mean = values.reduce((a, b) => a + b, 0) / values.length;
+    const variance = values.reduce((a, b) => a + (b - mean) * (b - mean), 0) / values.length;
+    const std = Math.sqrt(variance);
+    return Math.max(0, Math.round(100 - std / 3));
+}
+
+/**
+ * 采集「某一夜」的睡眠。
+ *
+ * ## 归属口径
+ *
+ * 按**醒来日期**归属：昨晚 22:43 → 今早 07:58 算今天的睡眠。
+ * 早先按自然日裁剪，一夜会被拆成 60 分钟 + 420 分钟两天，
+ * 用户看到「昨天只睡了 1 小时」。
+ *
+ * ## 窗口为什么从「昨天中午」开始
+ *
+ * 接口按 `bedtime` 过滤，22、23 点入睡的会话落在目标日之前；
+ * 从目标日零点开始取会把整夜漏掉。取前一天 12:00 起，
+ * 覆盖所有「当晚入睡、次日醒来」的组合，再按醒来日期筛。
+ *
+ * @return 日值列表 + 是否真的有会话（用于回补时区分「没数据」与「失败」）
+ */
+async function collectSleep(
     client: CollectClient,
-    start: number,
-    end: number,
     date: string,
-): Promise<number | null> {
-    const points = await client.getFitnessDataByTime('sleep', start - DAY_MILLIS, end);
-    if (!points || points.length === 0) return null;
+): Promise<{ metrics: PluginMetric[]; hasData: boolean }> {
+    // 先登记「查过」：即使后面一条都没拿到，详情页也要能列出这几个指标并显示「暂无」
+    const keys = [
+        SLEEP_KEY,
+        SLEEP_DEEP_RATIO_KEY,
+        SLEEP_EFFICIENCY_KEY,
+        SLEEP_AWAKE_COUNT_KEY,
+        SLEEP_BEDTIME_KEY,
+        SLEEP_REGULARITY_KEY,
+    ];
+    keys.forEach((k) => reportQueried(k, date));
 
-    let totalMillis = 0;
-    const raw: RawRecord[] = [];
+    const start = dayStart(date);
+    if (start === null) return { metrics: [], hasData: false };
+    const prevNoon = start - 12 * 60 * 60 * 1000;
+    const nextStart = new Date(start);
+    nextStart.setDate(nextStart.getDate() + 1);
+    const end = Math.min(nextStart.getTime() - 1, Date.now());
 
+    const points = await client.getFitnessDataByTime('sleep', prevNoon, end);
+    if (!points || points.length === 0) return { metrics: [], hasData: false };
+
+    // 解析 + 合并同一夜的重复记录
+    const sessions: SleepSession[] = [];
     points.forEach((p) => {
         const s = timestampAt(p, SLEEP_START_FIELDS);
         const e = timestampAt(p, SLEEP_END_FIELDS);
         if (s === null || e === null || e <= s) return;
 
-        // 只统计与当日窗口重叠的部分，避免跨天睡眠把前后两天都算满
-        const overlapStart = Math.max(s, start);
-        const overlapEnd = Math.min(e, end);
-        if (overlapEnd <= overlapStart) return;
+        const rawDuration = numberAt(p, ['duration']);
+        const deep = numberAt(p, ['sleep_deep_duration']) || 0;
+        const light = numberAt(p, ['sleep_light_duration']) || 0;
+        const rem = numberAt(p, ['sleep_rem_duration']) || 0;
+        const duration =
+            rawDuration !== null && rawDuration > 0 ? rawDuration : (e - s) / 60000;
 
-        totalMillis += overlapEnd - overlapStart;
-        raw.push({
-            timestamp: s,
-            value: (overlapEnd - overlapStart) / 60000,
-            // 起止时间都写进附注：拆到当天的那一段到底从几点到几点，
-            // 光看时长是推不出来的
-            detail: formatClock(s) + ' → ' + formatClock(e),
-        });
+        const session: SleepSession = {
+            startMs: s,
+            endMs: e,
+            duration,
+            deep,
+            light,
+            rem,
+            awakeCount: numberAt(p, ['awake_count']) || 0,
+            awakeDuration: numberAt(p, ['sleep_awake_duration']) || 0,
+            hasStages: deep + light + rem > 0,
+        };
+
+        const idx = sessions.findIndex((k) => sameSleep(k, session));
+        if (idx >= 0) {
+            sessions[idx] = richerSleep(sessions[idx], session);
+        } else {
+            sessions.push(session);
+        }
     });
 
-    raw.sort((a, b) => a.timestamp - b.timestamp);
+    // 只留「醒来日 == 目标日」的会话：跨零点的睡眠归到醒来的那一天
+    const nightly = sessions.filter((s) => formatDate(new Date(s.endMs)) === date);
+    if (nightly.length === 0) return { metrics: [], hasData: false };
+
+    nightly.sort((a, b) => a.startMs - b.startMs);
+
+    // 原始条目：一次会话一条，附注里带上起止与分期，供详情页核对
+    const raw: RawRecord[] = nightly.map((s) => {
+        const parts = [formatClock(s.startMs) + ' → ' + formatClock(s.endMs)];
+        if (s.hasStages) {
+            parts.push('深' + Math.round(s.deep) + ' 浅' + Math.round(s.light) + ' REM' + Math.round(s.rem));
+        }
+        if (s.awakeDuration > 0) parts.push('清醒' + Math.round(s.awakeDuration) + '分');
+        return {
+            timestamp: s.startMs,
+            value: Math.round(s.duration * 10) / 10,
+            detail: parts.join(' · '),
+        };
+    });
     reportRaw(SLEEP_KEY, raw, date);
 
-    return totalMillis > 0 ? totalMillis / 60000 : null;
+    const total = nightly.reduce((a, s) => a + s.duration, 0);
+    const deep = nightly.reduce((a, s) => a + s.deep, 0);
+    const inBed = nightly.reduce((a, s) => a + (s.endMs - s.startMs) / 60000, 0);
+    const awakeCount = nightly.reduce((a, s) => a + s.awakeCount, 0);
+    const bedtime = bedtimeMinute(nightly[0].startMs);
+
+    const metrics: PluginMetric[] = [{ metricKey: SLEEP_KEY, value: total }];
+    if (deep > 0 && total > 0) {
+        metrics.push({ metricKey: SLEEP_DEEP_RATIO_KEY, value: Math.round((deep / total) * 1000) / 10 });
+    }
+    if (inBed > 0 && total > 0) {
+        metrics.push({
+            metricKey: SLEEP_EFFICIENCY_KEY,
+            value: Math.min(100, Math.round((total / inBed) * 1000) / 10),
+        });
+    }
+    if (awakeCount > 0) {
+        metrics.push({ metricKey: SLEEP_AWAKE_COUNT_KEY, value: awakeCount });
+    }
+    metrics.push({ metricKey: SLEEP_BEDTIME_KEY, value: bedtime });
+    const regularity = sleepRegularity(bedtime);
+    if (regularity !== null) {
+        metrics.push({ metricKey: SLEEP_REGULARITY_KEY, value: regularity });
+    }
+
+    log(
+        'i',
+        '睡眠 ' + date + '：' + nightly.length + ' 段，总计 ' + Math.round(total) + ' 分钟，' +
+            '深睡占比 ' + (total > 0 ? Math.round((deep / total) * 100) : 0) + '%',
+    );
+    return { metrics, hasData: true };
 }
 
 /**
  * 采集一组共用同一个小米 key 的采样类指标。
  *
- * 原始条目全部上报，日值按 `mean` 折算：
- * 心率取均值（累加心率没有意义），热量取累加（一天烧掉多少是有意义的量）。
+ * 原始条目全部上报，日值有三种折法：
+ * - `mean`：当天均值（心率、血氧、压力这类「典型水平」）
+ * - `duration`：区间长度换算成分钟并累加（站立时长）
+ * - 其余：取时间上最新的一条（静息心率、体重、训练负荷这类「一天一次结论」）；
+ *   事件型（`fields` 为空）没有数值可取，按**次数**累加
+ * 都由插件算好交给宿主，宿主按 manifest 的 `aggregate` 再做一次同样的归约，
+ * 两边口径一致因此不会改变结果。
  */
 async function collectSampled(
     client: CollectClient,
@@ -873,6 +1184,14 @@ async function collectSampled(
         points.forEach((p) => {
             const at = timestampAt(p, ['time', 'timestamp', 'start_time']);
             if (at === null) return;
+            if (spec.duration) {
+                // 时长型：接口给的是 {start_time, end_time} 区间，换成分钟
+                const s = timestampAt(p, ['start_time', 'startTime', 'time']);
+                const e = timestampAt(p, ['end_time', 'endTime']);
+                if (s === null || e === null || e <= s) return;
+                raw.push({ timestamp: s, value: (e - s) / 60000, detail: formatClock(s) + ' → ' + formatClock(e) });
+                return;
+            }
             // 事件型（fields 为空）：记录存在本身就是「发生过」，按 1 计
             const value = spec.fields.length === 0 ? 1 : numberAt(p, spec.fields);
             if (value === null) return;
@@ -880,33 +1199,104 @@ async function collectSampled(
         });
 
         if (raw.length === 0) {
-            log('i', cloudKey + ' 的 ' + spec.fields.join('/') + ' 解析不出值');
+            log('i', cloudKey + ' 的 ' + (spec.fields.join('/') || '(事件型)') + ' 解析不出值');
             return;
         }
 
         raw.sort((a, b) => a.timestamp - b.timestamp);
         reportRaw(spec.metricKey, raw, date);
 
-        let daily: number;
         if (spec.mean) {
             let sum = 0;
             raw.forEach((r) => {
                 sum += r.value;
             });
-            daily = sum / raw.length;
-        } else {
+            const avg = sum / raw.length;
+            // 0 不算「有效日值」：接口对没有测量的日子会返回 0 值点，
+            // 当成真实的 0 会把均值拉到地上，卡片的趋势图也会跟着失真
+            if (avg > 0) out.push({ metricKey: spec.metricKey, value: avg });
+        } else if (spec.duration || spec.fields.length === 0) {
+            // 时长型与事件型都在于「这些记录一共多少」，必须累加：
+            // 取最新一条只会得到「最后一小时站了 60 分钟」
             let sum = 0;
             raw.forEach((r) => {
                 sum += r.value;
             });
-            daily = sum;
+            if (sum > 0) out.push({ metricKey: spec.metricKey, value: sum });
+        } else {
+            // 「一天一次结论」型：取最新一条原值。这里**不能**用 0 过滤——
+            // 体脂率、训练负荷这些指标的真实值可以是 0，滤掉就等于丢数据
+            const latest = raw[raw.length - 1].value;
+            out.push({ metricKey: spec.metricKey, value: latest });
         }
-
-        // 0 不算「有效日值」：接口对没有测量的日子会返回 0 值点，
-        // 当成真实的 0 会把均值拉到地上，卡片的趋势图也会跟着失真
-        if (daily > 0) out.push({ metricKey: spec.metricKey, value: daily });
     });
 
+    return out;
+}
+
+/**
+ * 采集「每日目标达成」。
+ *
+ * 走**聚合端点** `data/get_aggregated_fitness_data_by_time`：
+ * `tag=daily_fitness`（实测，不是 `daily`）、`key=goal`。
+ * 返回的 value 里是四个环：
+ * ```
+ * { goal_items: [{achieved_value, target_value, field}], stand_goal: {...} }
+ * ```
+ * `field` 映射（官方实测）：1=步数、2=热量、3=站立小时、4=活动分钟。
+ */
+async function collectDailyGoals(
+    client: CollectClient,
+    date: string,
+): Promise<PluginMetric[]> {
+    const keys = [GOAL_STEPS, GOAL_CALORIES, GOAL_ACTIVE_MINUTES, GOAL_STAND_HOURS];
+    keys.forEach((k) => reportQueried(k, date));
+
+    const range = dayRange(date);
+    if (!range) return [];
+    const [start, end] = range;
+
+    let items: any[];
+    try {
+        items = await client.getDailyGoals(start, end);
+    } catch (e) {
+        // 该端点在某些账号上直接返回空集（没有统计），那是「没有」而非「失败」，
+        // 不该让整轮采集跟着报错
+        log('i', 'daily_fitness/goal 取不到（' + date + '）：' + describeError(e));
+        return [];
+    }
+    if (items.length === 0) return [];
+
+    // 同一天可能有多条（多设备/重复写入），取时间最新的一条
+    const latest = items[items.length - 1];
+    const payload = payloadOf(latest);
+    const goals: Record<number, number> = {};
+
+    const goalItems = (payload.goal_items as any[]) || [];
+    goalItems.forEach((g: any) => {
+        const field = Number(g && g.field);
+        const achieved = Number(g && g.achieved_value);
+        if (isFinite(field) && isFinite(achieved)) goals[field] = achieved;
+    });
+    const stand = payload.stand_goal as any;
+    if (stand && isFinite(Number(stand.field))) {
+        goals[Number(stand.field)] = Number(stand.achieved_value);
+    }
+
+    const map: Array<[number, string]> = [
+        [1, GOAL_STEPS],
+        [2, GOAL_CALORIES],
+        [3, GOAL_STAND_HOURS],
+        [4, GOAL_ACTIVE_MINUTES],
+    ];
+    const out: PluginMetric[] = [];
+    map.forEach(([field, key]) => {
+        const v = goals[field];
+        if (v === undefined || !isFinite(v)) return;
+        reportRaw(key, [{ timestamp: start, value: v }], date);
+        out.push({ metricKey: key, value: v });
+    });
+    log('i', '每日目标（' + date + '）解析到 ' + out.length + ' 项');
     return out;
 }
 
@@ -1106,18 +1496,18 @@ export async function fetch(date: string): Promise<FetchResult> {
         // 若在请求前就登记，网络失败或未登录时也会显示「暂无」，
         // 用户会误判为「这天真的没走步」，而不是「采集失败」。
         try {
-            const steps = await collectSteps(client, start, end, date);
-            reportQueried(STEPS_KEY, date);
-            if (steps !== null) out.push({ metricKey: STEPS_KEY, value: steps });
+            // 步数、距离、热量同源：一次 steps 请求就能全拿到
+            const stepMetrics = await collectSteps(client, start, end, date);
+            [STEPS_KEY, OBS_DISTANCE, OBS_CALORIES].forEach((k) => reportQueried(k, date));
+            stepMetrics.forEach((m) => out.push(m));
         } catch (e) {
             noteAuthFailure(e);
             log('w', '步数采集失败（' + date + '）：' + describeError(e));
         }
 
         try {
-            const sleep = await collectSleepMinutes(client, start, end, date);
-            reportQueried(SLEEP_KEY, date);
-            if (sleep !== null) out.push({ metricKey: SLEEP_KEY, value: sleep });
+            const sleep = await collectSleep(client, date);
+            sleep.metrics.forEach((m) => out.push(m));
         } catch (e) {
             noteAuthFailure(e);
             log('w', '睡眠采集失败（' + date + '）：' + describeError(e));
@@ -1134,6 +1524,15 @@ export async function fetch(date: string): Promise<FetchResult> {
                 noteAuthFailure(e);
                 log('w', g.key + ' 采集失败（' + date + '）：' + describeError(e));
             }
+        }
+
+        // 每日目标达成（四个环）：走聚合端点，失败只记日志不影响其它指标
+        try {
+            const goals = await collectDailyGoals(client, date);
+            goals.forEach((m) => out.push(m));
+        } catch (e) {
+            noteAuthFailure(e);
+            log('w', '每日目标采集失败（' + date + '）：' + describeError(e));
         }
 
         // 只要有一个通道报凭据失效，就整轮按 authRequired 上报。
@@ -1299,8 +1698,44 @@ export async function detailUi(): Promise<UiBlock[]> {
             blocks.push({
                 type: 'text',
                 title: '统计口径',
-                body: '按自然日累计睡眠时长，跨夜睡眠会拆到前后两天，所以这里显示的不是「昨夜总睡眠」。',
+                body:
+                    '按醒来日统计整夜睡眠：昨晚 22:43 睡到今早 07:58 算今天这一条；' +
+                    '同一夜的多条记录（手机算法 + 手环汇总）已合并，不会重复累加。',
             });
+
+            // 睡眠细节：有数据才展示，没数据不占版面
+            const deepRatio = recentValues(SLEEP_DEEP_RATIO_KEY);
+            const efficiency = recentValues(SLEEP_EFFICIENCY_KEY);
+            const regularity = recentValues(SLEEP_REGULARITY_KEY);
+            const detailCards: UiBlock[] = [];
+            if (deepRatio.length > 0) {
+                detailCards.push({
+                    type: 'statusCard',
+                    label: '深睡占比',
+                    value: deepRatio[deepRatio.length - 1].value.toFixed(1) + ' %',
+                    tone: 'neutral',
+                    detail: deepRatio[deepRatio.length - 1].date,
+                });
+            }
+            if (efficiency.length > 0) {
+                detailCards.push({
+                    type: 'statusCard',
+                    label: '睡眠效率',
+                    value: efficiency[efficiency.length - 1].value.toFixed(1) + ' %',
+                    tone: 'neutral',
+                    detail: efficiency[efficiency.length - 1].date,
+                });
+            }
+            if (regularity.length > 0) {
+                detailCards.push({
+                    type: 'statusCard',
+                    label: '入睡规律性',
+                    value: Math.round(regularity[regularity.length - 1].value) + ' 分',
+                    tone: 'neutral',
+                    detail: regularity[regularity.length - 1].date,
+                });
+            }
+            detailCards.forEach((b) => blocks.push(b));
         } else {
             blocks.push({
                 type: 'text',
@@ -1400,13 +1835,32 @@ async function backfillHistory(): Promise<ActionResult> {
         }
         try {
             const [start, end] = range;
-            // 两个量纲的返回值是「有数据」的数，「没数据」是 null。
+            // 返回值是「有数据」的列表，「没数据」是空。
             // 不能用「没抛异常」当成功：服务端对没记录的日子正常返回空列表，
             // 那样填出来的天数会把「真的补到了」和「这天本来就没数据」混在一起，
             // 用户看到「已回补 30 天」但列表还是空的。
             const steps = await collectSteps(client, start, end, date);
-            const sleep = await collectSleepMinutes(client, start, end, date);
-            if (steps !== null || sleep !== null) {
+            const sleep = await collectSleep(client, date);
+            // 其余采样类指标也一并回补：只补步数/睡眠会让详情页的
+            // 心率、静息心率、身体成分等指标在历史日期永远是空的
+            let other = 0;
+            const groups = groupBy(SAMPLED, (s) => s.cloudKey);
+            for (let i = 0; i < groups.length; i++) {
+                const g = groups[i];
+                try {
+                    other += (await collectSampled(client, g.key, g.items, start, end, date)).length;
+                } catch (e) {
+                    log('w', '回补 ' + g.key + '（' + date + '）失败：' + describeError(e));
+                }
+            }
+            // 每日目标达成也一并回补
+            let goalCount = 0;
+            try {
+                goalCount = (await collectDailyGoals(client, date)).length;
+            } catch (e) {
+                log('w', '回补每日目标（' + date + '）失败：' + describeError(e));
+            }
+            if (steps.length > 0 || sleep.hasData || other > 0 || goalCount > 0) {
                 filled++;
             } else {
                 empty++;

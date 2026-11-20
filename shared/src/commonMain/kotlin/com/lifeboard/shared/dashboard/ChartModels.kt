@@ -84,6 +84,30 @@ enum class ChartType {
 
     /** 环形进度：单指标当前值 / 目标值 */
     RING,
+
+    /**
+     * 热力图：GitHub 打卡日历式的格子图。
+     *
+     * 只用第一条序列（一个指标），横轴周、纵轴星期，格子颜色深浅代表当天的值。
+     * 多指标叠在同一个格子里没有可读的比法，所以它和 [RING] 一样是单序列形态。
+     */
+    HEATMAP,
+}
+
+/**
+ * 卡片密度。
+ *
+ * 同一份数据在两种密度下画法不同：
+ * - [COMFORTABLE] 是原来的大卡，图占主体，适合单向滚动精读
+ * - [COMPACT] 参考仪表盘式的小方块：大数字在上、迷你趋势在下，
+ *   宽屏一屏能排三四列，适合「扫一眼全局」
+ *
+ * 存放在每张卡自己的配置里而不是页签级设置：同一个页签里
+ * 「得分」适合方块、「趋势」适合大卡，绑死在页签上反而不好用。
+ */
+enum class ChartDensity {
+    COMFORTABLE,
+    COMPACT,
 }
 
 /** 允许的时间窗天数。与 UI 上的三个选项保持一致 */
@@ -113,20 +137,26 @@ data class ChartSeriesConfig(
 /**
  * 一张自定义图表的完整配置。
  *
+ * @param title 用户可编辑的标题。为空时界面回退到图表类型名（「折线图」等），
+ *   而不是显示一个空白标题——空白让人以为是加载中
  * @param chartType 图表形态，决定用哪套渲染与数据约束
- * @param series 指标序列。折线/柱状/面积/散点可多条；饼图与环形进度只用第一条
+ * @param series 指标序列。折线/柱状/面积/散点可多条；饼图与热力图不读它，
+ *   环形进度与热力图只用第一条
  * @param timeWindowDays 时间窗，固定 7/30/90
  * @param showLegend 是否显示图例
  * @param categorySourceKey 分类数据源（仅饼图使用）
  * @param topN 饼图只展示前 N 项，其余归入「其他」
+ * @param density 卡片密度。[ChartDensity.COMPACT] 时用方块样式渲染
  */
 data class ChartCardConfig(
+    val title: String = "",
     val chartType: ChartType,
     val series: List<ChartSeriesConfig>,
     val timeWindowDays: Int = 30,
     val showLegend: Boolean = true,
     val categorySourceKey: String? = null,
     val topN: Int? = null,
+    val density: ChartDensity = ChartDensity.COMFORTABLE,
 ) {
     /**
      * 这份配置是否足以画出一张有意义的图。
@@ -149,9 +179,35 @@ data class ChartCardConfig(
 
             // 环形进度要一个指标作为当前值
             ChartType.RING -> series.isNotEmpty() && series.all { it.isUsable() }
+
+            // 热力图只画一个指标：它一张图只有一种「深浅」标度，
+            // 两条序列落在同一格上无法分辨谁是谁。
+            // 判据是「恰好一条」而不是「至少一条」——多出来的序列读不到、也画不出，
+            // 放它入库只会得到一张比配置少的图
+            ChartType.HEATMAP -> series.size == 1 && series.all { it.isUsable() }
         }
     }
+
+    /**
+     * 这张卡默认显示的名字。
+     *
+     * 用户没起名时用类型名而不是空串：卡片标题是用户定位「这张图是什么」的第一眼信息，
+     * 空着等于让每张没命名的图都长得一样。
+     */
+    fun displayTitle(): String = title.trim().ifEmpty { chartType.displayName() }
 }
+
+/** 图表类型的中文名。放在模型层是因为卡片的默认标题也要用它 */
+fun ChartType.displayName(): String = when (this) {
+    ChartType.LINE -> "折线图"
+    ChartType.COLUMN -> "柱状图"
+    ChartType.AREA -> "面积图"
+    ChartType.SCATTER -> "散点图"
+    ChartType.PIE -> "饼图"
+    ChartType.RING -> "环形进度"
+    ChartType.HEATMAP -> "热力图"
+}
+
 
 /**
  * 这条序列是否足以查到数据。

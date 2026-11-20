@@ -191,9 +191,23 @@ class PluginViewModel(
         }
     }
 
+    /**
+     * 最近一次从宿主收到的盘面。
+     *
+     * **为什么必须自己存**：`snapshots()` 是 `StateFlow`，宿主重扫后若
+     * 装了什么、版本、指标都没变，它推来的 `PluginList` 与旧值**相等**，
+     * StateFlow 会直接吞掉这次发射。而「登录态变了」恰恰不体现在
+     * `PluginList` 里（它在 [toRow] 里现问插件），于是列表会一直停在
+     * 「已登录」——登录成功、登出、清除凭据后都遇到过这个问题。
+     *
+     * 存一份原样盘面，动作完成后就能自己重跑一遍 [applyList] 把登录态刷新出来。
+     */
+    private var lastList: PluginList? = null
+
     /** 把宿主推来的盘面翻译成界面状态。健康度与登录态在这一层补 */
     private suspend fun applyList(list: PluginList) {
         if (!list.ready) return
+        lastList = list
         val rows = list.installed.map { it.toRow(deps) }
         _state.value = _state.value.copy(
             loading = false,
@@ -219,10 +233,23 @@ class PluginViewModel(
     }
 
     /**
+     * 用最近一次盘面重算列表（不重新扫描）。
+     *
+     * 给「插件集合没变、只有登录态或健康度变了」的动作收尾用：
+     * 登录、登出、清除凭据、立即同步。
+     */
+    private suspend fun reloadRows() {
+        lastList?.let { applyList(it) }
+    }
+
+    /**
      * 手动刷新。
      *
      * 列表本身已经靠 [snapshots] 自动更新，这个入口只保留给
      * 「刚改完文件、不想等轮询间隔」的场景与界面的显式刷新按钮。
+     *
+     * 扫完一定再 [reloadRows] 一次：重扫结果与旧值相等时 StateFlow 不会发射，
+     * 只靠订阅的话 `loading` 会永远停在 true、登录态也不会更新。
      */
     fun refresh() {
         scope.launch {
@@ -233,7 +260,13 @@ class PluginViewModel(
                         loading = false,
                         message = "扫描插件失败：${error.message ?: error::class.simpleName}",
                     )
+                    return@launch
                 }
+            reloadRows()
+            // 首次刷新时可能还没收到过盘面：把 loading 收掉，别让界面一直转圈
+            if (_state.value.loading) {
+                _state.value = _state.value.copy(loading = false)
+            }
         }
     }
 
@@ -391,16 +424,31 @@ class PluginViewModel(
     fun revokeTrust(row: PluginRow) {
         scope.launch {
             runCatching { deps.plugins.revokeTrust(row.pluginId) }
+                .onFailure { AppLogger.error("停止使用插件 ${row.pluginId} 失败", it) }
             _state.value = _state.value.copy(message = "已停止使用 ${row.displayName}")
             refresh()
         }
     }
 
-    /** 卸载：删包并撤销信任，保留凭据与私有数据（用户可能只是想重装） */
-    fun uninstall(row: PluginRow) {
+    /**
+     * 卸载：删包并撤销信任。
+     *
+     * @param clearData true 时连私有数据、凭据与历史采集一起清掉；
+     *   false 时保留，用户重装后数据与登录态都还在
+     */
+    fun uninstall(row: PluginRow, clearData: Boolean) {
         scope.launch {
-            runCatching { deps.plugins.uninstall(row.pluginId) }
-            _state.value = _state.value.copy(message = "已卸载 ${row.displayName}")
+            val result = runCatching { deps.plugins.uninstall(row.pluginId, clearData) }
+            result.exceptionOrNull()?.let {
+                AppLogger.error("卸载插件 ${row.pluginId} 失败", it)
+            }
+            _state.value = _state.value.copy(
+                message = if (result.isSuccess) {
+                    if (clearData) "已卸载 ${row.displayName} 并清除数据" else "已卸载 ${row.displayName}，数据已保留"
+                } else {
+                    "卸载失败：${result.exceptionOrNull()?.message ?: "未知错误"}"
+                },
+            )
             refresh()
         }
     }
@@ -408,6 +456,7 @@ class PluginViewModel(
     fun deletePending(row: PendingRow) {
         scope.launch {
             runCatching { deps.plugins.uninstallPending(row.archiveName) }
+                .onFailure { AppLogger.error("删除插件包 ${row.archiveName} 失败", it) }
             _state.value = _state.value.copy(message = "已删除 ${row.archiveName}")
             refresh()
         }
@@ -417,23 +466,42 @@ class PluginViewModel(
     fun deleteBroken(row: BrokenRow) {
         scope.launch {
             runCatching { deps.plugins.uninstallPending(row.archiveName) }
+                .onFailure { AppLogger.error("删除坏包 ${row.archiveName} 失败", it) }
             _state.value = _state.value.copy(message = "已删除 ${row.archiveName}")
             refresh()
         }
     }
 
-    /** 清除某插件的全部凭据，需要重新登录。不可逆，UI 必须先确认 */
+    /**
+     * 清除某插件的全部凭据，需要重新登录。不可逆，UI 必须先确认。
+     *
+     * 删完库还要调一次插件的 `logout`：契约要求宿主在用户清除凭据时这么做
+     * （见 `SourcePlugin.logout` 的注释）。插件通常把 token 缓存在内存里，
+     * 只删库不通知它，下一次调用就会把旧凭据重新写回去——用户看到的是
+     * 「清了但还显示已登录」，以为清除没生效。
+     */
     fun clearCredentials(row: PluginRow) {
         scope.launch {
-            val count = runCatching { deps.plugins.clearCredentials(row.pluginId) }
-                .getOrDefault(0)
+            val result = runCatching {
+                val count = deps.plugins.clearCredentials(row.pluginId)
+                // 登出失败不影响「已清除」这个结论：库里的凭据已经删掉了
+                runCatching { deps.pluginInvoker.logout(row.pluginId) }
+                    .onFailure { AppLogger.warn("清除凭据后通知插件 ${row.pluginId} 登出失败：${it.message}") }
+                count
+            }
             _state.value = _state.value.copy(
-                message = if (count > 0) {
-                    "已清除 ${row.displayName} 的 $count 项凭据"
-                } else {
-                    "该插件没有已保存的凭据"
-                },
+                message = result.fold(
+                    onSuccess = { count ->
+                        if (count > 0) "已清除 ${row.displayName} 的 $count 项凭据" else "该插件没有已保存的凭据"
+                    },
+                    onFailure = { error ->
+                        AppLogger.error("清除插件 ${row.pluginId} 的凭据失败", error)
+                        "清除凭据失败：${error.message ?: error::class.simpleName ?: "未知错误"}"
+                    },
+                ),
             )
+            // 登录态变了，重新问一遍插件把它显示到列表行上
+            refresh()
         }
     }
 
@@ -474,8 +542,10 @@ class PluginViewModel(
                         is CollectOutcome.Failed -> outcome.reason
                     },
                 )
-                // 列表已经靠 snapshots 自动更新，这里只是让健康度/登录态立刻重判
+                // 列表已经靠 snapshots 自动更新，这里只是让健康度/登录态立刻重判。
+                // 重扫结果若与旧盘面相等，StateFlow 不会再发；必须自己再算一遍行
                 runCatching { deps.plugins.refresh() }
+                reloadRows()
             }
             // 抛出去让 TaskCenter 记成失败；正常结束由 TaskCenter 自己收尾
             failure?.let { error(it) }
@@ -579,10 +649,17 @@ class PluginViewModel(
         }
     }
 
-    /** 登出：让插件清掉自己名下的凭据 */
+    /**
+     * 登出：让插件清掉自己名下的凭据。
+     *
+     * 与「清除凭据」的区别见 `PluginScreen` 的确认文案：登出是**插件自己**
+     * 执行的注销（清多少、清哪些由插件决定），清除凭据是**宿主直接删库**，
+     * 不依赖插件实现。两者都会在结束时刷一次列表，登录态才跟得上。
+     */
     fun logout(row: PluginRow) {
         scope.launch {
             runCatching { deps.pluginInvoker.logout(row.pluginId) }
+                .onFailure { AppLogger.warn("登出插件 ${row.pluginId} 失败：${it.message}") }
             _state.value = _state.value.copy(message = "已退出 ${row.displayName}")
             refresh()
         }

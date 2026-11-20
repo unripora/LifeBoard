@@ -121,6 +121,17 @@ fun buildChartRenderModel(
             return@forEachIndexed
         }
 
+        // 一条序列的单位与它所在的那根轴不一致，说明用户把不同单位的东西
+        // 塞进了同一根轴。刻度只按第一种单位画，这条线的读数就是错的，
+        // 而且错得很隐蔽——它看起来只是一条高得离谱的线。
+        // 这里给警告而不是排除它：排除会让用户以为数据没了
+        val axisUnit = if (slot == ChartAxisSlot.LEFT) leftUnit.firstOrNull() else rightUnit.firstOrNull()
+        if (unit.isNotBlank() && axisUnit != null && axisUnit != unit) {
+            val axisName = if (slot == ChartAxisSlot.LEFT) "左轴" else "右轴"
+            warnings += "${series.label}：单位「$unit」与${axisName}的「$axisUnit」不同，" +
+                "它按${axisName}刻度读出来的值不准确"
+        }
+
         placed += PlacedSeries(series, slot)
     }
 

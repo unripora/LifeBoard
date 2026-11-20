@@ -3,6 +3,7 @@ package com.lifeboard.server.dashboard
 import com.lifeboard.shared.dashboard.ChartAxis
 import com.lifeboard.shared.dashboard.ChartCardConfig
 import com.lifeboard.shared.dashboard.ChartConfigCodec
+import com.lifeboard.shared.dashboard.ChartDensity
 import com.lifeboard.shared.dashboard.ChartSeriesConfig
 import com.lifeboard.shared.dashboard.ChartType
 import org.junit.Assert.assertEquals
@@ -293,5 +294,82 @@ class ChartConfigCodecTest {
         val decoded = requireNotNull(ChartConfigCodec.decode(raw))
         assertEquals(ChartType.PIE, decoded.chartType)
         assertTrue(decoded.isRenderable())
+    }
+
+    @Test
+    fun titleAndDensityRoundTrip() {
+        val config = sampleConfig().copy(
+            title = "我的步数",
+            density = ChartDensity.COMPACT,
+        )
+        val decoded = requireNotNull(ChartConfigCodec.decode(ChartConfigCodec.encode(config)))
+        assertEquals("我的步数", decoded.title)
+        assertEquals(ChartDensity.COMPACT, decoded.density)
+    }
+
+    @Test
+    fun versionTwoConfigWithoutTitleOrDensityDecodesToDefaults() {
+        // v2 的配置里没有 title / density。升级后必须照常读出来，
+        // 而且要回退到「没命名 + 大卡」——那正是 v2 时的观感。
+        // 读成方块会让所有老图在升级瞬间集体变形
+        val raw = """{"v":2,"type":"LINE","series":[
+            {"source":"builtin","metric":"STEPS","label":"步数","unit":"步"}
+        ],"timeWindow":30}"""
+        val decoded = requireNotNull(ChartConfigCodec.decode(raw))
+        assertEquals("", decoded.title)
+        assertEquals(ChartDensity.COMFORTABLE, decoded.density)
+    }
+
+    @Test
+    fun emptyTitleIsNotWritten() {
+        // 空标题不落库：落进去就变成「用户把它命名成了空串」，
+        // 将来改默认标题时这些卡不跟随
+        val encoded = requireNotNull(ChartConfigCodec.encode(sampleConfig()))
+        assertFalse(encoded.contains("\"title\""))
+    }
+
+    @Test
+    fun displayTitleFallsBackToTypeName() {
+        // 没命名时用类型名，而不是显示空白标题
+        val unnamed = sampleConfig().copy(chartType = ChartType.COLUMN, title = "  ")
+        assertEquals("柱状图", unnamed.displayTitle())
+        assertEquals("我的图", unnamed.copy(title = "我的图").displayTitle())
+    }
+
+    @Test
+    fun heatmapRequiresExactlyOneSeries() {
+        // 热力图一张图只有一种深浅标度，两条序列落在同一格上分不出谁是谁
+        val one = ChartCardConfig(
+            chartType = ChartType.HEATMAP,
+            series = listOf(ChartSeriesConfig("builtin", "STEPS", "步数", "步")),
+        )
+        assertTrue(one.isRenderable())
+
+        val two = one.copy(
+            series = one.series + ChartSeriesConfig("builtin", "SLEEP", "睡眠", "小时"),
+        )
+        assertFalse(two.isRenderable())
+    }
+
+    @Test
+    fun manySeriesOnSequentialChartsStayRenderable() {
+        // 时间序列类不再限制指标条数：一条不同单位算不出可读的刻度，
+        // 但三条同单位的线完全可读，没有理由拦着
+        val series = (1..4).map { index ->
+            ChartSeriesConfig("builtin", "M$index", "指标$index", "步")
+        }
+        val config = ChartCardConfig(chartType = ChartType.LINE, series = series)
+        assertTrue(config.isRenderable())
+    }
+
+    @Test
+    fun heatmapTypeNameSurvivesRoundTrip() {
+        // 存进配置的是枚举名。改名字等于改数据格式，这条测的是「没被改」
+        val config = ChartCardConfig(
+            chartType = ChartType.HEATMAP,
+            series = listOf(ChartSeriesConfig("builtin", "STEPS", "步数", "步")),
+        )
+        val decoded = requireNotNull(ChartConfigCodec.decode(ChartConfigCodec.encode(config)))
+        assertEquals(ChartType.HEATMAP, decoded.chartType)
     }
 }

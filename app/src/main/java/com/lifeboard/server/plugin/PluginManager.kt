@@ -7,12 +7,14 @@ import com.lifeboard.plugin.api.AuthState
 import com.lifeboard.plugin.api.LoginResult
 import com.lifeboard.plugin.api.UiBlock
 import com.lifeboard.server.collect.DailyAggregateWorker
+import com.lifeboard.server.db.DatabaseProviders
 import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.shared.platform.PendingPlugin
 import com.lifeboard.shared.platform.PluginList
 import com.lifeboard.shared.platform.PluginSummary
 import com.lifeboard.shared.plugin.fs.AndroidPluginFileSystem
 import com.lifeboard.shared.plugin.js.PluginDirWatcher
+import com.lifeboard.shared.repository.PluginDataPurger
 import com.lifeboard.server.plugin.js.JsPluginInstallService
 import com.lifeboard.server.plugin.js.JsPluginLoader
 import kotlinx.coroutines.CoroutineScope
@@ -235,18 +237,53 @@ object PluginManager {
     /**
      * 卸载插件：删包 + 清除安装记录 + 撤销信任 + 重新扫描。
      *
-     * **不自动清凭据和插件私有数据**：用户可能只是想换版本重装，
-     * 账号和缓存没了就得重新登录。要清什么由调用方显式决定。
+     * @param clearData true 时一并清掉该插件产生的全部数据（私有目录、凭据、
+     *   历史采集）。false 时保留——用户可能只是想换版本重装，账号和缓存
+     *   没了就得重新登录、历史曲线也断了。
      */
-    fun uninstall(context: Context, pluginId: String) {
+    suspend fun uninstall(context: Context, pluginId: String, clearData: Boolean) {
         val appContext = context.applicationContext
-        synchronized(lifecycleLock) {
+        val metricKeys = synchronized(lifecycleLock) {
             val js = JsPluginLoader.find(appContext, pluginId) ?: return
+            val keys = js.plugin.metrics.map { it.metricKey }
             JsPluginLoader.closeAll(appContext)
             JsPluginLoader.remove(appContext, js.archiveName)
             PluginTrustStore.revokePackage(appContext, js.archive.packageName)
+            keys
+        }
+        if (clearData) {
+            clearPluginData(appContext, pluginId, metricKeys)
         }
         refresh(appContext)
+    }
+
+    /**
+     * 清空某插件产生的全部数据，但保留插件包与信任关系。
+     *
+     * 与「清除凭据」不同：那个只让插件回到未登录，这里连历史采集一起删。
+     * 编排在共享层的 [PluginDataPurger]，平台差异只有「私有目录在哪」。
+     */
+    suspend fun clearPluginData(context: Context, pluginId: String) {
+        val appContext = context.applicationContext
+        val keys = JsPluginLoader.find(appContext, pluginId)?.plugin?.metrics?.map { it.metricKey }.orEmpty()
+        clearPluginData(appContext, pluginId, keys)
+    }
+
+    private suspend fun clearPluginData(
+        appContext: Context,
+        pluginId: String,
+        metricKeys: Collection<String>,
+    ) {
+        PluginDataPurger(
+            pluginStore = DatabaseProviders.pluginStore(appContext),
+            metricStore = DatabaseProviders.metricStore(appContext),
+            clearCredentials = { id -> CredentialVault.clearPlugin(appContext, id) },
+            deleteDataDir = {
+                // 删整个插件目录而不只是 data 子目录：目录里若将来还有别的东西
+                // （缓存、导出文件），「清除数据」都不该留下
+                File(File(appContext.filesDir, "plugins"), it).deleteRecursively()
+            },
+        ).purge(pluginId, metricKeys)
     }
 
     /**

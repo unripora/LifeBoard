@@ -326,7 +326,8 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
     fun revokeTrust() {
         val info = _state.value.info ?: return
         scope.launch {
-            withContext(Dispatchers.IO) { deps.plugins.revokeTrust(info.pluginId) }
+            runCatching { withContext(Dispatchers.IO) { deps.plugins.revokeTrust(info.pluginId) } }
+                .onFailure { AppLogger.error("停止使用插件 ${info.pluginId} 失败", it) }
             _state.value = _state.value.copy(
                 message = "已停止使用 ${info.displayName}",
                 closed = true,
@@ -334,33 +335,105 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
         }
     }
 
-    /** 卸载：删包并撤销信任，保留凭据与私有数据（用户可能只是想重装） */
-    fun uninstall() {
+    /**
+     * 卸载：删包并撤销信任。
+     *
+     * @param clearData true 时连私有数据、凭据与历史采集一起清掉
+     */
+    fun uninstall(clearData: Boolean) {
         val info = _state.value.info ?: return
         scope.launch {
-            withContext(Dispatchers.IO) { deps.plugins.uninstall(info.pluginId) }
+            val result = runCatching {
+                withContext(Dispatchers.IO) { deps.plugins.uninstall(info.pluginId, clearData) }
+            }
+            result.exceptionOrNull()?.let { AppLogger.error("卸载插件 ${info.pluginId} 失败", it) }
             _state.value = _state.value.copy(
-                message = "已卸载 ${info.displayName}",
-                closed = true,
+                message = if (result.isSuccess) {
+                    if (clearData) "已卸载 ${info.displayName} 并清除数据" else "已卸载 ${info.displayName}，数据已保留"
+                } else {
+                    "卸载失败：${result.exceptionOrNull()?.message ?: "未知错误"}"
+                },
+                // 失败时留在页面上：用户需要看到原因，也需要能重试
+                closed = result.isSuccess,
             )
         }
     }
 
-    /** 清空凭据不影响插件本体，留在本页刷新登录态即可 */
+    /**
+     * 清除插件产生的全部数据（私有目录、凭据、历史采集），但保留插件包。
+     *
+     * 清完只重读「全部数据」这一块，**不**重新 `load()`：
+     * `load()` 会再进一次插件（`detailUi` / `authState`）并触发全量重扫，
+     * 而这里刚把它的数据删干净，再去问它只会让界面闪一下、还可能
+     * 让插件把缓存又写回来。
+     */
+    fun clearPluginData() {
+        val info = _state.value.info ?: return
+        scope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.IO) { deps.plugins.clearPluginData(info.pluginId) }
+            }
+            result.exceptionOrNull()?.let { AppLogger.error("清除插件 ${info.pluginId} 的数据失败", it) }
+            _state.value = _state.value.copy(
+                message = if (result.isSuccess) {
+                    "已清除 ${info.displayName} 的数据，需要重新登录"
+                } else {
+                    "清除数据失败：${result.exceptionOrNull()?.message ?: "未知错误"}"
+                },
+                // 登录态一并没了，本地直接反映，别再去问插件
+                info = if (result.isSuccess) {
+                    _state.value.info?.copy(
+                        loginText = if (info.needsLogin) "未登录" else "",
+                        needsLoginAction = info.needsLogin,
+                        authStateUnknown = false,
+                    )
+                } else {
+                    _state.value.info
+                },
+            )
+            reloadRaw(info.pluginId, _state.value.rawRange)
+        }
+    }
+
+    /**
+     * 清空凭据不影响插件本体，就地更新登录态即可。
+     *
+     * 这里**刻意不调 `load()`**：那会重新扫一遍插件目录、再进一次插件问
+     * `authState`，而刚删掉凭据就立刻去问它，既慢又容易让界面闪回「待确认」。
+     * 用户想看的结论很明确——现在是未登录。
+     *
+     * 删完还要通知插件登出（契约要求，见 `SourcePlugin.logout`）：
+     * 插件通常把 token 缓存在内存里，不通知它，下一次调用可能把旧凭据写回来。
+     */
     fun clearCredentials() {
         val info = _state.value.info ?: return
         scope.launch {
-            val count = runCatching {
-                withContext(Dispatchers.IO) { deps.plugins.clearCredentials(info.pluginId) }
-            }.getOrDefault(0)
+            val result = runCatching {
+                val count = withContext(Dispatchers.IO) { deps.plugins.clearCredentials(info.pluginId) }
+                runCatching { withContext(Dispatchers.IO) { deps.pluginInvoker.logout(info.pluginId) } }
+                    .onFailure { AppLogger.warn("清除凭据后通知插件 ${info.pluginId} 登出失败：${it.message}") }
+                count
+            }
             _state.value = _state.value.copy(
-                message = if (count > 0) {
-                    "已清除 ${info.displayName} 的 $count 项凭据"
+                message = result.fold(
+                    onSuccess = { count ->
+                        if (count > 0) "已清除 ${info.displayName} 的 $count 项凭据" else "该插件没有已保存的凭据"
+                    },
+                    onFailure = { error ->
+                        AppLogger.error("清除插件 ${info.pluginId} 的凭据失败", error)
+                        "清除凭据失败：${error.message ?: error::class.simpleName ?: "未知错误"}"
+                    },
+                ),
+                info = if (result.isSuccess) {
+                    _state.value.info?.copy(
+                        loginText = "未登录",
+                        needsLoginAction = true,
+                        authStateUnknown = false,
+                    )
                 } else {
-                    "该插件没有已保存的凭据"
+                    _state.value.info
                 },
             )
-            load(info.pluginId)
         }
     }
 

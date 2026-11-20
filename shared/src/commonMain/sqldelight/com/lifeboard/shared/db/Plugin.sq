@@ -101,6 +101,10 @@ deleteRawRecordsByDateAndMetric:
 DELETE FROM `plugin_raw_record`
 WHERE `pluginId` = ? AND `date` = ? AND `metricKey` = ?;
 
+-- 卸载时「清除数据」用：整插件清空，不按天
+deleteRawRecordsByPlugin:
+DELETE FROM `plugin_raw_record` WHERE `pluginId` = ?;
+
 clearAllRawRecords:
 DELETE FROM `plugin_raw_record`;
 
@@ -117,6 +121,10 @@ WHERE `pluginId` = ? AND `date` BETWEEN ? AND ?;
 
 selectEarliestMetricQueryDate:
 SELECT MIN(`date`) FROM `plugin_metric_query` WHERE `pluginId` = ?;
+
+-- 与 deleteRawRecordsByPlugin 配套：痕迹不清，详情页仍会列出「查过但暂无数据」
+deleteMetricQueriesByPlugin:
+DELETE FROM `plugin_metric_query` WHERE `pluginId` = ?;
 
 clearAllMetricQueries:
 DELETE FROM `plugin_metric_query`;

@@ -16,6 +16,7 @@ import com.lifeboard.shared.navigation.PageHost
 import com.lifeboard.shared.navigation.Shortcut
 import com.lifeboard.shared.navigation.TabActions
 import com.lifeboard.shared.navigation.TabLayout
+import com.lifeboard.shared.settings.AppearanceState
 import com.lifeboard.shared.ui.theme.ColorPalette
 import com.lifeboard.shared.ui.theme.GlassBackground
 import com.lifeboard.shared.ui.theme.LifeBoardTheme
@@ -45,6 +46,11 @@ import kotlinx.coroutines.flow.Flow
  *   Android 没有物理键盘，用默认的空实现
  * @param showTaskIndicator 是否在页签行右端画任务指示环。Android 端在自己的
  *   `TopAppBar` 里已经画了一颗，这里再画就是两颗，所以默认关闭、由桌面端显式打开
+ * @param appearance 外观状态（明暗模式 + 色系）。主题必须挂在这一层：
+ *   设置页改的是它，而重组的入口也只能是持有它的这棵界面树。
+ *   以前这里写死 `WATER_LILIES + SYSTEM`，设置页点色系后偏好确实写进了库，
+ *   但界面取色从不读它——表现就是「点了没反应」。
+ *   为 null 时退回默认配色（老调用方与预览仍能渲染）
  */
 @Composable
 fun App(
@@ -57,6 +63,7 @@ fun App(
     onRestoreDefaults: () -> Unit = {},
     shortcutHandler: (KeyEvent) -> Shortcut? = { null },
     showTaskIndicator: Boolean = false,
+    appearance: AppearanceState? = null,
 ) {
     // 快捷键处理器由页签壳注册进来（M4-4.7）。
     //
@@ -65,9 +72,12 @@ fun App(
     // 「按 Ctrl+Tab 总是跳到同一个页签」。
     var shortcutSink by remember { mutableStateOf<((Shortcut) -> Unit)?>(null) }
 
-    // 外观：Android 侧是 Activity 级的 AppearanceState（用户可改色系/明暗）。
-    // 桌面端等设置页搬过来（3.2d）再从 SettingsStore 读，现在用默认值。
-    LifeBoardTheme(palette = ColorPalette.WATER_LILIES, mode = ThemeMode.SYSTEM) {
+    // 外观：读端传入的 AppearanceState。取不到时退回默认值，
+    // 而不是在这里再建一个——自建的实例与设置页用的不是同一个对象，
+    // 改了不会互相看见，等于把「点了没反应」换个地方复现
+    val palette = appearance?.palette ?: ColorPalette.WATER_LILIES
+    val mode = appearance?.mode ?: ThemeMode.SYSTEM
+    LifeBoardTheme(palette = palette, mode = mode) {
         // 快捷键在根节点用 onPreviewKeyEvent 拦（M4-4.7）：preview 阶段
         // 先于子节点收到事件，输入框里按 Ctrl+Tab 也能切页签。
         // 放在窗口层的 onPreviewKeyEvent 也行，但那要把 sink 提到窗口作用域，

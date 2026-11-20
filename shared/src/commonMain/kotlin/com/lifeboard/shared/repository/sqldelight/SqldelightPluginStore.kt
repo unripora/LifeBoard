@@ -72,6 +72,9 @@ class SqldelightPluginStore(private val db: LifeBoardDb) : PluginStore {
     override suspend fun deleteRawRecords(pluginId: String, date: String, metricKey: String): Int =
         q.deleteRawRecordsByDateAndMetric(pluginId, date, metricKey).await().toInt()
 
+    override suspend fun deleteRawRecordsByPlugin(pluginId: String): Int =
+        q.deleteRawRecordsByPlugin(pluginId).await().toInt()
+
     override suspend fun clearAllRawRecords(): Int =
         q.clearAllRawRecords().await().toInt()
 
@@ -91,6 +94,9 @@ class SqldelightPluginStore(private val db: LifeBoardDb) : PluginStore {
 
     override suspend fun earliestMetricQueryDate(pluginId: String): String? =
         q.selectEarliestMetricQueryDate(pluginId).executeAsOne().MIN
+
+    override suspend fun deleteMetricQueriesByPlugin(pluginId: String): Int =
+        q.deleteMetricQueriesByPlugin(pluginId).await().toInt()
 
     override suspend fun clearAllMetricQueries(): Int =
         q.clearAllMetricQueries().await().toInt()

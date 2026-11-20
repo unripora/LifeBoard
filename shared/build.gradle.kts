@@ -43,6 +43,11 @@ kotlin {
             // 图表卡等配置的 JSON 编解码要在两端跑同一份代码：
             // Android 框架的 org.json 在桌面端不存在，必须用 KMP 可用的库
             implementation(libs.kotlinx.serialization.json)
+            // 图表引擎（Vico 3.x）。它发布的是 KMP 构件，commonMain 直接可用，
+            // 折线/面积/散点/柱状/饼图/环形都由它画；热力图 Vico 没有，仍自绘。
+            // 注意不要改成只在 androidMain 依赖——那样 commonMain 编译不过。
+            implementation(libs.vico.compose)
+            implementation(libs.vico.compose.m3)
             // 领域模型（TaskConfig / DailyRecord / MetricRecord / ScheduleRule …）与
             // 数据源引用（SourceRef）都已经在这两个 KMP 模块的 commonMain 里，
             // Repository 契约直接复用它们，不再另造一套平行 DTO——
@@ -58,11 +63,6 @@ kotlin {
         }
         androidMain.dependencies {
             implementation(libs.sqldelight.android.driver)
-            // 图表渲染用 Vico（只有 Android 构件）。
-            // 它是 M3-3.7「图表适配层」的遗留：桌面端已有一份 Canvas 自绘实现
-            // （desktopMain/.../ChartRenderer.desktop.kt），两端通过 expect/actual 分开。
-            implementation(libs.vico.compose)
-            implementation(libs.vico.compose.m3)
         }
         // 命名目标（jvm("desktop")）没有类型安全的访问器，按名查找
         getByName("desktopMain").dependencies {
@@ -87,12 +87,12 @@ sqldelight {
     }
 }
 
-// Vico 3.2.3 的 Android 产物把 androidx.compose.* 传递到 1.12.1，
-// 而 1.12.1 起 AAR 元数据要求 compileSdk >= 37，当前 AGP 8.12.3 上限是 36。
+// compose 版本钉住在 1.8.3：1.12.1 起 AAR 元数据要求 compileSdk >= 37，
+// 而当前 AGP 8.12.3 上限是 36。
 //
-// 这段与 :app 里的同名约束必须**逐条一致**：Vico 现在同时出现在两个模块里，
-// 只要有一个模块不压，那个模块的 checkAarMetadata 就会失败；
-// 而两边压的模块不一样，又会让同一张依赖图里出现两个 compose 版本。
+// 这段原本是为了压 Vico 传递进来的 androidx.compose.* 1.12.1（Vico 在 commonMain 里）。
+// :app 里还挂着同样的约束，两处必须逐条一致，
+// 否则同一张依赖图里会出现两个 compose 版本。
 // 若将来升级 AGP 到支持 37 的版本，两处可以一并删掉。
 val composePinnedModules = setOf(
     "androidx.compose.ui:ui",

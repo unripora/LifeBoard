@@ -37,6 +37,34 @@ enum class MetricBucket {
 }
 
 /**
+ * 插件上报的原始条目归约成「当天值」的方式。
+ *
+ * `reportRawRecords` 允许插件一次上报多条采样点，宿主需要把它们折成一个日值。
+ * 早先所有指标一律求和，结果是心率 82 bpm 被写成几千、睡眠一段段相加。
+ * 归约方式必须由插件按指标语义声明，宿主不能猜。
+ */
+enum class MetricAggregate {
+    /** 分段累加：步数、热量、距离、站立次数 */
+    SUM,
+
+    /** 取均值：心率、血氧、压力这类「一天的典型水平」 */
+    AVERAGE,
+
+    /** 取时间上最新的一条：体重、血压、入睡时间这类「最近一次测量」 */
+    LATEST,
+    ;
+
+    companion object {
+        /** 从 manifest 解析；认不出时返回 null，由调用方回落默认值 */
+        fun of(raw: String): MetricAggregate? {
+            val v = raw.trim().lowercase()
+            if (v.isEmpty()) return null
+            return entries.firstOrNull { it.name.lowercase() == v }
+        }
+    }
+}
+
+/**
  * 指标元数据：一个数据源能产出的一个具体指标。
  *
  * 引入它的原因：`MetricBucket` 只说明"量纲"，不说明"是哪个指标"。
@@ -52,12 +80,14 @@ enum class MetricBucket {
  * @property bucket 该指标的量纲
  * @property displayName 展示名称
  * @property unit 展示单位，默认取量纲的单位
+ * @property aggregate 原始条目归约成日值的方式，默认累加（与旧行为一致）
  */
 data class MetricSpec(
     val metricKey: String,
     val bucket: MetricBucket,
     val displayName: String,
     val unit: String = bucket.unit,
+    val aggregate: MetricAggregate = MetricAggregate.SUM,
 ) {
     companion object {
         /**

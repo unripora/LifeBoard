@@ -20,7 +20,11 @@ import com.lifeboard.shared.plugin.js.JsPluginLoader
 import com.lifeboard.shared.plugin.js.PendingJsPlugin
 import com.lifeboard.shared.plugin.js.PluginDirWatcher
 import com.lifeboard.shared.platform.SettingsStore
+import com.lifeboard.shared.plugin.host.HostPluginContext
 import com.lifeboard.shared.repository.CredentialVault
+import com.lifeboard.shared.repository.MetricStore
+import com.lifeboard.shared.repository.PluginDataPurger
+import com.lifeboard.shared.repository.PluginStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -57,6 +61,8 @@ import java.io.File
 class DesktopPluginRepository(
     private val settings: SettingsStore,
     private val credentials: CredentialVault,
+    pluginStore: PluginStore,
+    metricStore: MetricStore,
 ) {
 
     private val fileSystem = DesktopPluginFileSystem()
@@ -64,6 +70,17 @@ class DesktopPluginRepository(
     private val trustStore = PluginTrustStore(settings)
 
     private val loader = JsPluginLoader(fileSystem, trustStore)
+
+    /**
+     * 卸载/清空数据时用。私有目录的位置是桌面端独一无二的（`~/.lifeboard/plugins/<id>`），
+     * 其余「要清哪些表」全在共享层，两端同一份。
+     */
+    private val dataPurger = PluginDataPurger(
+        pluginStore = pluginStore,
+        metricStore = metricStore,
+        clearCredentials = { pluginId -> credentials.clearPlugin(pluginId) },
+        deleteDataDir = { pluginId -> pluginDataDir(pluginId).deleteRecursively() },
+    )
 
     private val installer = JsPluginInstallService(
         fileSystem = fileSystem,
@@ -123,6 +140,20 @@ class DesktopPluginRepository(
 
     private fun baseDir(): File =
         File(System.getProperty("user.home") ?: ".", ".lifeboard")
+
+    /**
+     * 插件私有目录：`~/.lifeboard/plugins/<pluginId>`。
+     *
+     * 与 `DesktopPlatformDependencies.pluginDataDir` 指向同一个位置，
+     * 那里负责「给插件用」，这里负责「卸载时删掉」。
+     *
+     * pluginId 会拼进路径，属于来自插件包的外部输入，删之前必须校验：
+     * 一个 `../` 就能让「清除插件数据」变成删宿主数据。
+     */
+    private fun pluginDataDir(pluginId: String): File {
+        require(HostPluginContext.isSafePluginId(pluginId)) { "非法 pluginId：$pluginId" }
+        return File(baseDir(), "plugins/$pluginId")
+    }
 
     /**
      * 全量重扫。
@@ -265,15 +296,43 @@ class DesktopPluginRepository(
         refresh()
     }
 
-    /** 卸载：删包、撤销信任，保留凭据与私有数据 */
-    @Synchronized
-    fun uninstall(pluginId: String) {
-        val entry = loaded.firstOrNull { it.pluginId == pluginId } ?: return
-        loader.remove(entry.archiveName)
-        trustStore.revoke(entry.packageInfo.identity)
-        trustStore.forgetInstalled(entry.packageInfo.packageName)
-        revokedIds -= entry.packageInfo.packageName
+    /**
+     * 卸载：删包、撤销信任。
+     *
+     * [clearData] 为 true 时把私有数据、凭据与历史采集一起清掉；
+     * 为 false 时原样保留，用户重装后能直接接着用（不需要重新登录、
+     * 历史曲线也还在）。
+     *
+     * 先删包再清数据：删包会一并关掉运行时，避免清理目录时插件脚本
+     * 正在读写自己的文件。指标清单必须在删包**之前**取出来——
+     * 插件被移除后就查不到它声明了哪些指标了。
+     */
+    suspend fun uninstall(pluginId: String, clearData: Boolean) {
+        val entry = synchronized(this) {
+            val current = loaded.firstOrNull { it.pluginId == pluginId } ?: return
+            loader.remove(current.archiveName)
+            trustStore.revoke(current.packageInfo.identity)
+            trustStore.forgetInstalled(current.packageInfo.packageName)
+            revokedIds -= current.packageInfo.packageName
+            current
+        }
+        if (clearData) {
+            dataPurger.purge(entry.pluginId, entry.metrics.keys)
+        }
         refresh()
+    }
+
+    /**
+     * 清空插件数据但保留插件包。
+     *
+     * 在这之后插件仍在列表里，但历史采集、详情页的原始条目与登录态都没了。
+     */
+    suspend fun clearPluginData(pluginId: String) {
+        // 指标清单必须从当前已加载的实例取：库里没有「这个插件声明了哪些指标」这回事
+        val keys = synchronized(this) {
+            loaded.firstOrNull { it.pluginId == pluginId }?.metrics?.keys.orEmpty()
+        }
+        dataPurger.purge(pluginId, keys)
     }
 
     /** 删掉一个还没信任（或加载失败）的包 */

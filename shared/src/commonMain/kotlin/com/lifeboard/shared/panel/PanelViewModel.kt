@@ -10,6 +10,7 @@ import com.lifeboard.core.util.Dates
 import com.lifeboard.shared.dashboard.CardType
 import com.lifeboard.shared.dashboard.ChartAxis
 import com.lifeboard.shared.dashboard.ChartConfigCodec
+import com.lifeboard.shared.dashboard.ChartDensity
 import com.lifeboard.shared.dashboard.ChartType
 import com.lifeboard.shared.platform.PlatformDependencies
 import com.lifeboard.shared.platform.remindLevelName
@@ -79,6 +80,10 @@ data class ChartCardState(
     val categories: CategoryBreakdown? = null,
     /** 环形进度的目标值；null 表示没有可用目标 */
     val ringTarget: Double? = null,
+    /** 卡片标题：用户自定义名，没命名时是类型名 */
+    val title: String = "",
+    /** 方块密度。渲染器与卡片外壳都按它换排版 */
+    val density: ChartDensity = ChartDensity.COMFORTABLE,
     val configError: Boolean = false,
 )
 
@@ -374,10 +379,18 @@ class PanelViewModel(
                 model = null,
                 chartType = ChartType.PIE,
                 categories = categories,
+                title = config.displayTitle(),
+                density = config.density,
             )
         }
 
-        val loaded = config.series.map { series ->
+        // 热力图与环形进度只用第一条序列：一张图只有一种深浅标度 / 一个当前值，
+        // 多读几条既画不出来，也会白跑查询
+        val requestedSeries = when (config.chartType) {
+            ChartType.HEATMAP, ChartType.RING -> config.series.take(1)
+            else -> config.series
+        }
+        val loaded = requestedSeries.map { series ->
             ChartQueryService(scope).readConfiguredSeries(
                 sourceKey = series.sourceKey,
                 metricKey = series.metricKey,
@@ -390,7 +403,7 @@ class PanelViewModel(
         }
         // 顺序必须与 loaded 一一对应：渲染模型按顺序配对轴，
         // 同一个指标可以带不同任务、挂不同轴各出现一次
-        val requested = config.series.map {
+        val requested = requestedSeries.map {
             RequestedSeries(
                 label = it.label,
                 unit = it.unit,
@@ -400,7 +413,7 @@ class PanelViewModel(
         // 环形进度要目标值：复用任务规则里的阈值。只有单序列形态才需要，
         // 多序列各自一个目标没有可比性
         val ringTarget = if (config.chartType == ChartType.RING) {
-            val first = config.series.firstOrNull()
+            val first = requestedSeries.firstOrNull()
             if (first == null) {
                 null
             } else {
@@ -416,6 +429,8 @@ class PanelViewModel(
             model = buildChartRenderModel(requested, loaded, showLegend = config.showLegend),
             chartType = config.chartType,
             ringTarget = ringTarget,
+            title = config.displayTitle(),
+            density = config.density,
         )
     }
 

@@ -49,8 +49,12 @@ object ChartConfigCodec {
      *
      * v2 增加序列的 `taskId`（单条规则类内置序列要指明看哪条任务），
      * 旧配置读进来时该字段为 null，含义与 v1 完全一致，所以版本号只用于写出。
+     *
+     * v3 增加 `title`（用户自定义标题）与 `density`（卡片密度）。
+     * 两者缺失时分别回退到「空标题」与 [ChartDensity.COMFORTABLE]，
+     * 与 v2 数据的行为完全一致，因此 v2 配置照常读得进来。
      */
-    const val VERSION = 2
+    const val VERSION = 3
 
     /**
      * 把配置编码成 JSON。
@@ -64,6 +68,10 @@ object ChartConfigCodec {
             put(KEY_TYPE, JsonPrimitive(config.chartType.name))
             put(KEY_TIME_WINDOW, JsonPrimitive(config.timeWindowDays))
             put(KEY_SHOW_LEGEND, JsonPrimitive(config.showLegend))
+            // 空标题不写：默认标题是算出来的，写进去反而会把「用户没命名」
+            // 变成一个「命名成空串」的历史值，将来改默认标题时旧卡不跟随
+            if (config.title.isNotBlank()) put(KEY_TITLE, JsonPrimitive(config.title))
+            put(KEY_DENSITY, JsonPrimitive(config.density.name))
 
             put(
                 KEY_SERIES,
@@ -131,12 +139,18 @@ object ChartConfigCodec {
             }
 
             ChartCardConfig(
+                title = obj.str(KEY_TITLE).orEmpty(),
                 chartType = chartType,
                 series = series,
                 timeWindowDays = item(obj, KEY_TIME_WINDOW, DEFAULT_TIME_WINDOW),
                 showLegend = obj[KEY_SHOW_LEGEND]?.jsonPrimitive?.booleanOrNull ?: true,
                 categorySourceKey = obj.str(KEY_CATEGORY_SOURCE),
                 topN = obj.int(KEY_TOP_N).takeIf { it > 0 },
+                // 不认识的密度名按大卡处理：v2 及更早的配置里没有这个键，
+                // 它们的观感就是大卡，不能因为读不到就变成方块
+                density = obj.str(KEY_DENSITY)
+                    ?.let { name -> ChartDensity.entries.firstOrNull { it.name == name } }
+                    ?: ChartDensity.COMFORTABLE,
             )
         }.getOrNull()
     }
@@ -179,6 +193,8 @@ object ChartConfigCodec {
 
     private const val KEY_VERSION = "v"
     private const val KEY_TYPE = "type"
+    private const val KEY_TITLE = "title"
+    private const val KEY_DENSITY = "density"
     private const val KEY_TIME_WINDOW = "timeWindow"
     private const val KEY_SHOW_LEGEND = "showLegend"
     private const val KEY_SERIES = "series"

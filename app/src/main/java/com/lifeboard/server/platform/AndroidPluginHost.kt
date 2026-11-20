@@ -72,9 +72,10 @@ class AndroidPluginHost(
                     metricCount = loaded.metrics.size,
                     trusted = loaded.trusted,
                     signatureHashes = loaded.archive.signatureHashes.toList(),
-                    // 有槽位就意味着这个插件曾经登录过（槽位是在登录时按需创建的），
-                    // 空表示不需要账号
-                    needsLogin = CredentialVault.slots(appContext, loaded.pluginId).isNotEmpty(),
+                    // 需要登录 = 插件声明了凭据槽位，与桌面端同一口径。
+                    // 不能用「库里有没有槽位」来判断：用户清除凭据后槽位就空了，
+                    // 那样「登录」按钮会跟着消失，用户再也没法重新登录
+                    needsLogin = loaded.plugin.credentialSpec.slots.isNotEmpty(),
                 )
             }
     }
@@ -164,8 +165,12 @@ class AndroidPluginHost(
         PluginManager.revokeTrust(appContext, pluginId)
     }
 
-    override suspend fun uninstall(pluginId: String) = withContext(Dispatchers.IO) {
-        PluginManager.uninstall(appContext, pluginId)
+    override suspend fun uninstall(pluginId: String, clearData: Boolean) = withContext(Dispatchers.IO) {
+        PluginManager.uninstall(appContext, pluginId, clearData)
+    }
+
+    override suspend fun clearPluginData(pluginId: String) = withContext(Dispatchers.IO) {
+        PluginManager.clearPluginData(appContext, pluginId)
     }
 
     override suspend fun uninstallPending(archiveName: String) = withContext(Dispatchers.IO) {

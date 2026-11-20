@@ -14,6 +14,7 @@ import com.lifeboard.plugin.api.FetchResult
 import com.lifeboard.plugin.api.InputField
 import com.lifeboard.plugin.api.LineChartSpec
 import com.lifeboard.plugin.api.LoginResult
+import com.lifeboard.plugin.api.MetricAggregate
 import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.plugin.api.MetricSpec
 import com.lifeboard.plugin.api.PluginHealth
@@ -334,6 +335,9 @@ object JsTypeConverter {
                     o.optString("name").ifBlank { key }
                 },
                 unit = o.optString("unit").ifBlank { bucket.unit },
+                // 认不出就按累加处理：与历史行为一致，不会让老插件的数据变少
+                aggregate = MetricAggregate.of(o.optString("aggregate"))
+                    ?: MetricAggregate.SUM,
             )
         }
     }

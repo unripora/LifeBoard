@@ -5,15 +5,18 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -29,9 +32,11 @@ import com.lifeboard.shared.dashboard.BuiltinSeries
 import com.lifeboard.core.model.TaskConfig
 import com.lifeboard.shared.dashboard.ChartAxis
 import com.lifeboard.shared.dashboard.ChartCardConfig
+import com.lifeboard.shared.dashboard.ChartDensity
 import com.lifeboard.shared.dashboard.ChartSeriesConfig
 import com.lifeboard.shared.dashboard.ChartType
 import com.lifeboard.shared.dashboard.CHART_TIME_WINDOWS_DAYS
+import com.lifeboard.shared.dashboard.displayName
 import com.lifeboard.shared.platform.LocalPlatform
 import com.lifeboard.shared.panel.MetricCandidate
 import com.lifeboard.shared.panel.SOURCE_GROUP_NATIVE
@@ -46,12 +51,26 @@ import com.lifeboard.shared.panel.sourceKeyFor
  *   跟时间序列没有关系。硬让它先选一个指标，那个指标最后会被静默丢掉
  * - **其余形态**问「指标 + 时间范围」。环形进度虽然也是单值，但它的当前值来自序列
  *
+ * ## 多指标的规则（问题 6 的答复）
+ *
+ * 时间序列类（折线/柱状/面积/散点）**不设条数上限**，这是刻意改掉的。
+ * 原来的上限是 2，理由是「Vico 只有两根 Y 轴」——但现在渲染是自绘的，
+ * 同一根轴上叠三条同单位的线完全可读，没理由拦着。
+ *
+ * 真正需要约束的不是**条数**，而是**轴数**：一根轴只能承载一种单位，
+ * 两张图各画一个单位才是可比的。所以：
+ * - 轴由**每条序列自己选**（左/右），不再按「第一条左、第二条右」硬分配
+ * - 一条不同单位的序列被放到已有不同单位的轴上时，保存前就提示会读错
+ *
+ * 至于**饼图为什么以前选不了指标**：它的数据来自分类查询（`categorySourceKey`），
+ * 根本没读 `series`，代码里还主动把 series 清空（`usesCategory -> emptyList()`）。
+ * 现在改成：饼图在分类源之外**也允许选指标**，选了就按「一列一个指标」画
+ * 占比饼图（多指标饼图 = 每个指标占总和的比例），没选则保持原来的分类模式。
+ *
  * ## 约束在哪一步生效
  *
- * - 环形进度只允许一个指标（第二步的单选）
- * - 时间序列类允许多选，但**最多两条**——Vico 只有两根 Y 轴，
- *   第三条不同单位只能被丢弃，不如在选的时候就挡住
- * - 连击、单条规则完成率这类序列必须指明看哪条任务，否则算不出东西
+ * - 环形进度与热力图只允许一个指标（单值 / 单标度）
+ * - 连击、单条规则完成率这类序列必须指明看哪条任务
  * - 保存按钮在配置无效时不可点，且给出原因
  *
  * @param initial 编辑已有图表时的初始配置；为 null 表示新建
@@ -70,9 +89,18 @@ fun ChartConfigDialog(
     var chartType by remember { mutableStateOf(initial?.chartType ?: ChartType.LINE) }
     var series by remember { mutableStateOf(initial?.series.orEmpty()) }
     var timeWindow by remember { mutableStateOf(initial?.timeWindowDays ?: 30) }
+    // 标题：用户可自定义。默认留空 = 用类型名，不在新建时替用户填一个
+    // 「折线图」，否则用户不点这一栏就永远是一串同名的卡
+    var title by remember { mutableStateOf(initial?.title.orEmpty()) }
+    var density by remember { mutableStateOf(initial?.density ?: ChartDensity.COMFORTABLE) }
     // Top N 只对饼图有意义：其余形态不读这个字段，但仍要保留编辑前的值，
     // 免得用户切一下类型再切回来就被重置
     var topN by remember { mutableStateOf(initial?.topN ?: DEFAULT_TOP_N) }
+    // 饼图是否改用「按指标占比」而不是分类占比。编辑已有配置时，
+    // 有指标序列就说明它本来就是指标模式
+    var pieUsesSeries by remember {
+        mutableStateOf(initial?.chartType == ChartType.PIE && initial.series.isNotEmpty())
+    }
 
     // 是否正在浏览指标列表。与 picking 分开：
     // picking 只表示「已经点了一条需要任务的序列」，此时列表换成任务清单
@@ -102,19 +130,23 @@ fun ChartConfigDialog(
     // 这样即使某天数据源没带分组名，也不会出现一个标题为空的分组
     val groups = remember(options) { groupOptions(options) }
 
-    val usesCategory = chartType == ChartType.PIE
-    val singleSeriesOnly = chartType == ChartType.RING
-    val maxSeries = if (singleSeriesOnly) 1 else 2
+    // 饼图且没选指标 → 走分类模式；选了指标 → 走指标占比模式
+    val pieCategoryMode = chartType == ChartType.PIE && !pieUsesSeries
+    val usesCategory = pieCategoryMode
+    // 单序列形态：环形进度是「一个当前值」，热力图是「一种深浅标度」
+    val singleSeriesOnly = chartType == ChartType.RING || chartType == ChartType.HEATMAP
 
     val config = ChartCardConfig(
+        title = title,
         chartType = chartType,
-        // 饼图不用序列：这里直接清空，避免把编辑前残留的指标写进去，
-        // 让「配置里有一个与图表无关的指标」这种脏数据进库
-        series = if (usesCategory) emptyList() else series,
+        series = series,
         timeWindowDays = timeWindow,
-        // 饼图的分类源暂时只开放应用时长；接口就绪后在这里扩展
+        showLegend = true,
+        // 分类源只在分类模式下有值。指标模式的饼图不该留着一个用不到的
+        // categorySourceKey——那会让「配置里有分类源但图是按指标画的」变成可能
         categorySourceKey = if (usesCategory) CATEGORY_APP_USAGE else null,
         topN = if (usesCategory) topN else null,
+        density = density,
     )
     val validationError = validate(chartType, config, loading)
 
@@ -126,6 +158,22 @@ fun ChartConfigDialog(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
+                SectionLabel("图表名称")
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it.take(MAX_TITLE_LENGTH) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    // 占位提示必须说明「不填会怎样」，否则用户以为名称是必填的
+                    placeholder = { Text(chartType.displayName(), style = MaterialTheme.typography.bodySmall) },
+                    supportingText = {
+                        Text(
+                            "留空时显示「${chartType.displayName()}」",
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    },
+                )
+
                 SectionLabel("图表类型")
                 FlowOfChips(
                     items = ChartType.entries.map { it to chartTypeLabel(it) },
@@ -134,12 +182,14 @@ fun ChartConfigDialog(
                         chartType = picked
                         browsing = false
                         picking = null
-                        // 切成单序列形态时裁掉多余的；切成饼图则整体清空，
-                        // 因为它根本不读序列
+                        // 切成单序列形态时裁掉多余的。饼图不再清空序列：
+                        // 它的指标模式正是靠 series 决定的
                         series = when {
-                            picked == ChartType.PIE -> emptyList()
-                            picked == ChartType.RING -> series.take(1)
+                            picked == ChartType.RING || picked == ChartType.HEATMAP -> series.take(1)
                             else -> series
+                        }
+                        if (picked == ChartType.PIE) {
+                            pieUsesSeries = series.isNotEmpty()
                         }
                     },
                 )
@@ -157,7 +207,30 @@ fun ChartConfigDialog(
                         selected = topN,
                         onSelect = { topN = it },
                     )
-                } else {
+                }
+
+                // 饼图给一个「按指标占比」的切换：以前它连指标都不能选，
+                // 想画「两个指标的比例」只能放弃饼图
+                if (chartType == ChartType.PIE) {
+                    SectionLabel("数据来源")
+                    FlowOfChips(
+                        items = listOf(
+                            false to "分类占比",
+                            true to "指标占比",
+                        ),
+                        selected = pieUsesSeries,
+                        onSelect = { pieUsesSeries = it },
+                    )
+                    if (pieUsesSeries) {
+                        Text(
+                            "按所选指标在当前时间窗内的合计值分块",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                if (!usesCategory) {
                     SectionLabel("数据")
                     val editIndex = editingTaskIndex
                     if (editIndex != null) {
@@ -169,6 +242,8 @@ fun ChartConfigDialog(
                             TaskPicker(
                                 title = "为「${current.label}」换一条任务",
                                 tasks = tasks,
+                                // 原地替换没有外层标题栏，取消由它自己给
+                                showCancel = true,
                                 onSelect = { task ->
                                     series = series.mapIndexed { i, item ->
                                         if (i != editIndex) {
@@ -195,7 +270,7 @@ fun ChartConfigDialog(
                             tasks = tasks,
                             browsing = browsing,
                             picking = picking,
-                            maxSeries = maxSeries,
+                            maxSeries = if (singleSeriesOnly) 1 else Int.MAX_VALUE,
                             singleSeriesOnly = singleSeriesOnly,
                             expandedGroups = expandedGroups,
                             onToggleGroup = { name ->
@@ -211,8 +286,20 @@ fun ChartConfigDialog(
                                 series = series.filterIndexed { i, _ -> i != index }
                             },
                             onEditTask = { index -> editingTaskIndex = index },
+                            onSetSeriesTitle = { index, value ->
+                                series = series.mapIndexed { i, item ->
+                                    if (i == index) item.copy(label = value) else item
+                                }
+                            },
+                            onSetAxis = { index, axis ->
+                                series = series.mapIndexed { i, item ->
+                                    if (i == index) item.copy(axis = axis) else item
+                                }
+                            },
                             onAdd = { option, task ->
-                                val axis = if (series.isEmpty()) ChartAxis.LEFT else ChartAxis.RIGHT
+                                // 新序列默认跟「第一条」同轴：直接把新指标画到右轴，
+                                // 会让同单位的第二条线平白跳到另一根刻度上
+                                val axis = series.firstOrNull()?.axis ?: ChartAxis.LEFT
                                 series = series + option.toSeriesConfig(
                                     axis = axis,
                                     taskId = task?.id,
@@ -224,6 +311,18 @@ fun ChartConfigDialog(
                         )
                     }
                 }
+
+                SectionLabel("卡片样式")
+                FlowOfChips(
+                    items = CHART_DENSITY_CHOICES.map { it to it.label },
+                    selected = density,
+                    onSelect = { density = it },
+                )
+                Text(
+                    density.description,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
 
                 SectionLabel("时间范围")
                 FlowOfChips(
@@ -251,11 +350,47 @@ fun ChartConfigDialog(
     )
 }
 
+/** 卡片密度的展示名与说明。放在界面层：配置层只关心取值 */
+private val ChartDensity.label: String
+    get() = when (this) {
+        ChartDensity.COMFORTABLE -> "大卡"
+        ChartDensity.COMPACT -> "方块"
+    }
+
+private val ChartDensity.description: String
+    get() = when (this) {
+        ChartDensity.COMFORTABLE -> "图占主体，适合逐个细看"
+        ChartDensity.COMPACT -> "大数字 + 迷你趋势，宽屏一屏能排好几列"
+    }
+
+private val CHART_DENSITY_CHOICES = listOf(ChartDensity.COMFORTABLE, ChartDensity.COMPACT)
+
+/** 标题长度上限。足够长，又能防止一整段话被塞进卡片标题 */
+private const val MAX_TITLE_LENGTH = 24
+
 /**
  * 「数据」一栏：已选序列 + 指标选择器。
  *
  * 选择器里选中需要任务的序列时，先展开任务列表再落定——
  * 连击这类序列没有任务是算不出来的，不能先加进去再报错。
+ *
+ * ## 每条已选序列能改什么
+ *
+ * - **名称**：直接内联编辑，改的是图例上显示的字。同一份数据被加了两次
+ *   （比如「步数」和「睡眠」都要看）时，不改名在图例上分不出来
+ * - **轴**：左/右两个按钮。这是「Y 轴可选两根」的落地点——
+ *   以前轴是按顺序硬分配的，用户没有发言权
+ *
+ * ## 三块内容为什么必须分开
+ *
+ * 「已选数据」「选择指标按钮」「展开后的数据源列表」原本上下紧挨着、
+ * 样式都是普通文字，用户分不清哪一块是自己刚点开的、哪一块是当前生效的。
+ * 现在用三层区分：
+ *
+ * 1. **已选**放进带边框的卡片，每条前面有轴标识，一眼看出「这是图上的东西」
+ * 2. **选择指标**是独立按钮，并说明还能加几个
+ * 3. **选择器**只在有值时出现，带自己的标题栏和「完成」出口；
+ *    此时**隐藏已选列表**——两个列表同时出现最容易混
  */
 @Composable
 private fun DataSection(
@@ -273,6 +408,8 @@ private fun DataSection(
     onPick: (SeriesOption?) -> Unit,
     onRemove: (Int) -> Unit,
     onEditTask: (Int) -> Unit,
+    onSetSeriesTitle: (Int, String) -> Unit,
+    onSetAxis: (Int, ChartAxis) -> Unit,
     onAdd: (SeriesOption, TaskConfig?) -> Unit,
 ) {
     if (loading) {
@@ -284,24 +421,41 @@ private fun DataSection(
         return
     }
 
+    // 选择器打开时只显示选择器：已选列表与可选列表同时铺开，
+    // 用户会误点、也分不清哪一行是「已经加进去的」
     if (browsing) {
-        PickerBody(
-            option = picking,
-            groups = groups,
-            tasks = tasks,
-            series = series,
-            expandedGroups = expandedGroups,
-            onToggleGroup = onToggleGroup,
-            onPick = onPick,
-            onAdd = onAdd,
-            onCancel = {
-                // 从任务清单退回指标列表，从指标列表退回「已选」视图
-                if (picking != null) onPick(null) else onBrowse(false)
-            },
-        )
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    if (picking == null) "选择指标" else "选择任务",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.weight(1f),
+                )
+                // 返回一步：从任务清单回到指标列表，从指标列表回到已选
+                TextButton(onClick = { if (picking != null) onPick(null) else onBrowse(false) }) {
+                    Text(if (picking != null) "返回" else "完成")
+                }
+            }
+            PickerBody(
+                option = picking,
+                groups = groups,
+                tasks = tasks,
+                series = series,
+                expandedGroups = expandedGroups,
+                onToggleGroup = onToggleGroup,
+                onPick = onPick,
+                onAdd = onAdd,
+                onCancel = { if (picking != null) onPick(null) else onBrowse(false) },
+            )
+        }
         return
     }
 
+    // ---- 已选数据 ----
     if (series.isEmpty()) {
         Text(
             "还没有选择指标",
@@ -309,35 +463,70 @@ private fun DataSection(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     } else {
-        series.forEachIndexed { index, item ->
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(item.label, style = MaterialTheme.typography.bodyMedium)
-                    // 任务型序列被改了任务后必须能看出来看的是哪一条，
-                    // 否则两条同名序列无法区分
-                    val needsTask = BuiltinSeries.fromMetricKey(item.metricKey)?.needsTask == true
-                    if (needsTask) {
-                        Text(
-                            taskHint(item.taskId, tasks),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(
+                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                    RoundedCornerShape(8.dp),
+                )
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            series.forEachIndexed { index, item ->
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        // 左轴 / 右轴：让用户直接选挂在哪根轴上，
+                        // 而不是按添加顺序被动分配
+                        FlowOfChips(
+                            items = listOf(ChartAxis.LEFT to "左轴", ChartAxis.RIGHT to "右轴"),
+                            selected = item.axis,
+                            onSelect = { axis -> onSetAxis(index, axis) },
+                            chunkSize = 2,
+                            compact = true,
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        SeriesTitleField(
+                            value = item.label,
+                            onValueChange = { value -> onSetSeriesTitle(index, value) },
+                            modifier = Modifier.weight(1f),
                         )
                     }
+                    val needsTask = BuiltinSeries.fromMetricKey(item.metricKey)?.needsTask == true
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        // 任务型序列被改了任务后必须能看出来看的是哪一条，
+                        // 否则两条同名序列无法区分
+                        if (needsTask) {
+                            Text(
+                                taskHint(item.taskId, tasks),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(onClick = { onEditTask(index) }) { Text("换任务") }
+                        } else {
+                            Spacer(Modifier.weight(1f))
+                        }
+                        TextButton(onClick = { onRemove(index) }) { Text("移除") }
+                    }
                 }
-                val needsTask = BuiltinSeries.fromMetricKey(item.metricKey)?.needsTask == true
-                if (needsTask) {
-                    TextButton(onClick = { onEditTask(index) }) { Text("换任务") }
-                }
-                TextButton(onClick = { onRemove(index) }) { Text("移除") }
             }
         }
     }
 
-    // 已满上限时不再显示添加入口：Vico 只有两根 Y 轴，
-    // 第三条不可比序列只能被丢弃，不如在这里就说清楚
+    // ---- 添加入口 ----
+    // 只有单序列形态才拦：时间序列类可以叠任意多条，
+    // 真正的约束在「轴」上——同一根轴只能是一种单位，那由每条序列自己选
     if (series.size < maxSeries) {
         if (groups.isEmpty()) {
             Text(
@@ -349,21 +538,51 @@ private fun DataSection(
             // 先进入浏览态，而不是直接选中第一项：
             // 可选项有十几条，替用户点第一个等于替他做了选择
             OutlinedButton(onClick = { onBrowse(true) }) {
-                Text("选择指标")
+                Text(if (series.isEmpty()) "选择指标" else "再添加一个指标")
             }
+            Text(
+                if (singleSeriesOnly) {
+                    "这个图表类型只能显示一个指标"
+                } else {
+                    "已选 ${series.size} 个：可以继续加。" +
+                        "不同单位的指标请分到左右两根轴上，否则同一根轴的刻度会读错"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     } else {
         Text(
-            text = if (singleSeriesOnly) {
-                "这个图表类型只能显示一个指标"
-            } else {
-                "最多两个指标：图表只有两根坐标轴，第三个不同单位的指标无法正确显示"
-            },
+            "这个图表类型只能显示一个指标",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
+
+/**
+ * 序列名内联编辑。
+ *
+ * 用单行输入框而不是「改名的弹窗」：改名是高频小动作，
+ * 再弹一层对话框会让「加三个指标、各改个名」变成九次点击。
+ */
+@Composable
+private fun SeriesTitleField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = { onValueChange(it.take(MAX_SERIES_TITLE_LENGTH)) },
+        modifier = modifier,
+        singleLine = true,
+        textStyle = MaterialTheme.typography.bodySmall,
+    )
+}
+
+/** 序列名长度上限。图例上放不下更长的名字 */
+private const val MAX_SERIES_TITLE_LENGTH = 20
 
 /**
  * 指标选择器：按来源分组、可展开收起的列表。
@@ -384,6 +603,11 @@ private fun DataSection(
  * 连击、单条规则完成率这类序列必须先选任务：没有任务就算不出任何值。
  * 所以点它们不会直接落定，而是把列表换成任务清单。
  *
+ * ## 不自己留「取消」
+ *
+ * 退出选择器由 [DataSection] 的标题栏统一提供（返回 / 完成），
+ * 这里再放一个只会多出一条并列的出口，用户不知道该点哪个。
+ *
  * @param option 需要选任务时的那条序列；为 null 表示在浏览指标列表
  */
 @Composable
@@ -400,7 +624,7 @@ private fun PickerBody(
 ) {
     if (option?.needsTask == true) {
         TaskPicker(
-            title = "${option.label}要指定看哪条任务",
+            title = "「${option.label}」要指定看哪条任务",
             tasks = tasks,
             onSelect = { task -> onAdd(option, task) },
             onCancel = onCancel,
@@ -458,7 +682,6 @@ private fun PickerBody(
             }
         }
     }
-    TextButton(onClick = onCancel) { Text("取消") }
 }
 
 /**
@@ -519,6 +742,8 @@ private fun replaceTaskSuffix(label: String, taskTitle: String): String {
  *
  * @param title 说明为什么要在这一步选任务
  * @param onSelect 选中某条任务
+ * @param showCancel 是否自带「取消」。放在选择器里时由外层标题栏统一提供出口，
+ *   这里不再重复；原地替换（换任务）时没有外层标题栏，才需要它
  */
 @Composable
 private fun TaskPicker(
@@ -526,6 +751,7 @@ private fun TaskPicker(
     tasks: List<TaskConfig>,
     onSelect: (TaskConfig) -> Unit,
     onCancel: () -> Unit,
+    showCancel: Boolean = false,
 ) {
     Text(title, style = MaterialTheme.typography.labelLarge)
     if (tasks.isEmpty()) {
@@ -559,7 +785,9 @@ private fun TaskPicker(
             }
         }
     }
-    TextButton(onClick = onCancel) { Text("取消") }
+    if (showCancel) {
+        TextButton(onClick = onCancel) { Text("取消") }
+    }
 }
 
 /**
@@ -749,10 +977,11 @@ private fun validate(
     loading: Boolean,
 ): String? {
     if (loading) return "正在读取数据源"
-    // 饼图读分类数据，与序列无关。要求它先选一个指标，
-    // 等于让用户填一个最后会被丢掉的字段
-    if (type == ChartType.PIE) {
-        return if (config.categorySourceKey.isNullOrBlank()) "分类数据源不可用" else null
+    // 分类模式的饼图读分类数据，与序列无关。要求它先选一个指标，
+    // 等于让用户填一个最后会被丢掉的字段。
+    // 指标模式（选了指标）就一样要走下面的序列校验
+    if (type == ChartType.PIE && config.categorySourceKey != null && config.series.isEmpty()) {
+        return if (config.categorySourceKey.isBlank()) "分类数据源不可用" else null
     }
     val series = config.series
     if (series.isEmpty()) return "请至少选择一个指标"
@@ -768,13 +997,41 @@ private fun validate(
     ) {
         return "连击、单条规则完成率需要指定任务，请重新选择"
     }
-    if (type == ChartType.RING && series.size > 1) {
+    // 单序列形态：环形进度是一个当前值，热力图是一种深浅标度
+    if ((type == ChartType.RING || type == ChartType.HEATMAP) && series.size > 1) {
         return "这个图表类型只能显示一个指标"
     }
+    // 同一根轴上出现两种单位，刻度只能按其中一种画，另一条线的读数就是错的。
+    // 这里是**唯一的**单位冲突检查：多指标本身不再有上限，冲突只可能出在轴上
+    val conflict = axisUnitConflict(series)
+    if (conflict != null) return conflict
     return if (config.isRenderable()) null else "这张图表的配置还不完整，请检查后再保存"
 }
 
-/** 图表类型的中文名。放在界面层：配置层不关心怎么称呼 */
+/**
+ * 检查两根轴上有没有混入不同单位。
+ *
+ * @return 无法保存的原因；没有冲突时返回 null
+ */
+private fun axisUnitConflict(series: List<ChartSeriesConfig>): String? {
+    ChartAxis.entries.forEach { axis ->
+        val units = series
+            .filter { it.axis == axis }
+            // 空单位不参与判断：没有量纲的序列（比如计数）跟谁都能共处
+            .map { it.unit }
+            .filter { it.isNotBlank() }
+            .distinct()
+        if (units.size > 1) {
+            val name = if (axis == ChartAxis.LEFT) "左轴" else "右轴"
+            return "$name 上混了「${units.joinToString("」和「")}」，刻度只能按一种单位画。" +
+                "请把它们分到左右两根轴上"
+        }
+    }
+    return null
+}
+
+/** 图表类型的中文名。配置层有同一份（[com.lifeboard.shared.dashboard.displayName]），
+ * 这里给的是九宫格里的短名，能少一个字就少一个字 */
 private fun chartTypeLabel(type: ChartType): String = when (type) {
     ChartType.LINE -> "折线"
     ChartType.COLUMN -> "柱状"
@@ -782,6 +1039,7 @@ private fun chartTypeLabel(type: ChartType): String = when (type) {
     ChartType.SCATTER -> "散点"
     ChartType.PIE -> "饼图"
     ChartType.RING -> "环形进度"
+    ChartType.HEATMAP -> "热力图"
 }
 
 @Composable
@@ -797,24 +1055,33 @@ private fun SectionLabel(text: String) {
  * 一组单选标签。
  *
  * 用等宽的列表而不是 Material 的 FilterChip：这里的选项都有固定含义，
- * 等宽排列能一眼看完六个类型，横着挤成两行反而更难认。
+ * 等宽排列能一眼看完，横着挤成两行反而更难认。
  *
  * @param items 选项值与该选项的展示名
+ * @param chunkSize 每行几个。默认 3 是给「图表类型」这类九宫格用的；
+ *   原地改序列的轴时用 2，否则「左轴/右轴」会被排成一行三个的怪样子
+ * @param compact 紧凑模式：内边距与字号都收一档，用在密集的行内
  */
 @Composable
 private fun <T> FlowOfChips(
     items: List<Pair<T, String>>,
     selected: T,
     onSelect: (T) -> Unit,
+    chunkSize: Int = 3,
+    compact: Boolean = false,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        items.chunked(3).forEach { rowItems ->
+        items.chunked(chunkSize).forEach { rowItems ->
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 rowItems.forEach { (value, label) ->
                     val isSelected = value == selected
                     Text(
                         text = label,
-                        style = MaterialTheme.typography.labelMedium,
+                        style = if (compact) {
+                            MaterialTheme.typography.labelSmall
+                        } else {
+                            MaterialTheme.typography.labelMedium
+                        },
                         color = if (isSelected) {
                             MaterialTheme.colorScheme.onPrimary
                         } else {
@@ -830,7 +1097,10 @@ private fun <T> FlowOfChips(
                                 shape = RoundedCornerShape(8.dp),
                             )
                             .clickable { onSelect(value) }
-                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                            .padding(
+                                horizontal = if (compact) 8.dp else 12.dp,
+                                vertical = if (compact) 4.dp else 6.dp,
+                            ),
                     )
                 }
             }

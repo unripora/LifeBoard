@@ -58,7 +58,7 @@ class PluginViewModel(
 
     fun revokeTrust(row: PluginRow) = delegate.revokeTrust(row)
 
-    fun uninstall(row: PluginRow) = delegate.uninstall(row)
+    fun uninstall(row: PluginRow, clearData: Boolean) = delegate.uninstall(row, clearData)
 
     fun deletePending(row: PendingRow) = delegate.deletePending(row)
 

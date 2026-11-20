@@ -124,8 +124,22 @@ interface PluginHost {
     /** 撤销信任：停止调度，保留包与数据 */
     suspend fun revokeTrust(pluginId: String)
 
-    /** 卸载：删包并撤销信任，保留凭据与私有数据 */
-    suspend fun uninstall(pluginId: String)
+    /**
+     * 卸载：删包并撤销信任。
+     *
+     * @param clearData true 时一并清掉该插件产生的**全部数据**（私有目录、凭据、
+     *   历史采集数据）。false 时保留，用户重装后数据与登录态都还在——
+     *   「卸载重装」是最常见的修复手段，把数据一起删掉会让它变成一次惩罚。
+     */
+    suspend fun uninstall(pluginId: String, clearData: Boolean)
+
+    /**
+     * 清空某插件产生的全部数据，但保留插件包与信任关系。
+     *
+     * 与 [clearCredentials] 的区别：那个只让插件回到未登录，已采集的历史还在；
+     * 这个是「彻底重来」，采集数据、私有目录与凭据一起清掉。
+     */
+    suspend fun clearPluginData(pluginId: String)
 
     /** 删除一个还没信任的包（也用于清掉加载失败的包） */
     suspend fun uninstallPending(archiveName: String)

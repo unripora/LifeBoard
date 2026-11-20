@@ -4,8 +4,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -42,6 +44,7 @@ import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.lifeboard.shared.panel.chart.ChartRenderer
+import com.lifeboard.shared.panel.chart.MiniTrendChart
 import com.lifeboard.shared.dashboard.DashboardViewModel
 import com.lifeboard.shared.ui.theme.GlassCard
 import com.lifeboard.shared.ui.theme.GlassProgress
@@ -50,10 +53,30 @@ import com.lifeboard.core.util.Dates
 import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.shared.dashboard.CardType
 import com.lifeboard.shared.dashboard.ChartConfigCodec
+import com.lifeboard.shared.dashboard.ChartDensity
+import com.lifeboard.shared.dashboard.ChartType
 import com.lifeboard.shared.dashboard.DashboardCards
 import com.lifeboard.shared.platform.LocalPlatform
 import com.lifeboard.shared.repository.model.DashboardCard
 import java.time.LocalDate
+
+/**
+ * 单张卡片的**最小可读宽度**。
+ *
+ * 低于这个宽度时折线图的 X 轴三个日期会挤在一起、柱状图会细成一条线，
+ * 所以它是决定列数的唯一依据：可用宽度 / 这个值 = 能放几列。
+ *
+ * 320dp 是按「30 天折线图还能看出趋势」估的，不是设计规范里的数。
+ */
+private val CARD_MIN_WIDTH = 320.dp
+
+/**
+ * 列数上限。
+ *
+ * 再宽就变成一排细长的方块，卡片内的图反而被压扁；
+ * 4 列在 1400dp 以上的桌面上正好是参考图那种「一屏 4 个方块」的密度。
+ */
+private const val MAX_CARD_COLUMNS = 4
 
 /**
  * 首页仪表盘。
@@ -171,102 +194,123 @@ fun PanelScreen(
         rows.filter { DashboardCards.parseType(it.type) != null }
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.End,
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        // 列数按可用宽度算（问题 2 与问题 8）。手机竖屏 1 列；
+        // 平板横屏 / 桌面窗口 2~4 列。用「最小可读宽度」除而不是写死断点：
+        // 窗口拖宽时列数是连续变化的，不会在某个宽度上突然从 2 列跳到 4 列
+        val columns = (maxWidth / CARD_MIN_WIDTH).toInt().coerceIn(1, MAX_CARD_COLUMNS)
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            TextButton(onClick = { editing = !editing }) {
-                Text(if (editing) "完成" else "调整卡片")
-            }
-        }
-
-        // 空态只在「一张卡都看不见」时出现。编辑态下即使全部关掉，
-        // 上面也还列着那些行与开关，再压一句「还没有卡片」会自相矛盾
-        if (cards.isEmpty() && !editing) {
-            // 只有确实读完了才显示空态：未就绪时上面已经用默认卡片兜住
-            EmptyTabHint(
-                onAdd = { adding = true },
-                // 用户页签才有「添加卡片」；面板被清空时同样可以加回去
-                canAdd = DashboardCards.isCardTab(tabId) && addable.isNotEmpty(),
-            )
-        }
-
-        visibleRows.forEachIndexed { index, card ->
-            val type = DashboardCards.parseType(card.type) ?: return@forEachIndexed
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .dragHandle(
-                        enabled = editing,
-                        index = index,
-                        count = visibleRows.size,
-                        drag = drag,
-                    ),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                if (editing) {
-                    CardEditBar(
-                        title = DashboardCards.labelOf(type),
-                        enabled = card.enabled,
-                        onToggleEnabled = { dashboardVm.setCardEnabled(card.cardId, it) },
-                        onEditConfig = if (type == CardType.CHART) {
-                            { editingChartCard = card }
-                        } else {
-                            null
-                        },
-                        onDelete = { dashboardVm.deleteCard(tabId, card.cardId) },
-                    )
-                }
-                // 关掉的卡不渲染内容，只留上面那条操作栏。
-                // 保留这一行而不是整条藏起来：它是重新打开的入口
-                if (card.enabled) {
-                    CardHost(
-                        type = type,
-                        state = state,
-                        metricReading = metricStates.firstOrNull { it.cardId == card.cardId },
-                        chartState = chartStates.firstOrNull { it.cardId == card.cardId },
-                        // 指标卡可以点开换数据源（M6b2c）。其他类型传 null：
-                        // 它们读的是固定位置的数据，没有「换源」这回事
-                        onChangeMetricSource = if (type == CardType.METRIC) {
-                            { rebindingCard = card }
-                        } else {
-                            null
-                        },
-                        onRefresh = { panelVm.reevaluate() },
-                        onMarkDone = { panelVm.markDone(it) },
-                        onEditTask = onEditTask,
-                        onNewTask = onNewTask,
-                        onToggle = { panelVm.toggleEnabled(it) },
-                        onDelete = { pendingDelete = it },
-                        // 只有系统权限类数据源会带 actionKey，宿主直接跳系统设置页
-                        onOpenSourceSettings = { panelVm.openSourceSettings(it) },
-                    )
-                }
-            }
-        }
-
-        // 编辑态才出现：没有任何卡可加时整块不显示，避免一个点不动的按钮
-        if (editing && DashboardCards.isCardTab(tabId) && addable.isNotEmpty()) {
-            OutlinedButton(
-                onClick = { adding = true },
+            Row(
                 modifier = Modifier.fillMaxWidth(),
-            ) { Text("添加卡片") }
-        }
+                horizontalArrangement = Arrangement.End,
+            ) {
+                TextButton(onClick = { editing = !editing }) {
+                    Text(if (editing) "完成" else "调整卡片")
+                }
+            }
 
-        // 提示文本不是卡片：它是一过性的状态说明，没有摆放/拖拽的意义
-        if (state.message.isNotBlank()) {
-            Text(
-                state.message,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            // 空态只在「一张卡都看不见」时出现。编辑态下即使全部关掉，
+            // 上面也还列着那些行与开关，再压一句「还没有卡片」会自相矛盾
+            if (cards.isEmpty() && !editing) {
+                // 只有确实读完了才显示空态：未就绪时上面已经用默认卡片兜住
+                EmptyTabHint(
+                    onAdd = { adding = true },
+                    // 用户页签才有「添加卡片」；面板被清空时同样可以加回去
+                    canAdd = DashboardCards.isCardTab(tabId) && addable.isNotEmpty(),
+                )
+            }
+
+            // 卡片按行切成若干列。用 Column + 行内 Row 而不是 LazyVerticalGrid：
+            // 外层已经是纵向滚动，嵌套一个可滚动的网格会把滚动手势抢走
+            rows.withIndex().chunked(columns).forEach { indexedChunk ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    indexedChunk.forEach { (index, card) ->
+                        val type = DashboardCards.parseType(card.type) ?: return@forEach
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .dragHandle(
+                                    enabled = editing,
+                                    index = index,
+                                    count = visibleRows.size,
+                                    drag = drag,
+                                ),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            if (editing) {
+                                CardEditBar(
+                                    title = DashboardCards.labelOf(type),
+                                    enabled = card.enabled,
+                                    onToggleEnabled = { dashboardVm.setCardEnabled(card.cardId, it) },
+                                    onEditConfig = if (type == CardType.CHART) {
+                                        { editingChartCard = card }
+                                    } else {
+                                        null
+                                    },
+                                    onDelete = { dashboardVm.deleteCard(tabId, card.cardId) },
+                                )
+                            }
+                            // 关掉的卡不渲染内容，只留上面那条操作栏。
+                            // 保留这一行而不是整条藏起来：它是重新打开的入口
+                            if (card.enabled) {
+                                CardHost(
+                                    type = type,
+                                    state = state,
+                                    metricReading = metricStates.firstOrNull { it.cardId == card.cardId },
+                                    chartState = chartStates.firstOrNull { it.cardId == card.cardId },
+                                    // 指标卡可以点开换数据源（M6b2c）。其他类型传 null：
+                                    // 它们读的是固定位置的数据，没有「换源」这回事
+                                    onChangeMetricSource = if (type == CardType.METRIC) {
+                                        { rebindingCard = card }
+                                    } else {
+                                        null
+                                    },
+                                    onRefresh = { panelVm.reevaluate() },
+                                    onMarkDone = { panelVm.markDone(it) },
+                                    onEditTask = onEditTask,
+                                    onNewTask = onNewTask,
+                                    onToggle = { panelVm.toggleEnabled(it) },
+                                    onDelete = { pendingDelete = it },
+                                    // 只有系统权限类数据源会带 actionKey，宿主直接跳系统设置页
+                                    onOpenSourceSettings = { panelVm.openSourceSettings(it) },
+                                )
+                            }
+                        }
+                    }
+                    // 末行不足列数时用空白撑住，否则最后一张卡会被拉成整行宽，
+                    // 与上一行的列宽对不齐
+                    repeat(columns - indexedChunk.size) {
+                        Spacer(Modifier.weight(1f))
+                    }
+                }
+            }
+
+            // 编辑态才出现：没有任何卡可加时整块不显示，避免一个点不动的按钮
+            if (editing && DashboardCards.isCardTab(tabId) && addable.isNotEmpty()) {
+                OutlinedButton(
+                    onClick = { adding = true },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("添加卡片") }
+            }
+
+            // 提示文本不是卡片：它是一过性的状态说明，没有摆放/拖拽的意义
+            if (state.message.isNotBlank()) {
+                Text(
+                    state.message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 
@@ -447,11 +491,22 @@ private fun CardHost(
  * - 正常：画图，并把 warnings 以说明的形式挂在图下面
  *
  * 不用空白卡代替任何一种：空白卡让用户无法判断是「没数据」还是「功能没做好」。
+ *
+ * ## 两种密度
+ *
+ * [ChartDensity.COMPACT] 是参考仪表盘式小方块做的：标题在上、大数字居中、
+ * 迷你趋势贴在底部。它为「宽屏一屏扫十几张图」服务，
+ * 所以省掉坐标轴与图例——那些信息在方块尺寸下读不出来，还会把数字挤走。
  */
 @Composable
 private fun ChartCard(state: ChartCardState?) {
+    val compact = state?.density == ChartDensity.COMPACT
     GlassCard(modifier = Modifier.fillMaxWidth()) {
-        Text("自定义图表", style = MaterialTheme.typography.titleSmall)
+        Text(
+            // 标题为空时回退到类型名：卡片标题是定位「这张图是什么」的第一眼信息
+            state?.title?.takeIf { it.isNotBlank() } ?: "自定义图表",
+            style = MaterialTheme.typography.titleSmall,
+        )
 
         when {
             state == null -> {
@@ -480,12 +535,45 @@ private fun ChartCard(state: ChartCardState?) {
             }
 
             else -> {
-                ChartRenderer(
-                    type = state.chartType,
-                    model = state.model,
-                    categories = state.categories,
-                    ringTarget = state.ringTarget,
-                )
+                // 方块密度只在迷你趋势图上生效：环形进度与热力图本身已经是紧凑形态，
+                // 再缩就没法看了。所以这里只对时间序列类换画法
+                val useMini = compact && state.model != null &&
+                    state.chartType in setOf(
+                        ChartType.LINE, ChartType.AREA, ChartType.COLUMN, ChartType.SCATTER,
+                    )
+
+                if (useMini) {
+                    val last = state.model.series.firstOrNull()?.series?.points?.maxByOrNull { it.date }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.Bottom,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Column {
+                            // 大数字是这个密度的主角：方块尺寸下只有它读得清
+                            Text(
+                                last?.value?.let { formatCompact(it) } ?: "—",
+                                style = MaterialTheme.typography.headlineSmall,
+                            )
+                            Text(
+                                state.model.series.firstOrNull()?.series?.unit.orEmpty(),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        MiniTrendChart(
+                            model = state.model,
+                            modifier = Modifier.weight(1f).height(48.dp),
+                        )
+                    }
+                } else {
+                    ChartRenderer(
+                        type = state.chartType,
+                        model = state.model,
+                        categories = state.categories,
+                        ringTarget = state.ringTarget,
+                    )
+                }
                 // 部分序列失败时仍然画其余的，但必须说明少了什么，
                 // 否则用户会以为那条线本来就不存在
                 state.model?.warnings?.forEach { warning ->
@@ -517,6 +605,17 @@ private fun ChartCard(state: ChartCardState?) {
         }
     }
 }
+
+/**
+ * 方块里的数字：整数直接显示，小数保留一位。
+ *
+ * 不用千分位撇号：48dp 宽的方块里再加分隔符，大数字会换行。
+ */
+private fun formatCompact(value: Double): String =
+    if (value == value.toLong().toDouble()) value.toLong().toString() else {
+        val scaled = kotlin.math.round(value * 10).toLong()
+        "${scaled / 10}.${kotlin.math.abs(scaled % 10)}"
+    }
 
 /**
  * 指标卡（M6b2b）。

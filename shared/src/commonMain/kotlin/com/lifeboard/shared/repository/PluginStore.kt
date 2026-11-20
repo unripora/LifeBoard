@@ -46,6 +46,9 @@ interface PluginStore {
      */
     suspend fun deleteRawRecords(pluginId: String, date: String, metricKey: String): Int
 
+    /** 清掉某插件的全部原始条目（卸载时「清除数据」用），返回删除行数 */
+    suspend fun deleteRawRecordsByPlugin(pluginId: String): Int
+
     /** 清空全部插件原始条目，返回删除行数 */
     suspend fun clearAllRawRecords(): Int
 
@@ -57,6 +60,9 @@ interface PluginStore {
 
     /** 某插件最早有过查询痕迹的日期，供「全部」时间段算起点 */
     suspend fun earliestMetricQueryDate(pluginId: String): String?
+
+    /** 清掉某插件的全部查询痕迹，返回删除行数 */
+    suspend fun deleteMetricQueriesByPlugin(pluginId: String): Int
 
     /**
      * 清空全部查询痕迹，返回删除行数。

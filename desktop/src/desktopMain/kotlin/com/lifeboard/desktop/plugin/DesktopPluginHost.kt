@@ -121,8 +121,12 @@ class DesktopPluginHost(
         withContext(Dispatchers.IO) { repository.revokeTrust(pluginId) }
     }
 
-    override suspend fun uninstall(pluginId: String) {
-        withContext(Dispatchers.IO) { repository.uninstall(pluginId) }
+    override suspend fun uninstall(pluginId: String, clearData: Boolean) {
+        withContext(Dispatchers.IO) { repository.uninstall(pluginId, clearData) }
+    }
+
+    override suspend fun clearPluginData(pluginId: String) {
+        withContext(Dispatchers.IO) { repository.clearPluginData(pluginId) }
     }
 
     override suspend fun uninstallPending(archiveName: String) {

@@ -1,14 +1,22 @@
 package com.lifeboard.shared.navigation
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ScrollableTabRow
@@ -28,6 +36,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -299,49 +308,83 @@ fun DashboardHost(
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        // 页签行 = 可横向滚动的页签 + 固定在右端的「+」。
-        // 「+」不能放进 ScrollableTabRow 里面：那样它会跟着页签一起滚走，
-        // 页签一多就找不到新增入口了
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            // 八个页签在窄屏上放不下，必须可横向滚动：
-            // 用 TabRow 会等分压缩，标签被截成两三个字就看不出是什么了
-            ScrollableTabRow(
-                selectedTabIndex = selectedIndex.coerceAtLeast(0),
-                containerColor = Color.Transparent,
-                edgePadding = 8.dp,
-                modifier = Modifier.weight(1f),
-            ) {
-                items.forEach { tab ->
-                    Tab(
-                        selected = current?.tabId == tab.tabId,
-                        onClick = { selectTab(tab.tabId) },
-                        text = { Text(tab.label, style = MaterialTheme.typography.labelMedium) },
-                    )
+    // 横向还是纵向放页签，由可用宽度决定（问题 2）。
+    //
+    // 手机竖屏只有 360~430dp，一行八个页签必须横向滚动，翻找很累；
+    // 但电脑与平板的宽度远大于高度，横向的页签行会把宝贵的高度浪费在一条
+    // 只有十几个字的横条上，同时宽度空着一大片。所以宽屏下把这一行搬到左侧
+    // 变成一列：标签能从两个字恢复到完整名称，页面区拿到的高度也多了一整行。
+    //
+    // 阈值 840dp 取自 Material 3 的 expanded 断点（≈ 平板横屏 / 桌面窗口）。
+    // 不用 `WindowSizeClass` 是因为它只在 Material3-adaptive 里，
+    // 而那个库目前只有 Android 构件；`BoxWithConstraints` 两端都有。
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val verticalTabs = maxWidth >= TAB_RAIL_BREAKPOINT
+
+        if (verticalTabs) {
+            Row(modifier = Modifier.fillMaxSize()) {
+                TabRail(
+                    items = items,
+                    selectedTabId = current?.tabId,
+                    onSelect = { selectTab(it) },
+                    onAdd = if (tabActions != null) {
+                        { showTabCreator = true }
+                    } else {
+                        null
+                    },
+                    showTaskIndicator = showTaskIndicator,
+                    onOpenTasks = { showTaskList = true },
+                )
+                Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                    pageContent(current?.route, host)
                 }
             }
-            // 没有写入口就不画「+」：画出来点了没反应比不画更糟
-            if (tabActions != null) {
-                // 用文字「+」而不是 Icons.Default.Add：`material-icons-core`
-                // 只在 `:app` 里有依赖，为了一个加号把图标库拉进 `shared`
-                // 会给每个模块都多背一份资源。字号按标题放大才能当按钮点击
-                IconButton(onClick = { showTabCreator = true }) {
-                    Text(
-                        "+",
-                        style = MaterialTheme.typography.titleLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+        } else {
+            Column(modifier = Modifier.fillMaxSize()) {
+                // 页签行 = 可横向滚动的页签 + 固定在右端的「+」。
+                // 「+」不能放进 ScrollableTabRow 里面：那样它会跟着页签一起滚走，
+                // 页签一多就找不到新增入口了
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    // 八个页签在窄屏上放不下，必须可横向滚动：
+                    // 用 TabRow 会等分压缩，标签被截成两三个字就看不出是什么了
+                    ScrollableTabRow(
+                        selectedTabIndex = selectedIndex.coerceAtLeast(0),
+                        containerColor = Color.Transparent,
+                        edgePadding = 8.dp,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        items.forEach { tab ->
+                            Tab(
+                                selected = current?.tabId == tab.tabId,
+                                onClick = { selectTab(tab.tabId) },
+                                text = { Text(tab.label, style = MaterialTheme.typography.labelMedium) },
+                            )
+                        }
+                    }
+                    // 没有写入口就不画「+」：画出来点了没反应比不画更糟
+                    if (tabActions != null) {
+                        // 用文字「+」而不是 Icons.Default.Add：`material-icons-core`
+                        // 只在 `:app` 里有依赖，为了一个加号把图标库拉进 `shared`
+                        // 会给每个模块都多背一份资源。字号按标题放大才能当按钮点击
+                        IconButton(onClick = { showTabCreator = true }) {
+                            Text(
+                                "+",
+                                style = MaterialTheme.typography.titleLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    // 任务指示环。Android 端的顶栏在 `MainActivity` 里自己画了，
+                    // 这一颗是给桌面端用的——桌面端没有顶栏，不同步渲染的话
+                    // 插件同步那十几秒界面完全没动静，用户分不清在干活还是卡死
+                    if (showTaskIndicator) {
+                        TaskIndicatorButton(onClick = { showTaskList = true })
+                    }
                 }
-            }
-            // 任务指示环。Android 端的顶栏在 `MainActivity` 里自己画了，
-            // 这一颗是给桌面端用的——桌面端没有顶栏，不同步渲染的话
-            // 插件同步那十几秒界面完全没动静，用户分不清在干活还是卡死
-            if (showTaskIndicator) {
-                TaskIndicatorButton(onClick = { showTaskList = true })
+
+                pageContent(current?.route, host)
             }
         }
-
-        pageContent(current?.route, host)
     }
 
     if (showTaskList) {
@@ -399,6 +442,122 @@ fun DashboardHost(
         )
     }
 }
+
+/**
+ * 宽屏下的左侧页签列。
+ *
+ * 与顶部的 `ScrollableTabRow` 表达同一件事（当前在哪一页、去别的页），
+ * 只是方向换成了竖向：
+ * - 宽度固定，标签左对齐，能用完整名称而不必缩成两个字
+ * - 选中项用一个浅色底块标出，而不是底部指示条——竖向的指示条看不出来
+ * - 「+」与任务指示环放在底部，位置固定，页签再多也不会把它们挤走
+ *
+ * 页签变多时整列可滚动：页签数量没有上限，不能指望永远放得下。
+ *
+ * @param onAdd 为 null 表示这一端不能新建页签，此时不画「+」
+ */
+@Composable
+private fun TabRail(
+    items: List<TabItem>,
+    selectedTabId: String?,
+    onSelect: (String) -> Unit,
+    onAdd: (() -> Unit)?,
+    showTaskIndicator: Boolean,
+    onOpenTasks: () -> Unit,
+) {
+    // 玻璃面板的边缘：右侧一条淡描边就够把导航区和内容区分开，
+    // 加阴影会在浅色主题下糊成一片
+    val divider = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+    Column(
+        modifier = Modifier
+            .width(TAB_RAIL_WIDTH)
+            .fillMaxHeight()
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.35f)),
+    ) {
+        Text(
+            "LifeBoard",
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.padding(start = 16.dp, top = 16.dp, bottom = 8.dp),
+        )
+
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            items.forEach { tab ->
+                val selected = tab.tabId == selectedTabId
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(
+                            if (selected) {
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
+                            } else {
+                                Color.Transparent
+                            },
+                        )
+                        .clickable { onSelect(tab.tabId) }
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        tab.label,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (selected) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        },
+                        maxLines = 1,
+                    )
+                }
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(divider),
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (onAdd != null) {
+                IconButton(onClick = onAdd) {
+                    Text(
+                        "+",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Spacer(Modifier.weight(1f))
+            if (showTaskIndicator) {
+                TaskIndicatorButton(onClick = onOpenTasks)
+            }
+        }
+    }
+}
+
+/**
+ * 宽屏断点。
+ *
+ * 840dp ≈ Material 3 的 expanded 断点：平板横屏、桌面窗口都在它之上，
+ * 手机竖屏（360~430dp）与手机横屏（约 800dp）都在它之下——
+ * 手机横屏仍然用顶部的横向页签，因为那时高度本来就很紧张，
+ * 抽出一条竖向导航会挤压内容宽度。
+ */
+private val TAB_RAIL_BREAKPOINT = 840.dp
+
+/** 侧边页签列的宽度。够放四到六个汉字，再多就挤内容区了 */
+private val TAB_RAIL_WIDTH = 168.dp
 
 /**
  * 页签增删改的落库入口。

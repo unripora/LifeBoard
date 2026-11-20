@@ -208,10 +208,10 @@ fun PluginScreen(
     confirmAction?.let { action ->
         ConfirmDialog(
             action = action,
-            onConfirm = {
+            onConfirm = { clearData ->
                 when (action) {
                     is ConfirmAction.ClearCredentials -> vm.clearCredentials(action.row)
-                    is ConfirmAction.Uninstall -> vm.uninstall(action.row)
+                    is ConfirmAction.Uninstall -> vm.uninstall(action.row, clearData)
                 }
                 confirmAction = null
             },
@@ -329,19 +329,30 @@ private fun InstalledCard(
     }
 }
 
+/**
+ * 危险操作的二次确认。
+ *
+ * 卸载给两个出口而不是一个开关：数据保留与否是**用户此刻就要决定的事**，
+ * 用一个默认勾选框很容易被忽略，而两种选择的后果差别很大
+ * （重装后是否还要重新登录、历史曲线还在不在）。
+ */
 @Composable
 private fun ConfirmDialog(
     action: ConfirmAction,
-    onConfirm: () -> Unit,
+    /** clearData 只对卸载有意义；清除凭据时忽略 */
+    onConfirm: (clearData: Boolean) -> Unit,
     onCancel: () -> Unit,
 ) {
     val (title, body) = when (action) {
         is ConfirmAction.ClearCredentials -> "清除凭据" to
-            "将删除 ${action.row.displayName} 保存的登录凭据，无法恢复。" +
-            "下次同步前需要重新登录。插件本身和数据不受影响。"
+            "将删除 ${action.row.displayName} 保存的登录凭据，无法恢复。\n\n" +
+            "与「登出」的区别：登出由插件自己执行，清什么由插件决定；" +
+            "这里由宿主直接把凭据全部删掉，插件没实现登出也能清干净。" +
+            "插件本身与已采集的数据不受影响。"
         is ConfirmAction.Uninstall -> "卸载插件" to
-            "将停止使用并删除 ${action.row.displayName} 的插件包，之后可以重新安装。" +
-            "已保存的凭据和插件私有数据会保留。"
+            "将停止使用并删除 ${action.row.displayName} 的插件包，之后可以重新安装。\n\n" +
+            "「仅卸载」会保留已采集的数据、插件私有文件与登录凭据，重装后可以直接接着用；" +
+            "「卸载并清除数据」会把这些一起删掉，重装后需要重新登录。"
     }
 
     AlertDialog(
@@ -349,11 +360,17 @@ private fun ConfirmDialog(
         title = { Text(title) },
         text = { Text(body) },
         confirmButton = {
-            TextButton(onClick = onConfirm) {
-                Text(
-                    if (action is ConfirmAction.ClearCredentials) "清除" else "卸载",
-                    color = MaterialTheme.colorScheme.error,
-                )
+            Row {
+                if (action is ConfirmAction.Uninstall) {
+                    TextButton(onClick = { onConfirm(false) }) { Text("仅卸载") }
+                    TextButton(onClick = { onConfirm(true) }) {
+                        Text("卸载并清除数据", color = MaterialTheme.colorScheme.error)
+                    }
+                } else {
+                    TextButton(onClick = { onConfirm(false) }) {
+                        Text("清除", color = MaterialTheme.colorScheme.error)
+                    }
+                }
             }
         },
         dismissButton = { TextButton(onClick = onCancel) { Text("取消") } },
