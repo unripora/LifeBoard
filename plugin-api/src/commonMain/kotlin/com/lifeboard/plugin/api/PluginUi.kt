@@ -21,7 +21,14 @@ package com.lifeboard.plugin.api
  * 它遇到不认识的类型只能不渲染，表现为「插件说的东西没显示」。
  * 所以新增分支不需要升版本号，但插件应当在自己的最低宿主版本说明里写清依赖关系。
  */
-sealed interface UiBlock
+sealed interface UiBlock {
+    /**
+     * 可选稳定标识：用户自定义区块顺序时用来引用具体区块。
+     *
+     * 不要求插件提供——缺省时宿主按「类型 + 当前位置」兜底。
+     */
+    val id: String?
+}
 
 /**
  * 一段带标题的说明文字。
@@ -32,6 +39,8 @@ data class TextBlock(
     val title: String,
     val body: String = "",
     val tone: Tone = Tone.NEUTRAL,
+    /** 可选稳定标识，用于用户自定义区块顺序；缺省由宿主按「类型 + 位置」兜底 */
+    override val id: String? = null,
 ) : UiBlock
 
 /**
@@ -45,6 +54,7 @@ data class StatusCardBlock(
     val value: String,
     val tone: Tone = Tone.NEUTRAL,
     val detail: String? = null,
+    override val id: String? = null,
 ) : UiBlock
 
 /**
@@ -57,6 +67,7 @@ data class StatusCardBlock(
  */
 data class ButtonRowBlock(
     val buttons: List<ButtonSpec>,
+    override val id: String? = null,
 ) : UiBlock
 
 /**
@@ -76,6 +87,7 @@ data class ButtonSpec(
 data class ChartBlock(
     val title: String,
     val chart: ChartSpec,
+    override val id: String? = null,
 ) : UiBlock
 
 /**
@@ -136,6 +148,117 @@ data class ChartPoint(
 data class CustomImageBlock(
     val dataUri: String,
     val aspectRatio: Float = 1.6f,
+    override val id: String? = null,
+) : UiBlock
+
+/**
+ * 消息列表：一段对话记录。
+ *
+ * 由宿主负责气泡样式、左右对齐与滚动；插件只给出「谁说的、说了什么」。
+ * 每次 [SourcePlugin.detailUi] 都返回**全量**消息而不是增量，
+ * 宿主整体替换即可——增量协议要处理丢包与乱序，对聊天记录没有收益。
+ *
+ * @property messages 按时间正序，最后一条在底部
+ */
+data class MessageListBlock(
+    val messages: List<ChatMessage>,
+    override val id: String? = null,
+) : UiBlock
+
+/**
+ * 一条消息。
+ *
+ * @property role 决定气泡样式；[ChatRole.SYSTEM] 用于「已连接」「对方正在处理」这类提示
+ * @property pending 消息尚未完成（流式输出中或等待回复），宿主会给出进行中的视觉提示
+ * @property timeLabel 展示用时间文案，由插件按自己的协议格式化；为空则不显示
+ */
+data class ChatMessage(
+    val role: ChatRole,
+    val text: String,
+    val timeLabel: String? = null,
+    val pending: Boolean = false,
+)
+
+/** 消息角色 */
+enum class ChatRole {
+    /** 用户自己说的 */
+    USER,
+
+    /** 对方（Agent / 服务端）说的 */
+    ASSISTANT,
+
+    /** 系统提示，不属于任何一方 */
+    SYSTEM,
+}
+
+/**
+ * 输入框：用户输入文本后提交。
+ *
+ * 提交时宿主调用 [SourcePlugin.onAction]，`actionId` 是本区块的标识，
+ * `value` 是用户输入的文本。宿主**不替插件清空**输入语义——
+ * 输入框内容由宿主清空，但插件应在下一次 `detailUi` 里把这条消息
+ * 作为 [ChatRole.USER] 放进 [MessageListBlock]。
+ *
+ * @property actionId 回传给 [SourcePlugin.onAction] 的标识
+ * @property submitLabel 提交按钮文案
+ * @property multiline 多行输入；对话场景通常为 `true`
+ * @property enabled 为 `false` 时只展示不可输入（如连接断开期间）
+ */
+data class InputBoxBlock(
+    val actionId: String,
+    val placeholder: String = "输入消息",
+    val submitLabel: String = "发送",
+    val multiline: Boolean = true,
+    val enabled: Boolean = true,
+    override val id: String? = null,
+) : UiBlock
+
+/**
+ * 审批区块：请求用户做一个选择（批准/拒绝、选一个选项）。
+ *
+ * [waiting] 为 `true` 时只展示「等待处理」的占位，不显示选项——
+ * 用于「已提交、等对方决定」的阶段。插件在对应用户操作后应重新发出
+ * 一个 `waiting=false` 或去掉选项的区块来表达结果。
+ *
+ * @property options 选项列表；点击后宿主把该项的 `actionId` 回传给
+ *   [SourcePlugin.onAction]，`value` 为空
+ */
+data class ApprovalBlock(
+    val title: String,
+    val detail: String = "",
+    val options: List<ButtonSpec>,
+    val waiting: Boolean = false,
+    override val id: String? = null,
+) : UiBlock
+
+/**
+ * 会话区块：一块由宿主托管的实时对话区域。
+ *
+ * 与 [MessageListBlock] 的区别是「活」的：消息由插件持续推入，用户输入直接交给插件，
+ * 不需要每次操作都重画整页。[MessageListBlock] 仍是静态快照，适合展示历史记录。
+ *
+ * ## 插件控制位置，宿主控制表现
+ *
+ * 插件把本区块放在 `detailUi()` 返回列表的任意位置，宿主负责气泡样式、滚动与输入框行为；
+ * 具体绑定哪个会话由 [sessionId] 决定，同一插件内唯一。
+ *
+ * ## 生命周期
+ *
+ * 宿主在区块可见时开始会话、不可见时按策略保留或结束。插件不需要自己判断页面是否在前台。
+ *
+ * @property sessionId 插件内唯一的会话标识
+ * @property title 区块标题；为空时使用「会话」
+ * @property placeholder 输入框占位文案
+ * @property submitLabel 提交按钮文案
+ * @property emptyHint 尚无消息时的提示
+ */
+data class ConversationBlock(
+    val sessionId: String,
+    val title: String = "",
+    val placeholder: String = "输入消息",
+    val submitLabel: String = "发送",
+    val emptyHint: String = "还没有消息",
+    override val id: String? = null,
 ) : UiBlock
 
 /** 语义色调，具体颜色由宿主按主题决定 */

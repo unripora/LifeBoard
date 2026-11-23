@@ -32,6 +32,11 @@
     "allowImportingTsExtensions": false,
     "verbatimModuleSyntax": true
   },
-  "include": ["types/**/*.d.ts", "types/__typecheck__/**/*.ts", "mihealth/**/*.ts"],
-  "exclude": ["mihealth/main.js", "node_modules", "_debug"]
+  "include": [
+    "types/**/*.d.ts",
+    "types/__typecheck__/**/*.ts",
+    "mihealth/**/*.ts",
+    "dsh/**/*.ts"
+  ],
+  "exclude": ["mihealth/main.js", "dsh/main.js", "node_modules", "_debug"]
 }

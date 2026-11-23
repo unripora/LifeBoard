@@ -1,7 +1,9 @@
 package com.lifeboard.desktop.schedule
 
 import com.lifeboard.shared.platform.Scheduler
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -39,7 +41,10 @@ import java.util.concurrent.ConcurrentHashMap
  * 所有操作在 [Dispatchers.Default] 上跑。`delay` 不占线程，
  * 几十个 tag 同时挂着也只是几十个挂起的协程，没有线程开销。
  */
-class DesktopScheduler : Scheduler {
+class DesktopScheduler(
+    private val nowMillis: () -> Long = System::currentTimeMillis,
+    dispatcher: CoroutineDispatcher = Dispatchers.Default,
+) : Scheduler {
 
     /**
      * 定时器所在的 scope。
@@ -48,7 +53,7 @@ class DesktopScheduler : Scheduler {
      * 不该让**其它所有**提醒一起停掉。用普通 `Job` 的话，
      * 一个插件的 bug 会让全天的提醒静默消失。
      */
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val scope = CoroutineScope(SupervisorJob() + dispatcher)
 
     /** tag → 挂着的定时任务 */
     private val timers = ConcurrentHashMap<String, Job>()
@@ -72,42 +77,33 @@ class DesktopScheduler : Scheduler {
     fun unregister(tag: String) = listeners.remove(tag)
 
     override suspend fun scheduleAt(tag: String, triggerAtMillis: Long, payload: String?) {
-        // 覆盖：先撤掉旧的那次
-        timers.remove(tag)?.cancel()
-
-        val wait = triggerAtMillis - System.currentTimeMillis()
-        if (wait <= 0) {
-            // 已经过点了。立即触发而不是丢弃：
-            // 业务层算出「应该现在提醒」时，晚几百毫秒总比整天不提醒好
-            // （这也是 Android 侧 `setAndAllowWhileIdle` 传过去时刻时的实际行为）
-            fireNow(tag, payload)
-            return
+        val listener = listeners[tag]
+        val wait = triggerAtMillis - nowMillis()
+        lateinit var timer: Job
+        // 先存入注册表再启动，立即触发的任务也必须能被覆盖和取消。
+        timer = scope.launch(start = CoroutineStart.LAZY) {
+            if (wait > 0) delay(wait)
+            // 只有本次排程仍持有 tag 才能移除；旧任务不能误删新任务或调用新回调。
+            if (timers.remove(tag, timer)) listener?.invoke(payload)
         }
-
-        timers[tag] = scope.launch {
-            delay(wait)
-            // 到自己把自己从表里摘掉：否则 isScheduled 会对一个已经触发过的
-            // 一次性任务一直返回 true
-            timers.remove(tag)
-            listeners[tag]?.invoke(payload)
-        }
+        timers.put(tag, timer)?.cancel()
+        timer.start()
     }
 
     override suspend fun scheduleRepeating(tag: String, intervalMinutes: Long, payload: String?) {
-        timers.remove(tag)?.cancel()
-
-        // 桌面端不需要 Android 那个 15 分钟下限（那里是省电策略）。
-        // 但 0 或负数会让 delay 变成忙循环，必须挡住
+        // 桌面端不需要 Android 的 15 分钟下限，但必须防止忙循环。
         val intervalMillis = (intervalMinutes * 60_000L).coerceAtLeast(1_000L)
-
-        timers[tag] = scope.launch {
-            // 第一次等一个周期再触发，与 Android `setInexactRepeating` 的
-            // 「now + interval 起算」一致
+        val listener = listeners[tag]
+        lateinit var timer: Job
+        timer = scope.launch(start = CoroutineStart.LAZY) {
             while (isActive) {
                 delay(intervalMillis)
-                listeners[tag]?.invoke(payload)
+                if (timers[tag] !== timer) break
+                listener?.invoke(payload)
             }
         }
+        timers.put(tag, timer)?.cancel()
+        timer.start()
     }
 
     override suspend fun cancel(tag: String) {
@@ -138,13 +134,4 @@ class DesktopScheduler : Scheduler {
 
     override suspend fun isScheduled(tag: String): Boolean = timers[tag]?.isActive == true
 
-    /**
-     * 立即触发一次，用于「已过点」。
-     *
-     * 用 `launch` 而不是直接调：调用方（`scheduleAt`）是 `suspend`，
-     * 若在这里同步调回调，回调里再调 `scheduleAt` 就会同步递归。
-     */
-    private fun fireNow(tag: String, payload: String?) {
-        scope.launch { listeners[tag]?.invoke(payload) }
-    }
 }

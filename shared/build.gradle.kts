@@ -72,6 +72,9 @@ kotlin {
         }
         getByName("desktopTest").dependencies {
             implementation(kotlin("test"))
+            // WebSocket 桥测试需要真的 WS 服务端。手写 ServerSocket 做握手与帧编解码，
+            // 会把「测试自己的 bug」混进断言里；用 OkHttp 官方的 mock 服务端更可信。
+            implementation("com.squareup.okhttp3:mockwebserver:4.12.0")
         }
     }
 }

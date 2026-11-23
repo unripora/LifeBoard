@@ -1,9 +1,11 @@
 package com.lifeboard.server.plugin.js
 
 import android.content.Context
-import com.lifeboard.server.plugin.LoadedPlugin
-import com.lifeboard.server.plugin.PluginTrustStore
+import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.server.platform.AndroidSettingsStore
+import com.lifeboard.server.plugin.LoadedPlugin
+import com.lifeboard.server.plugin.PluginDataSource
+import com.lifeboard.server.source.SourceProviderRegistry
 import com.lifeboard.shared.plugin.fs.AndroidPluginFileSystem
 import com.lifeboard.shared.plugin.js.BrokenJsPlugin
 import com.lifeboard.shared.plugin.js.JsPluginLoader as SharedJsPluginLoader
@@ -42,6 +44,10 @@ internal object JsPluginLoader {
 
     private val loaders = java.util.concurrent.ConcurrentHashMap<Context, SharedJsPluginLoader>()
 
+    // 注册表、详情页与 PluginDataSource 必须共用同一个可撤销的宿主包装，不能每次读取都重建。
+    // 所有修改都持有本对象的锁，与首次扫描共用同一个生命周期临界区。
+    private val loaded = mutableMapOf<Context, List<LoadedPlugin>>()
+
     /**
      * 是否已经完整扫描过一次。
      *
@@ -70,10 +76,10 @@ internal object JsPluginLoader {
             if (scanned) return
             runCatching { scan(context.applicationContext) }
                 .onFailure { com.lifeboard.shared.log.AppLogger.error("首次插件扫描失败", it) }
-            scanned = true
         }
     }
 
+    @Synchronized
     private fun loader(context: Context): SharedJsPluginLoader {
         val app = context.applicationContext
         return loaders.getOrPut(app) {
@@ -89,8 +95,9 @@ internal object JsPluginLoader {
     /** 插件包与解压目录的根位置 */
     fun pluginsDir(context: Context): File = File(context.filesDir, "js-plugins").apply { mkdirs() }
 
+    @Synchronized
     fun loadedPlugins(context: Context): List<LoadedPlugin> =
-        loader(context).loadedPlugins().map { it.toLoadedPlugin() }
+        loaded[context.applicationContext].orEmpty()
 
     fun brokenPlugins(context: Context): List<BrokenJsPlugin> =
         loader(context).brokenPlugins()
@@ -98,55 +105,83 @@ internal object JsPluginLoader {
     fun pendingPlugins(context: Context): List<PendingJsPlugin> =
         loader(context).pendingPlugins()
 
+    @Synchronized
     fun find(context: Context, pluginId: String): LoadedPlugin? =
-        loader(context).find(pluginId)?.toLoadedPlugin()
+        loaded[context.applicationContext]?.firstOrNull { it.pluginId == pluginId }
 
-    fun remove(context: Context, archiveName: String): Boolean =
-        loader(context).remove(archiveName)
-
-    fun scan(context: Context): List<LoadedPlugin> =
-        loader(context).scan().map { it.toLoadedPlugin() }
-
-    fun closeAll(context: Context) {
-        loaders[context.applicationContext]?.closeAll()
-    }
-
-    /**
-     * 把某个插件标记为不再可信。
-     *
-     * 只在内存里翻转标记，不重建运行时：撤销信任发生在 UI 线程，
-     * 重建列表会把所有插件实例一起换掉，正在采集的会被打断。
-     * 调度前检查 `LoadedPlugin.trusted` 就够了。
-     */
-    fun markUntrusted(context: Context, pluginId: String) {
-        markUntrustedFlags(pluginId)
-    }
-
-    /**
-     * 撤销信任后的内存标记表。
-     *
-     * 共享层不认识 `LoadedPlugin.trusted`（那是宿主簿记），所以由这一层记住
-     * 哪些插件已被撤销，下次 [scan] 重建 `LoadedPlugin` 时据此恢复标记。
-     */
-    private val untrustedIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-
-    private fun markUntrustedFlags(pluginId: String) {
-        untrustedIds += pluginId
-    }
-
-    private fun com.lifeboard.shared.plugin.js.JsLoadedPlugin.toLoadedPlugin(): LoadedPlugin =
-        LoadedPlugin(
-            archive = packageInfo,
-            archiveName = archiveName,
-            plugin = plugin,
-        ).apply {
-            // 撤销过信任的插件在下次扫描重建后仍要显示为不可信，
-            // 否则用户撤销后刷一下列表它就「恢复」了
-            if (plugin.id in untrustedIds) trusted = false
+    @Synchronized
+    fun remove(context: Context, archiveName: String): Boolean {
+        val app = context.applicationContext
+        return try {
+            loader(app).remove(archiveName)
+        } finally {
+            // 即便文件已被外部删除或删除中途失败，也不能继续调度这个归档的旧实例。
+            replaceLoaded(app, loaded[app].orEmpty().filterNot { it.archiveName == archiveName })
         }
+    }
 
-    /** 重新信任时清掉撤销标记，避免下次扫描又把它置回不可信 */
-    fun markTrusted(pluginId: String) {
-        untrustedIds -= pluginId
+    /** 加载与登记在同一个临界区完成；空扫描也必须覆盖旧的插件源。 */
+    @Synchronized
+    fun scan(context: Context): List<LoadedPlugin> {
+        val app = context.applicationContext
+        val previous = loaded[app].orEmpty()
+        val plugins = try {
+            loader(app).scan().map { js ->
+                // 共享层可能复用未变化的运行时，宿主也复用包装，确保所有持有者看到同一个信任标记。
+                // 已撤销的包装不复活：重新信任必须通过共享层本次扫描的持久化信任判定。
+                previous.firstOrNull { it.plugin === js.plugin && it.trusted }
+                    ?: LoadedPlugin(js.packageInfo, js.archiveName, js.plugin)
+            }
+        } catch (error: Throwable) {
+            // 共享扫描可能已经关闭旧运行时，异常时宁可暂不调度，也不留下失效的采集器。
+            replaceLoaded(app, emptyList())
+            scanned = false
+            throw error
+        }
+        replaceLoaded(app, plugins)
+        scanned = true
+        return plugins
+    }
+
+    @Synchronized
+    fun closeAll(context: Context) {
+        val app = context.applicationContext
+        // 先撤掉调度入口，并让已取出的 Provider/采集器也看见停止标记，再释放运行时。
+        replaceLoaded(app, emptyList())
+        scanned = false
+        loaders[app]?.closeAll()
+    }
+
+    /** 撤销只停用该插件，不关闭其它插件的运行时；已取出的采集器也会读取同一个标记。 */
+    @Synchronized
+    fun markUntrusted(context: Context, pluginId: String) {
+        loaded[context.applicationContext].orEmpty()
+            .filter { it.pluginId == pluginId }
+            .forEach { it.trusted = false }
+        registerProviders()
+    }
+
+    private fun replaceLoaded(app: Context, plugins: List<LoadedPlugin>) {
+        loaded[app].orEmpty().filter { old -> plugins.none { it === old } }
+            .forEach { it.trusted = false }
+        loaded[app] = plugins
+        registerProviders()
+    }
+
+    private fun registerProviders() {
+        val providers = loaded.values.flatten().filter { it.trusted }.flatMap { plugin ->
+            // LoadedPlugin.metrics 按 metricKey 索引，同一插件的重复声明只登记一个采集源。
+            plugin.metrics.values.map { spec ->
+                SourceProviderRegistry.Provider(
+                    SourceRef.Plugin(
+                        pluginId = plugin.pluginId,
+                        metricKey = spec.metricKey,
+                        displayName = "${plugin.plugin.displayName}·${spec.displayName}",
+                        bucket = spec.bucket,
+                    ),
+                ) { context -> PluginDataSource(plugin, spec, context) }
+            }
+        }.distinctBy { it.source.key }
+        SourceProviderRegistry.setPluginProviders(providers)
     }
 }

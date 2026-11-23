@@ -3,6 +3,7 @@ package com.lifeboard.shared.panel
 import com.lifeboard.core.model.RemindLevel
 import com.lifeboard.core.model.TaskConfig
 import com.lifeboard.core.model.TimeSource
+import com.lifeboard.core.schedule.RepeatType
 import com.lifeboard.core.schedule.ScheduleRule
 import com.lifeboard.core.schedule.TimeWindow
 import com.lifeboard.core.util.Dates
@@ -92,7 +93,12 @@ class RemindPlannerTest {
     @Test
     fun boundaryMinutesAreAccepted() {
         // 00:00 与 23:59 是合法边界，不能因为「看起来像越界」被误拒
-        assertNotNull(RemindPlanner.triggerMillisFor(endMinute = 0, offsetMinutes = 0, nowMillis = at(0, 0) - 60_000))
+        assertNotNull(RemindPlanner.triggerMillisFor(
+            endMinute = 0,
+            offsetMinutes = 0,
+            nowMillis = at(0, 0) - 60_000,
+            date = LocalDate.now(),
+        ))
         assertNotNull(RemindPlanner.triggerMillisFor(endMinute = 1439, offsetMinutes = 0, nowMillis = at(0, 0)))
     }
 
@@ -177,9 +183,31 @@ class RemindPlannerTest {
         assertEquals("all windows already passed today", plan.skipReason)
     }
 
-    // ───────────────────────── 辅助 ─────────────────────────
+    @Test
+    fun injectedDateControlsWeeklyActivation() {
+        val monday = LocalDate.now().with(java.time.temporal.TemporalAdjusters.nextOrSame(java.time.DayOfWeek.MONDAY))
+        val mondayNow = at(monday, 8, 0)
+        val weekly = ScheduleRule(
+            windows = listOf(TimeWindow(9 * 60, 9 * 60 + 30)),
+            repeatType = RepeatType.WEEKLY,
+            weekdays = setOf(1),
+        )
+        val plan = RemindPlanner.planTask(task(), weekly, nowMillis = mondayNow)
+        assertEquals(at(monday, 9, 35), plan.entries.single().triggerAtMillis)
 
-    /** 每日规则 + 指定时段；[windows] 是 `时:分` 到 `时:分` 的配对 */
+        val sunday = monday.plusDays(6)
+        val inactive = RemindPlanner.planTask(task(), weekly, nowMillis = at(sunday, 8, 0))
+        assertTrue(inactive.isEmpty)
+        assertEquals("date not active today", inactive.skipReason)
+    }
+
+
+    private fun at(date: LocalDate, hour: Int, minute: Int): Long =
+        LocalDateTime.of(date, LocalTime.of(hour, minute))
+            .atZone(Dates.zone)
+            .toInstant()
+            .toEpochMilli()
+
     private fun daily(vararg windows: Pair<Int, Int>): ScheduleRule =
         ScheduleRule(windows = windows.map { (s, e) -> TimeWindow(s, e) })
 

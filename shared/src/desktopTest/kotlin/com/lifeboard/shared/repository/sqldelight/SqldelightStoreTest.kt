@@ -469,6 +469,69 @@ class SqldelightStoreTest {
     }
 
     @Test
+    fun 清除插件数据删除已移除指标且保留相似插件源() = runBlocking {
+        val database = open()
+        val pluginStore = SqldelightPluginStore(database)
+        val metricStore = SqldelightMetricStore(database, lookup)
+
+        fun source(pluginId: String, metricKey: String) =
+            SourceRef.Plugin(pluginId, metricKey, metricKey, MetricBucket.COUNT)
+        fun metric(pluginId: String, metricKey: String) = MetricRecord(
+            source = source(pluginId, metricKey), date = "2026-11-13", value = 1.0,
+        )
+        listOf(
+            metric("p_1", "CURRENT"),
+            metric("p_1", "REMOVED_FROM_MANIFEST"),
+            metric("pX1", "CURRENT"), // `_` must not act as a LIKE wildcard
+            metric("p_10", "CURRENT"), // the exact plugin prefix ends at `:`
+        ).forEach { metricStore.saveMetric(it) }
+        listOf("p_1" to "CURRENT", "p_1" to "REMOVED_FROM_MANIFEST", "pX1" to "CURRENT", "p_10" to "CURRENT")
+            .forEach { (pluginId, metricKey) ->
+                metricStore.saveSourceHealth(
+                    com.lifeboard.core.model.SourceHealth(source(pluginId, metricKey), healthy = true),
+                )
+            }
+
+        com.lifeboard.shared.repository.PluginDataPurger(
+            pluginStore = pluginStore,
+            metricStore = metricStore,
+            clearCredentials = {},
+            deleteDataDir = {},
+        ).purge("p_1", listOf("CURRENT"))
+
+        val expectedOtherKeys = setOf(
+            SourceRef.pluginKey("pX1", "CURRENT"),
+            SourceRef.pluginKey("p_10", "CURRENT"),
+        )
+        assertEquals(
+            expectedOtherKeys,
+            metricStore.getMetricsInRange("2026-11-13", "2026-11-13").map { it.source.key }.toSet(),
+            "purge should delete every metric for p_1, including removed keys, and no similar IDs",
+        )
+        assertEquals(
+            expectedOtherKeys,
+            metricStore.getAllSourceHealth().map { it.source.key }.toSet(),
+            "purge should delete every source_health row for p_1 without wildcard collisions",
+        )
+    }
+
+    @Test
+    fun 未加载插件也能按插件标识清除历史指标() = runBlocking {
+        val database = open()
+        val metrics = SqldelightMetricStore(database, lookup)
+        val source = SourceRef.Plugin("offline.plugin", "OLD_KEY", "old", MetricBucket.COUNT)
+        metrics.saveMetric(MetricRecord(source, "2026-11-13", 2.0))
+        metrics.saveSourceHealth(com.lifeboard.core.model.SourceHealth(source, healthy = true))
+
+        com.lifeboard.shared.repository.PluginDataPurger(
+            SqldelightPluginStore(database), metrics, clearCredentials = {}, deleteDataDir = {},
+        ).purge("offline.plugin", emptyList())
+
+        assertTrue(metrics.getMetricsInRange("2026-11-13", "2026-11-13").isEmpty())
+        assertTrue(metrics.getAllSourceHealth().isEmpty())
+    }
+
+    @Test
     fun 清除插件数据覆盖凭据历史与私有目录() = runBlocking {
         val db = open()
         val pluginStore = SqldelightPluginStore(db)

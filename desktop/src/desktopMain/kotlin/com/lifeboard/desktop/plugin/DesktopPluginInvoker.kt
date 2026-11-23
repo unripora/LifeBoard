@@ -7,15 +7,22 @@ import com.lifeboard.plugin.api.LoginResult
 import com.lifeboard.plugin.api.MetricSample
 import com.lifeboard.plugin.api.MetricSeries
 import com.lifeboard.plugin.api.PluginHealth
+import com.lifeboard.plugin.api.SessionAction
+import com.lifeboard.plugin.api.SessionConfig
+import com.lifeboard.plugin.api.SessionEvent
+import com.lifeboard.plugin.api.SessionUiEvent
 import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.plugin.api.UiBlock
 import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.shared.platform.CollectOutcome
 import com.lifeboard.shared.platform.PluginInvoker
+import com.lifeboard.shared.platform.StreamingSourcePlugin
 import com.lifeboard.shared.plugin.host.HostPluginContext
 import com.lifeboard.shared.repository.MetricStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.withContext
 import java.time.LocalDate
 
@@ -126,14 +133,18 @@ class DesktopPluginInvoker(
      * 手动同步必须走宿主既有采集链路，否则健康度、去重与量纲校验都会被绕过。
      * 同步完成后重新问一次 [detailUi]，插件返回的区块就能反映最新数据。
      */
-    override suspend fun onAction(pluginId: String, actionId: String): ActionResult {
+    override suspend fun onAction(
+        pluginId: String,
+        actionId: String,
+        value: String?,
+    ): ActionResult {
         val entry = repository.find(pluginId)
             ?: return ActionResult.ShowMessage("插件未加载，请重新扫描")
         if (!entry.trusted) return ActionResult.ShowMessage("插件已停止使用，请先信任再操作")
 
         val result = withContext(Dispatchers.IO) {
             try {
-                entry.plugin.onAction(hostContextFactory(pluginId), actionId)
+                entry.plugin.onAction(hostContextFactory(pluginId), actionId, value)
             } catch (cancel: CancellationException) {
                 throw cancel
             } catch (error: Throwable) {
@@ -158,6 +169,67 @@ class DesktopPluginInvoker(
             return ActionResult.ShowMessage("同步未完成，请检查登录状态与网络后重试")
         }
         return ActionResult.RefreshUi(detailUi(pluginId))
+    }
+
+    /**
+     * 增量输出。
+     *
+     * 返回的是插件实例上常驻的热流：**订阅之前**的推送会丢，调用方必须在
+     * 发起调用前订阅。没实现 [StreamingSourcePlugin] 的插件返回空流，
+     * 调用方不必写「支持 / 不支持」两条路径。
+     */
+    override fun streamDeltas(pluginId: String): Flow<String> =
+        (repository.find(pluginId)?.plugin as? StreamingSourcePlugin)?.streamDeltas ?: emptyFlow()
+
+    /**
+     * 启动会话。
+     *
+     * 桌面端与 Android 共用插件契约，因此能力一致；真正决定「能不能连」
+     * 的是插件自己（例如 DSH 需要账号与主机配置）。
+     */
+    override suspend fun sessionStart(pluginId: String, config: SessionConfig): Boolean {
+        val entry = repository.find(pluginId) ?: return false
+        if (!entry.trusted) return false
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                entry.plugin.onSessionStart(hostContextFactory(pluginId), config)
+            }.getOrElse {
+                AppLogger.warn("插件 $pluginId 启动会话失败：${it.message ?: it::class.simpleName}")
+                false
+            }
+        }
+    }
+
+    /** 投递一次会话操作；异常按「继续」降级，避免把插件故障当成用户取消 */
+    override suspend fun sessionEvent(pluginId: String, event: SessionEvent): SessionAction {
+        val entry = repository.find(pluginId) ?: return SessionAction.Continue
+        if (!entry.trusted) return SessionAction.Stop("插件已停止使用")
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                entry.plugin.onSessionEvent(hostContextFactory(pluginId), event)
+            }.getOrElse {
+                AppLogger.warn("插件 $pluginId 处理会话事件失败：${it.message ?: it::class.simpleName}")
+                SessionAction.Continue
+            }
+        }
+    }
+
+    override suspend fun sessionStop(pluginId: String) {
+        val entry = repository.find(pluginId) ?: return
+        if (!entry.trusted) return
+        withContext(Dispatchers.IO) {
+            runCatching { entry.plugin.onSessionStop(hostContextFactory(pluginId)) }
+                .onFailure {
+                    AppLogger.warn("插件 $pluginId 停止会话失败：${it.message ?: it::class.simpleName}")
+                }
+        }
+    }
+
+    override fun setSessionUiListener(
+        pluginId: String,
+        listener: ((SessionUiEvent) -> Unit)?,
+    ) {
+        repository.find(pluginId)?.plugin?.setSessionUiListener(listener)
     }
 
     /**

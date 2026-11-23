@@ -25,7 +25,7 @@ import java.io.File
  *
  * 1. `ctx.d.ts` 里能被**调用**的成员（`name(` 形式的属性和方法）必须与
  *    [JsHostFunctions.ALL] 一一对应；
- * 2. 三个桥接的 `functionNames()` 合起来等于 [JsHostFunctions.ALL]，
+ * 2. 四个桥接的 `functionNames()` 合起来等于 [JsHostFunctions.ALL]，
  *    防止有人在桥接里独自加函数却忘了登记；
  * 3. [JsPluginApi.CAPABILITIES] 覆盖全部函数，防止加了能力却不记录版本。
  */
@@ -56,6 +56,8 @@ class JsHostFunctionContractTest {
             "CryptoApi" to "ctx.crypto",
             "CodecApi" to "ctx.codec",
             "LogApi" to "ctx.log",
+            "WsApi" to "ctx.ws",
+            "StreamApi" to "ctx.stream",
         )
 
         val found = mutableSetOf<String>()
@@ -82,7 +84,7 @@ class JsHostFunctionContractTest {
         Regex("""(?m)^\s{1,8}(\w+)\s*(?:<[^>]*>)?\s*\(""").findAll(cleaned).forEach {
             found += "ctx.${it.groupValues[1]}"
         }
-        // 属性式能力（credentials / files / http / crypto / codec / log）不进比对：
+        // 属性式能力（credentials / files / http / crypto / codec / ws / log）不进比对：
         // 它们是对象不是函数，函数由上面的接口展开覆盖
         return found
     }
@@ -155,8 +157,9 @@ class JsHostFunctionContractTest {
     }
 
     @Test
-    fun `三个桥接注册的函数合起来就是全集`() {
-        val grouped = JsHostFunctions.CONTEXT + JsHostFunctions.HTTP + JsHostFunctions.CRYPTO
+    fun `四个桥接注册的函数合起来就是全集`() {
+        val grouped = JsHostFunctions.CONTEXT + JsHostFunctions.HTTP +
+            JsHostFunctions.CRYPTO + JsHostFunctions.WS + JsHostFunctions.STREAM
 
         assertEquals(
             "分组清单与 ALL 不一致",

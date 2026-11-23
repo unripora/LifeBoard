@@ -92,6 +92,19 @@ object BuiltinTabs {
         BuiltinTab("builtin_settings", ROUTE_SETTINGS, "设置"),
     )
 
+    /**
+     * 已下线但可能还留在老用户库里的页签。
+     *
+     * 「远程」曾经是内置页签；会话做成插件的 `conversation` 区块之后，
+     * 这个入口只剩一份空态，留着只会让用户点进一个永远连不上的页面。
+     *
+     * 必须显式清理而不是「从 [ALL] 里删掉就算完」：`toItem` 认不出的内置 tabId
+     * 会退化成用户页签（卡片容器），用户会看到一个名字叫「远程」、里面能加卡片
+     * 的怪东西。清理在 `DashboardLayout.ensureInitialized` 里做，
+     * 只在库里确实有这一行时才写——避免每次启动都开一次写事务。
+     */
+    val RETIRED_TAB_IDS: Set<String> = setOf("builtin_remote")
+
     fun byRoute(route: String): BuiltinTab? = ALL.firstOrNull { it.route == route }
 
     fun byTabId(tabId: String): BuiltinTab? = ALL.firstOrNull { it.tabId == tabId }

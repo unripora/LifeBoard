@@ -62,10 +62,8 @@ import com.lifeboard.shared.panel.sourceKeyFor
  * - 轴由**每条序列自己选**（左/右），不再按「第一条左、第二条右」硬分配
  * - 一条不同单位的序列被放到已有不同单位的轴上时，保存前就提示会读错
  *
- * 至于**饼图为什么以前选不了指标**：它的数据来自分类查询（`categorySourceKey`），
- * 根本没读 `series`，代码里还主动把 series 清空（`usesCategory -> emptyList()`）。
- * 现在改成：饼图在分类源之外**也允许选指标**，选了就按「一列一个指标」画
- * 占比饼图（多指标饼图 = 每个指标占总和的比例），没选则保持原来的分类模式。
+ * 饼图只开放分类占比：查询层读取 `categorySourceKey`，不消费 `series`。
+ * 指标占比需要先定义单位可比性和聚合口径，再一起交付配置与查询。
  *
  * ## 约束在哪一步生效
  *
@@ -96,12 +94,6 @@ fun ChartConfigDialog(
     // Top N 只对饼图有意义：其余形态不读这个字段，但仍要保留编辑前的值，
     // 免得用户切一下类型再切回来就被重置
     var topN by remember { mutableStateOf(initial?.topN ?: DEFAULT_TOP_N) }
-    // 饼图是否改用「按指标占比」而不是分类占比。编辑已有配置时，
-    // 有指标序列就说明它本来就是指标模式
-    var pieUsesSeries by remember {
-        mutableStateOf(initial?.chartType == ChartType.PIE && initial.series.isNotEmpty())
-    }
-
     // 是否正在浏览指标列表。与 picking 分开：
     // picking 只表示「已经点了一条需要任务的序列」，此时列表换成任务清单
     var browsing by remember { mutableStateOf(false) }
@@ -130,25 +122,22 @@ fun ChartConfigDialog(
     // 这样即使某天数据源没带分组名，也不会出现一个标题为空的分组
     val groups = remember(options) { groupOptions(options) }
 
-    // 饼图且没选指标 → 走分类模式；选了指标 → 走指标占比模式
-    val pieCategoryMode = chartType == ChartType.PIE && !pieUsesSeries
-    val usesCategory = pieCategoryMode
+    // 饼图仅开放已有查询链路支持的分类占比。
+    val usesCategory = chartType == ChartType.PIE
     // 单序列形态：环形进度是「一个当前值」，热力图是「一种深浅标度」
     val singleSeriesOnly = chartType == ChartType.RING || chartType == ChartType.HEATMAP
 
     val config = ChartCardConfig(
         title = title,
         chartType = chartType,
-        series = series,
+        series = if (usesCategory) emptyList() else series,
         timeWindowDays = timeWindow,
         showLegend = true,
-        // 分类源只在分类模式下有值。指标模式的饼图不该留着一个用不到的
-        // categorySourceKey——那会让「配置里有分类源但图是按指标画的」变成可能
         categorySourceKey = if (usesCategory) CATEGORY_APP_USAGE else null,
         topN = if (usesCategory) topN else null,
         density = density,
     )
-    val validationError = validate(chartType, config, loading)
+    val validationError = validateChartConfig(chartType, config, loading)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -182,14 +171,10 @@ fun ChartConfigDialog(
                         chartType = picked
                         browsing = false
                         picking = null
-                        // 切成单序列形态时裁掉多余的。饼图不再清空序列：
-                        // 它的指标模式正是靠 series 决定的
+                        // 单序列形态裁掉多余项；饼图的草稿序列暂存，切回折线时可继续编辑。
                         series = when {
                             picked == ChartType.RING || picked == ChartType.HEATMAP -> series.take(1)
                             else -> series
-                        }
-                        if (picked == ChartType.PIE) {
-                            pieUsesSeries = series.isNotEmpty()
                         }
                     },
                 )
@@ -207,27 +192,6 @@ fun ChartConfigDialog(
                         selected = topN,
                         onSelect = { topN = it },
                     )
-                }
-
-                // 饼图给一个「按指标占比」的切换：以前它连指标都不能选，
-                // 想画「两个指标的比例」只能放弃饼图
-                if (chartType == ChartType.PIE) {
-                    SectionLabel("数据来源")
-                    FlowOfChips(
-                        items = listOf(
-                            false to "分类占比",
-                            true to "指标占比",
-                        ),
-                        selected = pieUsesSeries,
-                        onSelect = { pieUsesSeries = it },
-                    )
-                    if (pieUsesSeries) {
-                        Text(
-                            "按所选指标在当前时间窗内的合计值分块",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
                 }
 
                 if (!usesCategory) {
@@ -971,17 +935,15 @@ private fun builtinOptions(): List<SeriesOption> =
  *
  * @return 不能保存的原因；可以保存时返回 null
  */
-private fun validate(
+internal fun validateChartConfig(
     type: ChartType,
     config: ChartCardConfig,
     loading: Boolean,
 ): String? {
     if (loading) return "正在读取数据源"
-    // 分类模式的饼图读分类数据，与序列无关。要求它先选一个指标，
-    // 等于让用户填一个最后会被丢掉的字段。
-    // 指标模式（选了指标）就一样要走下面的序列校验
-    if (type == ChartType.PIE && config.categorySourceKey != null && config.series.isEmpty()) {
-        return if (config.categorySourceKey.isBlank()) "分类数据源不可用" else null
+    // 饼图只支持分类查询；不能通过增加序列绕过分类源校验。
+    if (type == ChartType.PIE) {
+        return if (config.isRenderable()) null else "分类数据源不可用"
     }
     val series = config.series
     if (series.isEmpty()) return "请至少选择一个指标"

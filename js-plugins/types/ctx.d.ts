@@ -7,6 +7,8 @@
  * - `shared/src/jvmMain/kotlin/com/lifeboard/shared/plugin/js/JsPluginContextBridge.kt`
  * - `shared/src/jvmMain/kotlin/com/lifeboard/shared/plugin/js/JsHttpBridge.kt`
  * - `shared/src/jvmMain/kotlin/com/lifeboard/shared/plugin/js/JsCryptoBridge.kt`
+ * - `shared/src/jvmMain/kotlin/com/lifeboard/shared/plugin/js/JsWebSocketBridge.kt`
+ * - `shared/src/jvmMain/kotlin/com/lifeboard/shared/plugin/js/JsStreamBridge.kt`
  *
  * 宿主新增函数时这份声明要同步跟着改，否则 TS 会报「属性不存在」而宿主明明支持。
  *
@@ -192,6 +194,146 @@ interface HttpApi {
 }
 
 // ---------------------------------------------------------------------------
+// WebSocket
+// ---------------------------------------------------------------------------
+
+/** 建立连接的可选项。 */
+interface WsOptions {
+    /** 握手请求额外请求头。 */
+    headers?: HeaderMap;
+}
+
+/** `ctx.ws.state()` 的返回值。 */
+interface WsState {
+    /** `closed` 之后 `recv` 不再返回帧，直接抛错。 */
+    state: 'connecting' | 'open' | 'closing' | 'closed';
+
+    /** 已到达、但插件还没取走的帧数。 */
+    queued: number;
+
+    /** 因插件消费过慢被丢弃的帧数。上界为每条连接 512 帧，超出丢最旧。 */
+    dropped: number;
+}
+
+/** 文本帧。 */
+interface WsTextFrame {
+    type: 'text';
+    data: string;
+}
+
+/** 二进制帧。 */
+interface WsBinaryFrame {
+    type: 'binary';
+    bytes: Bytes;
+}
+
+/**
+ * 终态帧，`recv` 拿到它之后连接不再产出任何帧。
+ *
+ * 写法上仍是一条「帧」而不是 reject：对端正常关闭是业务事件，
+ * 不应该以异常形式进入插件的 catch，否则控制流会被打乱。
+ */
+interface WsCloseFrame {
+    type: 'close';
+    code: number;
+    reason: string;
+    /** 对端正常关闭为 true；传输层失败（断网、证书、DNS）为 false。 */
+    clean: boolean;
+    /** 传输层失败原因；正常关闭为 null。 */
+    error: string | null;
+}
+
+type WsFrame = WsTextFrame | WsBinaryFrame | WsCloseFrame;
+
+/**
+ * 宿主提供的 WebSocket 长连接。
+ *
+ * **没有「注册回调」这种用法**：宿主函数只能收发 JSON，JS 函数传不进来。
+ * 改用拉取模型，插件自己循环消费：
+ *
+ * ```js
+ * const id = await ctx.ws.connect(url);
+ * for (;;) {
+ *     const frame = await ctx.ws.recv(id);
+ *     if (frame.type === 'close') break;
+ *     handle(frame);
+ * }
+ * ```
+ */
+interface WsApi {
+    /** 建连。握手成功后 resolve 为连接 id；失败时 reject。 */
+    connect(url: string, options?: WsOptions): Promise<string>;
+
+    /**
+     * 取下一条帧；当前没有帧时挂起，直到帧到达或连接终结。
+     *
+     * 同一条连接**同一时刻只允许一个** `recv` 在等待，第二个会同步抛错。
+     *
+     * @throws 连接不存在、或已关闭且帧已取完
+     */
+    recv(id: string): Promise<WsFrame>;
+
+    /**
+     * 发一条文本帧。
+     *
+     * @throws 连接不在 `open` 状态时同步抛错
+     */
+    send(id: string, text: string): void;
+
+    /**
+     * 发一条二进制帧。字节每个应在 0~255。
+     *
+     * @throws 连接不在 `open` 状态、或字节越界时同步抛错
+     */
+    sendBinary(id: string, bytes: Bytes): void;
+
+    /**
+     * 主动关闭。
+     *
+     * `code` 只允许 `1000` 或 `3000~4999`，`reason` 不超过 123 个 UTF-8 字节——
+     * 这是 WebSocket 协议自身的限制，越界宿主会同步抛错而不是发出去再说。
+     */
+    close(id: string, code?: number, reason?: string): void;
+
+    /** 读连接状态与积压计数，用于自检与日志。 */
+    state(id: string): WsState;
+}
+
+// ---------------------------------------------------------------------------
+// 流式输出
+// ---------------------------------------------------------------------------
+
+/**
+ * 把生成中的片段推给界面。**同步返回，不等待界面**。
+ *
+ * 与 HTTP / WS 的根本区别：那两个是「插件问宿主」，这个是「插件告诉宿主」。
+ * 宿主不做确认、不做排队、也不回传任何结果，所以调用后立刻继续跑自己的逻辑。
+ *
+ * 三条使用约定：
+ * 1. 只在 `onAction` 执行期间推送——别的时机推出去没有任何人接收，内容会被丢掉；
+ * 2. 推的是**新增片段**，不是完整回复。宿主负责拼接，插件不要自己累积后整段重发；
+ * 3. 最终结论必须通过 `onAction` 的返回值（`refreshUi` 的区块）给出。
+ *    增量只是给用户「在动」的感觉，刷新后的区块才是权威结果——两者不一致时以区块为准。
+ *
+ * ```js
+ * for (const chunk of chunks) {
+ *     ctx.stream.emit(chunk);
+ * }
+ * // 完整消息列表由插件自己组装后作为最终结果返回
+ * return { type: 'refreshUi', blocks: blocks };
+ * ```
+ */
+interface StreamApi {
+    /**
+     * 推一段增量文本。
+     *
+     * @param text 片段内容。空串会被忽略；单段过大时宿主按缓冲区上限自然丢弃最旧的片段，
+     *             所以不要把整篇回复一次性当一段推。
+     */
+    emit(text: string): void;
+}
+
+// ---------------------------------------------------------------------------
 // 其它能力
 // ---------------------------------------------------------------------------
 
@@ -201,12 +343,42 @@ interface CryptoApi {
     sha1Base64(bytes: Bytes): string;
     sha256Base64(bytes: Bytes): string;
     sha256Hex(bytes: Bytes): string;
+
+    /** SHA-256，字节进、字节出（32 字节）。需要原始摘要时用这个，不是 hex。 */
+    sha256Bytes(bytes: Bytes): Bytes;
+
+    /**
+     * 安全随机字节，等价于 `crypto.getRandomValues(new Uint8Array(n))`。
+     *
+     * @param length 1~4096，越界宿主抛错
+     */
+    randomBytes(length: number): Bytes;
 }
 
 interface CodecApi {
+    /** 标准 Base64（带 `=` 补齐）。 */
     base64Encode(bytes: Bytes): string;
-    /** 返回字节数组，不是字符串。 */
+    /** 标准 Base64 解码，返回字节数组，不是字符串。 */
     base64Decode(text: string): Bytes;
+
+    /** URL-safe Base64，**不带 `=` 补齐**，与上游 `toBase64Url` 输出一致。 */
+    base64UrlEncode(bytes: Bytes): string;
+    /** URL-safe Base64 解码；带不带 `=` 都能解。非法输入返回空数组。 */
+    base64UrlDecode(text: string): Bytes;
+
+    /**
+     * UTF-8 编码。QuickJS 没有 `TextEncoder`，用这个替代。
+     *
+     * @param text 允许空串（结果是零字节）
+     */
+    utf8Encode(text: string): Bytes;
+
+    /**
+     * UTF-8 解码。QuickJS 没有 `TextDecoder`，用这个替代。
+     *
+     * 与 `TextDecoder` 默认行为一致：非法字节序列解成替换符 `\uFFFD`，不抛错。
+     */
+    utf8Decode(bytes: Bytes): string;
 }
 
 /**
@@ -242,12 +414,36 @@ interface CredentialsApi {
     /** 取不到返回 null。 */
     get(slot: string): string | null;
 
+    /** 写入（覆盖）。 */
+    set(slot: string, value: string | null): void;
+
     put(slot: string, value: string): void;
 
     remove(slot: string): void;
 
     /** 清空本插件全部凭据。 */
     clear(): void;
+}
+
+/**
+ * 会话推送通道：插件 → 宿主。
+ *
+ * 只在会话期间有效。事件是**受控 JSON**，不是任意 UI——宿主只认下面几种，
+ * 未知 `type` 直接报错（便于开发期发现拼写错误），不会静默丢弃。
+ */
+interface SessionApi {
+    /**
+     * 推一条会话事件。
+     *
+     * | type | 字段 | 作用 |
+     * |---|---|---|
+     * | `message` | `role`、`text` | 追加一条完整消息 |
+     * | `delta` | `text` | 追加到当前回复末尾（增量，不是累计） |
+     * | `status` | `text`、`inputEnabled` | 状态文案与输入可用性 |
+     * | `clear` | 无 | 清空消息 |
+     * | `closed` | `reason` | 插件侧关闭会话 |
+     */
+    emit(payload: string): void;
 }
 
 /**
@@ -287,16 +483,22 @@ interface RawRecord {
 }
 
 /**
- * 宿主注入给插件的上下文。
+ * 插件上下文。
  *
  * 插件源码里直接引用裸 `ctx`（不 import），由宿主在每次调用插件方法时注入。
+ *
+ * `session` 只在会话期间可用：宿主在调用 `sessionStart` 之前就挂上
+ * `ctx.session.emit`，`sessionStop` 之后移除。
  */
 interface PluginCtx {
     credentials: CredentialsApi;
     files: FilesApi;
+    session: SessionApi;
     http: HttpApi;
     crypto: CryptoApi;
     codec: CodecApi;
+    ws: WsApi;
+    stream: StreamApi;
     log: LogApi;
 
     /**

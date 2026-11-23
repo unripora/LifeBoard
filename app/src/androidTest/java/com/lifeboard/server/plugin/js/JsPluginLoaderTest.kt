@@ -6,6 +6,7 @@ import com.lifeboard.plugin.api.FetchResult
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -276,7 +277,7 @@ class JsPluginLoaderTest {
     }
 
     @Test
-    fun rescanReleasesOldRuntimes() {
+    fun rescanReusesUnchangedWrapper() {
         val archive = writePackage(
             "demo.jsplugin",
             validManifest(),
@@ -289,9 +290,9 @@ class JsPluginLoaderTest {
 
         assertEquals(1, first.size)
         assertEquals(1, second.size)
-        // 重新扫描后仍是同一个 id，但实例是新的一份
+        // 未变化的共享运行时与宿主信任标记一起复用，已取出的采集器才能看见后续撤销。
         assertEquals("js.test.demo", second[0].pluginId)
-        assertTrue("应当是新的插件实例", first[0] !== second[0])
+        assertSame(first[0], second[0])
     }
 
     // ---------- 信任门禁 ----------

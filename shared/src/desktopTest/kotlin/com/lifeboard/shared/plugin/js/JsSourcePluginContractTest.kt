@@ -1,18 +1,27 @@
 package com.lifeboard.shared.plugin.js
 
 import com.lifeboard.plugin.api.ActionResult
+import com.lifeboard.plugin.api.ApprovalBlock
 import com.lifeboard.plugin.api.AuthState
+import com.lifeboard.plugin.api.ChatRole
+import com.lifeboard.plugin.api.ConversationBlock
 import com.lifeboard.plugin.api.CredentialSpec
 import com.lifeboard.plugin.api.CredentialStore
 import com.lifeboard.plugin.api.FetchResult
+import com.lifeboard.plugin.api.InputBoxBlock
 import com.lifeboard.plugin.api.LoginResult
+import com.lifeboard.plugin.api.MessageListBlock
 import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.plugin.api.MetricSample
 import com.lifeboard.plugin.api.MetricSpec
 import com.lifeboard.plugin.api.PluginContext
 import com.lifeboard.plugin.api.PluginHealth
 import com.lifeboard.plugin.api.RawRecord
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -77,6 +86,9 @@ class JsSourcePluginContractTest {
     ): JsSourcePlugin {
         val runtime = JsPluginRuntime.create(PLUGIN_ID)
         val contextRef = arrayOfNulls<JsPluginContextBridge>(1)
+        // 增量桥接要在插件实例之前装好，而它的接收方正是那个实例：
+        // 入口脚本顶层就 emit 时实例还不存在，按「无人接收」丢弃
+        val streamRef = arrayOfNulls<JsSourcePlugin>(1)
 
         val startResult = runtime.start(
             modules = extraModules + mapOf("main.js" to mainJs),
@@ -87,7 +99,10 @@ class JsSourcePluginContractTest {
                 pluginIdProvider = { PLUGIN_ID },
             )
             contextRef[0] = bridge
-            CompositeHostDispatcher(listOf(bridge.functionNames() to bridge))
+            val stream = JsStreamBridge { text -> streamRef[0]?.emitStreamDelta(text) }
+            CompositeHostDispatcher(
+                listOf(bridge.functionNames() to bridge, stream.functionNames() to stream),
+            )
         }
 
         check(startResult.isSuccess) {
@@ -105,7 +120,7 @@ class JsSourcePluginContractTest {
             // 真实加载器在这里注入「本次调用的 context」，测试直接构造时
             // 桥接已经持有 fakeContext，无需再绑定
             bindContext = { },
-        )
+        ).also { streamRef[0] = it }
     }
 
     // ---- 登录 ----
@@ -275,6 +290,138 @@ class JsSourcePluginContractTest {
 
         val result = runBlocking { plugin.onAction(fakeContext, "sync") }
         assertTrue("实际：$result", result is ActionResult.TriggerSync)
+    }
+
+    @Test
+    fun onActionReceivesInputValue() {
+        val plugin = buildPlugin(
+            """
+            export function onAction(actionId, value) {
+                return { type: 'showMessage', text: actionId + ':' + (value === null ? 'null' : value) }
+            }
+            """.trimIndent()
+        )
+
+        val result = runBlocking { plugin.onAction(fakeContext, "send", "你好") }
+        assertEquals("send:你好", (result as ActionResult.ShowMessage).text)
+
+        // 按钮类动作不带文本，必须显式传 null 而不是空串——
+        // 插件据此区分「用户发了空消息」与「不是输入类动作」
+        val button = runBlocking { plugin.onAction(fakeContext, "sync") }
+        assertEquals("sync:null", (button as ActionResult.ShowMessage).text)
+    }
+
+    /**
+     * 增量片段按推送顺序到达，空串不占位。
+     *
+     * 订阅必须在调用前完成：热流没有重放，晚一步就丢掉开头几段——
+     * 这不是实现细节，而是调用方（ViewModel）遵守的约定，所以在这里钉住。
+     */
+    @Test
+    fun streamEmitsIncrementalText() = runBlocking {
+        val plugin = buildPlugin(
+            """
+            export function onAction(actionId) {
+                ctx.stream.emit('你');
+                ctx.stream.emit('');
+                ctx.stream.emit('好');
+                return { type: 'refreshUi', blocks: [] }
+            }
+            """.trimIndent()
+        )
+
+        val deltas = mutableListOf<String>()
+        // UNDISPATCHED：collect 直接跑到挂起点，订阅在调用发起前就已注册
+        val job = launch(start = CoroutineStart.UNDISPATCHED) {
+            plugin.streamDeltas.collect { deltas += it }
+        }
+
+        plugin.onAction(fakeContext, "chat")
+
+        // 投递经过一次调度，等片段落到收集端
+        withTimeout(2_000) { while (deltas.size < 2) delay(5) }
+        job.cancel()
+
+        assertEquals("片段应按推送顺序到达，空串被丢弃", listOf("你", "好"), deltas)
+    }
+
+    @Test
+    fun detailUiParsesSessionBlocks() {
+        val plugin = buildPlugin(
+            """
+            export function detailUi() {
+                return [
+                    { type: 'messageList', messages: [
+                        { role: 'user', text: '你好', timeLabel: '10:00' },
+                        { role: 'assistant', text: '在的', pending: true },
+                        { role: 'system', text: '已连接' }
+                    ]},
+                    { type: 'inputBox', actionId: 'send', placeholder: '说点什么' },
+                    { type: 'approval', title: '执行 rm -rf？', detail: '危险操作',
+                      options: [{ label: '允许', actionId: 'allow', primary: true },
+                                { label: '拒绝', actionId: 'deny' }] },
+                    { type: 'approval', title: '等待对方确认', options: [], waiting: true },
+                    // 没有 actionId 的输入框提交无门，应当被丢弃
+                    { type: 'inputBox' }
+                ]
+            }
+            """.trimIndent()
+        )
+
+        val blocks = runBlocking { plugin.detailUi(fakeContext) }
+        assertEquals("实际：$blocks", 4L, blocks.size.toLong())
+
+        val list = blocks[0] as MessageListBlock
+        assertEquals(ChatRole.USER, list.messages[0].role)
+        assertEquals("10:00", list.messages[0].timeLabel)
+        assertEquals(ChatRole.ASSISTANT, list.messages[1].role)
+        assertTrue(list.messages[1].pending)
+        assertEquals(ChatRole.SYSTEM, list.messages[2].role)
+
+        val input = blocks[1] as InputBoxBlock
+        assertEquals("send", input.actionId)
+        assertEquals("说点什么", input.placeholder)
+        assertEquals("发送", input.submitLabel)
+
+        val approval = blocks[2] as ApprovalBlock
+        assertEquals(2, approval.options.size)
+        assertTrue(approval.options[0].primary)
+        assertTrue(!approval.waiting)
+
+        assertTrue((blocks[3] as ApprovalBlock).waiting)
+    }
+
+    @Test
+    fun detailUiParsesConversationBlock() {
+        val plugin = buildPlugin(
+            """
+            export function detailUi() {
+                return [
+                    { type: 'conversation', sessionId: 'main', title: '远程会话',
+                      placeholder: '说点什么', submitLabel: '发送', emptyHint: '暂无对话' },
+                    // 缺省字段走宿主默认值
+                    { type: 'conversation', sessionId: 'side' },
+                    // 没有 sessionId 无法绑定，应当被丢弃
+                    { type: 'conversation', title: '无主会话' }
+                ]
+            }
+            """.trimIndent()
+        )
+
+        val blocks = runBlocking { plugin.detailUi(fakeContext) }
+        assertEquals("实际：$blocks", 2L, blocks.size.toLong())
+
+        val main = blocks[0] as ConversationBlock
+        assertEquals("main", main.sessionId)
+        assertEquals("远程会话", main.title)
+        assertEquals("说点什么", main.placeholder)
+        assertEquals("暂无对话", main.emptyHint)
+
+        val side = blocks[1] as ConversationBlock
+        assertEquals("side", side.sessionId)
+        assertEquals("输入消息", side.placeholder)
+        assertEquals("发送", side.submitLabel)
+        assertEquals("还没有消息", side.emptyHint)
     }
 
     // ---- 可选实现与异常兜底 ----
@@ -470,7 +617,7 @@ class JsSourcePluginContractTest {
  * 只覆盖适配器会用到的能力：凭据放内存 Map，原始记录与历史指标放内存表。
  * 文件通道走真实磁盘——目录穿越的拦截逻辑在真实文件系统上才有意义。
  */
-private class FakePluginContext(
+internal class FakePluginContext(
     override val pluginId: String,
     val dir: File,
 ) : PluginContext {

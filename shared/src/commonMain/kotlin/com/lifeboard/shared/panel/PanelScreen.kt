@@ -882,7 +882,7 @@ private fun MetricSourcePickerDialog(
  * 实时让位。松手时才提交最终顺序。
  */
 @Stable
-private class CardDragState(
+class CardDragState(
     private var onDrop: (from: Int, to: Int) -> Unit,
 ) {
     /** 正在拖的下标；null 表示没在拖 */
@@ -994,7 +994,7 @@ private class CardDragState(
 }
 
 @Composable
-private fun rememberCardDrag(
+internal fun rememberCardDrag(
     count: Int,
     onDrop: (from: Int, to: Int) -> Unit,
 ): CardDragState {
@@ -1018,7 +1018,7 @@ private fun rememberCardDrag(
  * 只在 [enabled] 时挂手势：非编辑态长按不应该有任何反应，
  * 否则用户按着卡片想滚动列表会突然开始拖。
  */
-private fun Modifier.dragHandle(
+internal fun Modifier.dragHandle(
     enabled: Boolean,
     index: Int,
     count: Int,

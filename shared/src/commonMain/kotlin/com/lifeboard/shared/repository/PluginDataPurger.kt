@@ -1,6 +1,5 @@
 package com.lifeboard.shared.repository
 
-import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.shared.log.AppLogger
 
 /**
@@ -22,8 +21,8 @@ import com.lifeboard.shared.log.AppLogger
  * 某张表也可能本来就没有该插件的行。任何一步失败都不该让后面的步骤跳过——
  * 尤其是「凭据没删掉」这种后果，比「历史数据多留了几行」严重得多。
  *
- * @param metricKeys 插件声明的指标。插件已被卸载时传空：那时拿不到声明，
- *   只能保证条目/痕迹/元数据这几张按 pluginId 索引的表被清掉
+ * @param metricKeys 保留旧签名供调用方兼容；删除指标与健康度现按插件 ID 前缀处理，
+ *   因此不依赖当前 manifest 声明，历史上已移除的指标也会清理
  */
 class PluginDataPurger(
     private val pluginStore: PluginStore,
@@ -32,16 +31,14 @@ class PluginDataPurger(
     private val deleteDataDir: (pluginId: String) -> Unit,
 ) {
 
+    @Suppress("UNUSED_PARAMETER")
     suspend fun purge(pluginId: String, metricKeys: Collection<String>) {
         step("删除私有目录") { deleteDataDir(pluginId) }
         step("清除凭据") { clearCredentials(pluginId) }
 
-        // metric / source_health 没有 pluginId 列，只能按拼好的 sourceKey 逐个删
-        metricKeys.distinct().forEach { key ->
-            val sourceKey = SourceRef.pluginKey(pluginId, key)
-            step("删除指标 $sourceKey") { metricStore.deleteMetricsBySource(sourceKey) }
-            step("删除健康度 $sourceKey") { metricStore.deleteSourceHealth(sourceKey) }
-        }
+        // metric / source_health 没有 pluginId 列；按固定前缀删除可覆盖已从 manifest 移除的指标
+        step("删除插件全部指标") { metricStore.deleteMetricsByPlugin(pluginId) }
+        step("删除插件全部健康度") { metricStore.deleteSourceHealthByPlugin(pluginId) }
         step("删除指标元数据") { metricStore.deleteMetricMetaByPlugin(pluginId) }
         step("删除原始条目") { pluginStore.deleteRawRecordsByPlugin(pluginId) }
         step("删除查询痕迹") { pluginStore.deleteMetricQueriesByPlugin(pluginId) }

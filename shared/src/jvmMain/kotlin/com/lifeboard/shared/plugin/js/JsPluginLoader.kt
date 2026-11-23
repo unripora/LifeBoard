@@ -55,6 +55,14 @@ class JsPluginLoader(
      */
     private val httpTokenSeq = AtomicLong(0)
 
+    /**
+     * WebSocket 连接 id / 异步 token 的全局序号。
+     *
+     * 与 [httpTokenSeq] 分开，避免两类 token 落在同一串空间里，
+     * 排查日志时分不清是哪个桥发起的。
+     */
+    private val wsTokenSeq = AtomicLong(0)
+
     @Volatile
     private var entries: List<Entry> = emptyList()
 
@@ -132,6 +140,7 @@ class JsPluginLoader(
                     if (!seenIds.add(pluginId)) {
                         // 后加载的重复项直接释放，不进入 entries
                         result.entry.httpBridge?.cancelAll()
+                        result.entry.wsBridge?.cancelAll()
                         result.entry.runtime.close()
                         bad += BrokenJsPlugin(
                             result.entry.plugin.archiveName,
@@ -173,6 +182,7 @@ class JsPluginLoader(
         previous.forEach { (archiveName, old) ->
             if (archiveName !in reused) {
                 runCatching { old.httpBridge?.cancelAll() }
+                runCatching { old.wsBridge?.cancelAll() }
                 runCatching { old.runtime.close() }
             }
         }
@@ -190,6 +200,7 @@ class JsPluginLoader(
     fun closeAll() {
         entries.forEach {
             it.httpBridge?.cancelAll()
+            it.wsBridge?.cancelAll()
             it.runtime.close()
         }
         entries = emptyList()
@@ -201,7 +212,7 @@ class JsPluginLoader(
      * 顺序固定为「解包 → 读 manifest → 算哈希 → 信任判定 → 执行入口脚本」，
      * 把信任判定放在执行之前，未信任的包一行脚本都不会跑。
      *
-     * @param reusable 上一轮加载的同一个包。内容哈希一致且仍受信任时直接复用它，
+     * @param reusable 上一轮加载的同一个包。内容哈希与 manifest 都一致且仍受信任时直接复用它，
      *   不再新建运行时——重扫是很频繁的动作，每次都重建会让在途调用全部失效。
      */
     private fun loadOne(
@@ -297,14 +308,14 @@ class JsPluginLoader(
                 TrustVerdict.Trusted -> Unit
             }
 
-            // 包没变、仍受信任 —— 直接交出上一轮的实例。
-            //
-            // 判断依据是内容哈希：它由包内全部文件算出，包被替换必定变化。
-            // 复用不只是省一次解包：运行时长着的 QuickJS 堆、已建立的
-            // HTTP 会话与 Cookie 都还在，用户不会因为「后台重扫了一次」
-            // 就掉登录态。
-            if (reusable != null && reusable.contentHash == contentHash) {
-                AppLogger.debug("复用已加载的 JS 插件 ${manifest.id}（包未变化）")
+            // 信任指纹刻意不包含 manifest（例如只改描述不应要求重新信任），
+            // 但运行时行为和对外声明取决于 manifest：入口、指标、凭据等变化都要重建。
+            // 因此在信任校验通过后，独立比较 manifest 决定是否复用。
+            if (reusable != null &&
+                reusable.contentHash == contentHash &&
+                reusable.manifest == manifest
+            ) {
+                AppLogger.debug("复用已加载的 JS 插件 ${manifest.id}（脚本与 manifest 均未变化）")
                 return LoadResult.Success(reusable)
             }
 
@@ -334,7 +345,11 @@ class JsPluginLoader(
         val contextRef = ContextHolder()
 
         val httpHolder = arrayOfNulls<JsHttpBridge>(1)
+        val wsHolder = arrayOfNulls<JsWebSocketBridge>(1)
         val bridgeHolder = arrayOfNulls<JsPluginContextBridge>(1)
+        // 增量的接收方是 JsSourcePlugin，它要等 start 之后才构造出来。
+        // 入口脚本在模块顶层就 emit 是允许的，那时没有实例，按「无人接收」丢弃。
+        val streamHolder = arrayOfNulls<JsSourcePlugin>(1)
 
         val startResult = runtime.start(
             modules = sources,
@@ -351,14 +366,28 @@ class JsPluginLoader(
                 tokenProvider = { "js#${httpTokenSeq.incrementAndGet()}" },
             )
             val crypto = JsCryptoBridge()
+            // WebSocket 桥同样只持有 runtime：OkHttp 回调在别的线程，
+            // 帧统一投回插件专用线程再落地 Promise
+            val ws = JsWebSocketBridge(
+                runtime = runtime,
+                tokenProvider = { "ws#${wsTokenSeq.incrementAndGet()}" },
+            )
             httpHolder[0] = http
+            wsHolder[0] = ws
             bridgeHolder[0] = contextBridge
+
+            val stream = JsStreamBridge { text -> streamHolder[0]?.emitStreamDelta(text) }
+            // 会话事件同样落在 JsSourcePlugin 上，复用上面的 holder
+            val session = JsSessionBridge { event -> streamHolder[0]?.emitSessionUiEvent(event) }
 
             CompositeHostDispatcher(
                 listOf(
                     contextBridge.functionNames() to contextBridge,
                     http.functionNames() to http,
                     crypto.functionNames() to crypto,
+                    ws.functionNames() to ws,
+                    stream.functionNames() to stream,
+                    session.functionNames() to session,
                 )
             )
         }
@@ -386,6 +415,7 @@ class JsPluginLoader(
             bindContext = { ctx -> contextRef.set(ctx) },
             declaredApiVersion = manifest.apiVersion,
         )
+        streamHolder[0] = plugin
 
         return LoadResult.Success(
             Entry(
@@ -396,7 +426,9 @@ class JsPluginLoader(
                 ),
                 runtime = runtime,
                 httpBridge = httpHolder[0],
+                wsBridge = wsHolder[0],
                 contentHash = contentHash,
+                manifest = manifest,
             )
         )
     }
@@ -406,6 +438,8 @@ class JsPluginLoader(
         val plugin: JsLoadedPlugin,
         val runtime: JsPluginRuntime,
         val httpBridge: JsHttpBridge?,
+        /** 长连接桥；卸载时必须 cancelAll，否则后台还挂着未关闭的 socket */
+        val wsBridge: JsWebSocketBridge?,
         /**
          * 包内容的 sha256。
          *
@@ -414,6 +448,8 @@ class JsPluginLoader(
          * 而重建会把正在被调用的运行时掐掉。
          */
         val contentHash: String,
+        /** Manifest 不参与信任指纹，但其运行元数据变化时必须重建实例。 */
+        val manifest: JsPluginManifest,
     )
 
     private sealed interface LoadResult {

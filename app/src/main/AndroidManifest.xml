@@ -12,6 +12,8 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- 远程 Agent 长连接属于数据同步型前台服务 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.VIBRATE" />
@@ -106,6 +108,12 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="用户在设定时段未完成任务时播放闹钟铃声，属一次性短时提醒" />
         </service>
+
+        <!-- 插件会话：前台服务 + 常驻通知，避免息屏后长连接被回收（任务 2.3） -->
+        <service
+            android:name="com.lifeboard.server.remote.RemoteConnectionService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <!-- 提醒闹钟触发 -->
         <receiver

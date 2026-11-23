@@ -5,7 +5,13 @@ import com.lifeboard.plugin.api.AuthState
 import com.lifeboard.plugin.api.LoginResult
 import com.lifeboard.plugin.api.MetricSeries
 import com.lifeboard.plugin.api.PluginHealth
+import com.lifeboard.plugin.api.SessionAction
+import com.lifeboard.plugin.api.SessionConfig
+import com.lifeboard.plugin.api.SessionEvent
+import com.lifeboard.plugin.api.SessionUiEvent
 import com.lifeboard.plugin.api.UiBlock
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 
 /**
  * 插件的**业务调用**契约。
@@ -71,8 +77,42 @@ interface PluginInvoker {
      * 执行详情页上某个交互。
      *
      * @param actionId 来自 [UiBlock] 里的 action 标识
+     * @param value 输入类动作携带的用户文本；按钮类动作传 `null`
      */
-    suspend fun onAction(pluginId: String, actionId: String): ActionResult
+    suspend fun onAction(pluginId: String, actionId: String, value: String? = null): ActionResult
+
+    /**
+     * 插件在调用过程中推送的文本增量。
+     *
+     * 默认空流：绝大多数插件一次返回结果，没有中间状态。[StreamingSourcePlugin]
+     * 的实现才真正推送。调用方应在**发起调用前**订阅（热流、无重放），
+     * 并在调用结束后取消订阅。
+     */
+    fun streamDeltas(pluginId: String): Flow<String> = emptyFlow()
+
+    /**
+     * 启动会话（详情页 `conversation` 区块使用）。
+     *
+     * 默认返回 false：绝大多数插件没有会话，调用方据此保持「会话未连接」。
+     * 会话与采集是两条独立链路，互不影响。
+     */
+    suspend fun sessionStart(pluginId: String, config: SessionConfig): Boolean = false
+
+    /** 把用户操作投递给会话；失败时返回 [SessionAction.Continue] 而不是抛异常 */
+    suspend fun sessionEvent(pluginId: String, event: SessionEvent): SessionAction = SessionAction.Continue
+
+    /** 结束会话；重复调用必须安全 */
+    suspend fun sessionStop(pluginId: String) {}
+
+    /**
+     * 注册会话主动推送监听；`null` 解除。
+     *
+     * 会话期间才有效：插件在 `sessionStart` 之前推的事件会被丢弃。
+     */
+    fun setSessionUiListener(pluginId: String, listener: ((SessionUiEvent) -> Unit)?) {}
+
+    /** 会话的纯文本增量；不支持时返回空流 */
+    fun sessionDeltas(pluginId: String): Flow<String> = emptyFlow()
 
     /** 插件自报的健康状态 */
     suspend fun health(pluginId: String): PluginHealth

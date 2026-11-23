@@ -9,6 +9,7 @@ import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.delay
 
 /**
  * 一个 JS 插件的运行时宿主。
@@ -48,6 +49,20 @@ class JsPluginRuntime private constructor(
     private var closed = false
 
     /**
+     * 最近一次「插件实质推进」的时间戳。
+     *
+     * 推进的定义只有一种：某个挂起的 Promise 落了地（宿主回调完成）。
+     * 它用来支撑「无活动超时」——见 [JsSourcePlugin] 的 invoke 循环。
+     * 空转的 job queue 推进不算推进，否则任何调用都不会超时。
+     */
+    @Volatile
+    private var lastActivityAt: Long = System.currentTimeMillis()
+
+    /** 常驻泵每轮推进前执行的钩子（例如恢复会话上下文绑定）；在专用线程上调用 */
+    @Volatile
+    private var pumpHook: (() -> Unit)? = null
+
+    /**
      * 在专用线程上初始化运行时并装载插件。
      *
      * @param modules 模块名 → 源码
@@ -74,6 +89,9 @@ class JsPluginRuntime private constructor(
 
                     rt.setModules(modules)
                     rt.evaluateModule(entry)
+
+                    // 模块装载完再起泵：顶层代码还没跑之前推进 job queue 没有意义
+                    startPump()
 
                     Result.success(Unit)
                 } catch (e: Throwable) {
@@ -148,6 +166,45 @@ class JsPluginRuntime private constructor(
         post { rt ->
             rt.resolvePromise(token, resultJson, error)
             rt.drainJobs()
+            lastActivityAt = System.currentTimeMillis()
+        }
+    }
+
+    /** 最近一次实质推进（Promise 落地）的时间戳，供无活动超时判定 */
+    fun lastActivityAt(): Long = lastActivityAt
+
+    /**
+     * 设置常驻泵每轮推进前的钩子。
+     *
+     * 泵会在没有调用进入的情况下继续推进 job queue，此时 JS 里的 `ctx.*`
+     * 需要一个「当前上下文」。短时调用只会把上下文绑在自己那一次进入里，
+     * 所以会话期间必须由钩子把会话上下文重新绑上，否则后台循环里的
+     * `ctx.credentials` 之类会读到上一次调用留下的临时实例。
+     */
+    fun setPumpHook(hook: (() -> Unit)?) {
+        pumpHook = hook
+    }
+
+    /**
+     * 常驻泵：按固定间隔推进一次 job queue。
+     *
+     * 为什么需要它：`ctx.ws.recv` 这类宿主函数是拉取模型，插件用
+     * 「后台 async 循环 + await」消费消息。循环的续体只有在 job queue
+     * 被推进时才继续跑，而落地回调并非每次都会自己推进（例如只投递结果的
+     * 回调线程）。没有泵时，后台循环会停在某个 await 上不再前进，
+     * 表现为「连接还在、消息却不再处理」。
+     *
+     * 间隔取 5 ms：单次空转实测 4~6 µs（M0 验证），空转开销约为千分之一 CPU；
+     * 再小会把专用线程压满，再大则后台消息处理出现可感知延迟。
+     * 用协程 `delay` 而不是定时器线程：等待期间不占线程，推进时才回到专用线程。
+     */
+    private fun startPump() {
+        scope.launch {
+            while (true) {
+                delay(PUMP_INTERVAL_MILLIS)
+                runCatching { pumpHook?.invoke() }
+                runCatching { runtime?.drainJobs() }
+            }
         }
     }
 
@@ -169,6 +226,9 @@ class JsPluginRuntime private constructor(
     companion object {
         /** 关停等待上限：超时后放弃，交给 native 中断兜底 */
         private const val CLOSE_TIMEOUT_SECONDS = 5L
+
+        /** 常驻泵的推进间隔（毫秒），取值理由见 [startPump] */
+        private const val PUMP_INTERVAL_MILLIS = 5L
 
         fun create(pluginId: String): JsPluginRuntime = JsPluginRuntime(pluginId)
     }

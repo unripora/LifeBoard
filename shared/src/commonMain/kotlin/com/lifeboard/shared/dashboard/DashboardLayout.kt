@@ -41,9 +41,31 @@ object DashboardLayout {
      * 只在页签表为空时写入默认值。页签非空就视为用户已有布局，一律不动——
      * 这是「用户把面板卡片全删光后，下次启动不会被塞满」的保证。
      * 卡片表单独不判空：用户很可能主动清空某个页签的卡片，那不该触发重建。
+     *
+     * 顺带清掉下线的内置页签（见 [BuiltinTabs.RETIRED_TAB_IDS]）。清理放在这里
+     * 而不是迁移里：迁移只改结构，而「哪个入口不再提供」是产品决策，
+     * 将来还会再变。
      */
-    suspend fun ensureInitialized(store: DashboardStore): List<DashboardTab> =
-        store.ensureInitialized(defaultTabs(), defaultCards())
+    suspend fun ensureInitialized(store: DashboardStore): List<DashboardTab> {
+        val tabs = store.ensureInitialized(defaultTabs(), defaultCards())
+        return pruneRetiredTabs(store, tabs)
+    }
+
+    /**
+     * 删掉已下线的内置页签。
+     *
+     * 先比对再写：每次启动都无条件 delete 会开一次写事务，
+     * 而这个动作一辈子只可能命中一次。
+     */
+    private suspend fun pruneRetiredTabs(
+        store: DashboardStore,
+        tabs: List<DashboardTab>,
+    ): List<DashboardTab> {
+        val retired = tabs.filter { it.tabId in BuiltinTabs.RETIRED_TAB_IDS }
+        if (retired.isEmpty()) return tabs
+        retired.forEach { store.deleteTab(it.tabId) }
+        return tabs.filterNot { it.tabId in BuiltinTabs.RETIRED_TAB_IDS }
+    }
 
     /** 内置页签的默认行，按 [BuiltinTabs.ALL] 的顺序编号 */
     fun defaultTabs(): List<DashboardTab> = BuiltinTabs.ALL.mapIndexed { index, tab ->

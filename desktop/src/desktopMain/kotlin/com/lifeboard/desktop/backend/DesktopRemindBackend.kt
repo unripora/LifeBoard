@@ -24,6 +24,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.time.Clock
+import java.time.LocalDate
 
 /**
  * 桌面端提醒后端（M4-4.5c）。
@@ -58,7 +62,13 @@ class DesktopRemindBackend(
     private val scheduler: com.lifeboard.desktop.schedule.DesktopScheduler,
     private val notifier: Notifier,
     private val appScope: CoroutineScope,
+    private val clock: Clock = Clock.system(Dates.zone),
 ) : RemindBackend {
+
+    private val lifecycleMutex = Mutex()
+    private val ownedTags = mutableSetOf<String>()
+    private val reminderTokens = mutableMapOf<String, Any>()
+    private var scheduledDate: LocalDate? = null
 
     private val tasks get() = stores.taskStore
     private val rules get() = stores.ruleStore
@@ -96,16 +106,19 @@ class DesktopRemindBackend(
         withContext(Dispatchers.IO) { tasks.getEnabled() }
 
     override suspend fun createTask(task: TaskConfig): Long {
-        val id = withContext(Dispatchers.IO) { tasks.save(task) }
-        // 新建后立刻排程，不必等用户去点「重排」。
-        // 只排这一个而不是 rescheduleAll：一次保存不该把所有 tag 全撤了重建
-        scheduleOne(task.copy(id = id))
-        return id
+        return lifecycleMutex.withLock {
+            val id = withContext(Dispatchers.IO) { tasks.save(task) }
+            // 新建也可能发生在跨天恢复后，统一重排，避免只更新新任务却漏掉其他任务。
+            rescheduleAllLocked()
+            id
+        }
     }
 
     override suspend fun deleteTask(id: Long) {
-        withContext(Dispatchers.IO) { tasks.deleteById(id) }
-        cancelTask(id)
+        lifecycleMutex.withLock {
+            withContext(Dispatchers.IO) { tasks.deleteById(id) }
+            cancelTaskLocked(id)
+        }
     }
 
     /**
@@ -115,29 +128,62 @@ class DesktopRemindBackend(
      * 1. **应用启动**——桌面端定时器活在进程内，上次退出时全丢了
      * 2. 规则或任务批量变更
      */
-    override suspend fun rescheduleAll() {
-        // 先清干净：任务可能已被删除或禁用，残留的 tag 会继续按旧时间响
-        scheduler.cancelAll()
+    override suspend fun rescheduleAll() = lifecycleMutex.withLock {
+        rescheduleAllLocked()
+    }
 
-        withContext(Dispatchers.IO) {
-            val all = tasks.getAll()
-            val ruleMap = rules.getAllRules().associateBy { it.id }
-            all.forEach { task ->
-                registerPlan(
-                    RemindPlanner.planTask(
-                        task = task,
-                        ruleSchedule = ruleMap[task.ruleId]?.schedule,
-                    ),
-                )
+    private suspend fun rescheduleAllLocked() {
+        scheduledDate = null
+        cancelOwnedTagsLocked()
+        val now = clock.millis()
+        try {
+            withContext(Dispatchers.IO) {
+                val all = tasks.getAll()
+                val ruleMap = rules.getAllRules().associateBy { it.id }
+                all.forEach { task ->
+                    registerPlan(
+                        RemindPlanner.planTask(task, ruleMap[task.ruleId]?.schedule, nowMillis = now),
+                    )
+                }
             }
+            scheduledDate = dateAt(now)
+        } finally {
+            // 数据库瞬时失败也保留日期检查，不能连后续恢复机会一起丢掉。
+            registerMidnightWatchdog()
         }
     }
 
-    override suspend fun cancelTask(id: Long) {
-        // 时段上限是 MAX_WINDOWS，撤到上限就够（Planner 也只排这么多）
+    private fun dateAt(millis: Long): LocalDate =
+        java.time.Instant.ofEpochMilli(millis).atZone(Dates.zone).toLocalDate()
+
+    /** 午夜和周期检查共用；在锁内复查，避免并发回调重复重排。 */
+    internal suspend fun refreshForDateChange(): Boolean = lifecycleMutex.withLock {
+        if (dateAt(clock.millis()) == scheduledDate) return@withLock false
+        rescheduleAllLocked()
+        true
+    }
+
+    override suspend fun cancelTask(id: Long) = lifecycleMutex.withLock {
+        cancelTaskLocked(id)
+    }
+
+    private suspend fun cancelTaskLocked(id: Long) {
         repeat(RemindPlanner.MAX_WINDOWS) { index ->
-            scheduler.cancel("remind:$id:$index")
+            cancelOwnedTag("remind:$id:$index")
         }
+    }
+
+    private suspend fun cancelOwnedTagsLocked() {
+        ownedTags.toList().forEach { scheduler.cancel(it); scheduler.unregister(it) }
+        ownedTags.clear()
+        reminderTokens.clear()
+    }
+
+    private suspend fun cancelOwnedTag(tag: String) {
+        scheduler.cancel(tag)
+        scheduler.unregister(tag)
+        ownedTags.remove(tag)
+        reminderTokens.remove(tag)
     }
 
     /**
@@ -174,13 +220,6 @@ class DesktopRemindBackend(
 
     // ───────────────────────── 内部 ─────────────────────────
 
-    private suspend fun scheduleOne(task: TaskConfig) {
-        val ruleSchedule = withContext(Dispatchers.IO) {
-            rules.getAllRules().firstOrNull { it.id == task.ruleId }?.schedule
-        }
-        registerPlan(RemindPlanner.planTask(task, ruleSchedule))
-    }
-
     /**
      * 把 [RemindPlanner.Plan] 登记到定时器。
      *
@@ -201,27 +240,68 @@ class DesktopRemindBackend(
         val taskId = plan.taskId
 
         plan.entries.forEach { entry ->
+            val plannedDate = dateAt(entry.triggerAtMillis)
+            val token = Any()
+            reminderTokens[entry.tag] = token
             scheduler.register(entry.tag) {
-                appScope.launch { onTriggered(taskId) }
+                appScope.launch {
+                    lifecycleMutex.withLock {
+                        // 已经排队的旧回调也必须失效，不能穿过取消或重排继续投递。
+                        if (reminderTokens[entry.tag] === token) onTriggeredLocked(taskId, plannedDate)
+                    }
+                }
             }
+            ownedTags += entry.tag
             scheduler.scheduleAt(entry.tag, entry.triggerAtMillis, payload = taskId.toString())
         }
     }
 
+    private suspend fun registerMidnightWatchdog() {
+        val tag = MIDNIGHT_TAG
+        scheduler.register(tag) {
+            appScope.launch { refreshForDateChange() }
+        }
+        ownedTags += tag
+        val now = clock.millis()
+        val nextMidnight = dateAt(now)
+            .plusDays(1)
+            .atStartOfDay(Dates.zone)
+            .toInstant()
+            .toEpochMilli()
+        scheduler.scheduleAt(tag, nextMidnight)
+
+        val driftTag = DATE_WATCHDOG_TAG
+        scheduler.register(driftTag) {
+            appScope.launch {
+                refreshForDateChange()
+            }
+        }
+        ownedTags += driftTag
+        scheduler.scheduleRepeating(driftTag, DATE_WATCHDOG_MINUTES)
+    }
+
     /** 到点后的完整处理，与 Android `RemindReceiver.handle` 一一对应 */
-    private suspend fun onTriggered(taskId: Long) {
+    internal suspend fun onTriggered(taskId: Long, plannedDate: LocalDate) = lifecycleMutex.withLock {
+        onTriggeredLocked(taskId, plannedDate)
+    }
+
+    private suspend fun onTriggeredLocked(taskId: Long, plannedDate: LocalDate) {
+        val currentDate = dateAt(clock.millis())
+        if (currentDate != plannedDate) {
+            if (currentDate != scheduledDate) rescheduleAllLocked()
+            return
+        }
         val result = withContext(Dispatchers.IO) {
-            evaluator.evaluate(taskId, Dates.todayString())
+            val task = tasks.getById(taskId)?.takeIf { it.enabled } ?: return@withContext null
+            evaluator.evaluate(task, currentDate.toString())
         } ?: return
 
         if (result.completed) {
-            // 到点时已完成：收掉未完成气泡即可。
-            // 不补发「完成提醒」——那会在「早就完成、闹钟才响」时冒出无意义提示
+            // 已达成：只收掉旧气泡，不重复投递。
             notifier.cancel(taskId.toInt())
             return
         }
         if (result.task.remindLevel == RemindLevel.NONE) {
-            // 不提醒档位：只落库
             logDelivery(result, RemindLevel.NONE)
             return
         }
@@ -279,6 +359,9 @@ class DesktopRemindBackend(
          * 是为了将来若换成 Windows 原生 Toast，同一个渠道的历史能聚在一起。
          */
         const val CHANNEL_ID = "lifeboard_remind"
+        const val MIDNIGHT_TAG = "remind:midnight-watchdog"
+        const val DATE_WATCHDOG_TAG = "remind:date-watchdog"
+        const val DATE_WATCHDOG_MINUTES = 1L
     }
 
     /** 投递日志，用于排查「到点没响」 */

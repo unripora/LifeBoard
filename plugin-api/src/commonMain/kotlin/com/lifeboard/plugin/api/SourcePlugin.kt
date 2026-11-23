@@ -105,7 +105,12 @@ interface SourcePlugin {
     suspend fun detailUi(context: PluginContext): List<UiBlock> = emptyList()
 
     /**
-     * 用户在详情页点了 [ButtonSpec.actionId] 对应的按钮。
+     * 用户在详情页触发了某个交互。
+     *
+     * 三类来源共用这一个入口：
+     * - [ButtonRowBlock] 的按钮：只带 `actionId`
+     * - [InputBoxBlock] 提交：`actionId` 是输入框的标识，[value] 是用户输入的文本
+     * - [ApprovalBlock] 的选项：只带该项的 `actionId`
      *
      * 宿主会在本方法返回前禁用该按钮，插件不必自己防连点；
      * 但**同一插件可能被并发调用**（两个按钮几乎同时点），需要互斥时请自行加锁。
@@ -113,8 +118,117 @@ interface SourcePlugin {
      * 失败不要抛异常：异常会被宿主兜住并转成一句通用错误，
      * 用户看不到原因。要说明情况请返回 [ActionResult.ShowMessage]。
      *
-     * @param actionId 插件在 [ButtonSpec] 里给出的标识
+     * @param actionId 插件在 [ButtonSpec] / [InputBoxBlock] 里给出的标识
+     * @param value 输入类动作携带的用户文本；非输入类动作为 `null`
      */
-    suspend fun onAction(context: PluginContext, actionId: String): ActionResult =
-        ActionResult.NoOp
+    suspend fun onAction(
+        context: PluginContext,
+        actionId: String,
+        value: String? = null,
+    ): ActionResult = ActionResult.NoOp
+
+    /**
+     * 启动一个交互式会话（例如远程 Agent 对话）。
+     *
+     * 这三条会话方法都是**宿主驱动的生命周期钩子**，不是「一次请求对一次响应」：
+     * 宿主在用户进入会话页时调 [onSessionStart]，之后把用户的每次操作作为
+     * [onSessionEvent] 投递进来，离开页面或超时后调 [onSessionStop]。
+     *
+     * 每次调用只应处理一件事就返回。长时间在线的收发由插件自己的后台循环完成
+     * （宿主会持续推进它，见 `ctx.ws` 的拉取模型）：一次调用长期不返回，
+     * 会把同一插件的其它调用（采集、健康检查）堵在后面。
+     *
+     * 默认不实现，返回 `false`；宿主据此在界面上标注「本插件不支持会话」，
+     * 并且不会再投递后续事件。
+     *
+     * @param config 会话启动参数，键值对由插件自己的协议解释，宿主只原样转交
+     * @return 会话是否成功启动
+     */
+    suspend fun onSessionStart(context: PluginContext, config: SessionConfig): Boolean = false
+
+    /**
+     * 投递一次会话事件（用户输入、审批结果、取消等）。
+     *
+     * 默认视为「不需要特殊处理，会话继续」。插件执行失败也不要抛异常，
+     * 抛出的异常会被宿主兜底吞掉并转成一句通用错误；需要终止会话时
+     * 返回 [SessionAction.Stop] 并说明原因。
+     */
+    suspend fun onSessionEvent(
+        context: PluginContext,
+        event: SessionEvent,
+    ): SessionAction = SessionAction.Continue
+
+    /** 结束会话。宿主保证在页面关闭、插件卸载前调用；默认空实现 */
+    suspend fun onSessionStop(context: PluginContext) {}
+
+    /**
+     * 注册会话主动事件监听器。
+     *
+     * 用途是让插件在**用户没有操作时**也能把消息推给界面（服务端主动来消息、
+     * 后台任务完成）。只在会话期间由宿主注册，会话结束后传 `null` 解除。
+     *
+     * 回调可能发生在插件自己的线程上，实现方必须自行切回主线程再更新界面状态。
+     * 默认空实现：纯拉取型插件不需要主动推送。
+     */
+    fun setSessionUiListener(listener: ((SessionUiEvent) -> Unit)?) {}
+}
+
+/**
+ * 会话启动参数。
+ *
+ * 刻意用「键值对 + 插件自行解释」而不是宿主定义的字段：会话里要传什么
+ * （网关地址、工作区、会话 id）完全取决于插件对接的协议，宿主定义字段
+ * 就等于把某一家协议固化进契约。宿主只负责原样转交。
+ */
+data class SessionConfig(val options: Map<String, String> = emptyMap())
+
+/**
+ * 宿主投递给插件的会话事件。
+ *
+ * @property type 事件类型，语义由插件自己约定（如 `input` / `approval` / `cancel`）
+ * @property payload 事件负载，JSON 文本；宿主不解析
+ */
+data class SessionEvent(val type: String, val payload: String = "")
+
+/** 插件对一次会话事件的处置 */
+sealed interface SessionAction {
+
+    /** 会话继续，宿主无需额外处理 */
+    data object Continue : SessionAction
+
+    /**
+     * 结束会话。
+     *
+     * @property reason 展示给用户的原因
+     */
+    data class Stop(val reason: String) : SessionAction
+}
+
+/**
+ * 插件主动推给会话区块的事件。
+ *
+ * 与 [SessionAction] 的分工：那个是「对宿主事件的应答」，这个是「没人问也要说」。
+ * 结构刻意保持最小——只够驱动消息列表、流式增量与输入可用性，
+ * 不允许插件自定义任意 UI（那会绕开宿主统一的表现层）。
+ */
+sealed interface SessionUiEvent {
+
+    /** 追加一条完整消息 */
+    data class Message(val role: ChatRole, val text: String) : SessionUiEvent
+
+    /**
+     * 追加到当前回复末尾的流式片段。
+     *
+     * 没有进行中的回复时，宿主会新建一条 assistant 消息再接上。
+     */
+    data class Delta(val text: String) : SessionUiEvent
+
+    /** 更新状态文案与输入可用性（如「已连接」「正在生成」） */
+    data class Status(val text: String, val inputEnabled: Boolean) : SessionUiEvent
+
+    /** 清空消息列表（重连后由服务端快照重建时使用） */
+    data object Clear : SessionUiEvent
+
+    /** 会话被插件侧关闭，宿主应停止会话并显示原因 */
+    data class Closed(val reason: String) : SessionUiEvent
 }

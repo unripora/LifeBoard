@@ -58,6 +58,9 @@ interface MetricStore {
     /** 删除某个数据源的全部指标，返回删除行数。源被移除后清理残留 */
     suspend fun deleteMetricsBySource(sourceKey: String): Int
 
+    /** Delete every plugin metric whose source key starts with the exact `PLUGIN_{pluginId}:` prefix. */
+    suspend fun deleteMetricsByPlugin(pluginId: String): Int
+
     // ---- 插件指标元数据 ----
 
     /**
@@ -92,6 +95,9 @@ interface MetricStore {
     suspend fun getAllSourceHealth(): List<SourceHealth>
 
     suspend fun saveSourceHealth(health: SourceHealth)
+
+    /** Delete every plugin health row whose source key starts with the exact `PLUGIN_{pluginId}:` prefix. */
+    suspend fun deleteSourceHealthByPlugin(pluginId: String): Int
 
     /** 删除某个源的健康度记录，与 [deleteMetricsBySource] 配套使用 */
     suspend fun deleteSourceHealth(sourceKey: String): Int

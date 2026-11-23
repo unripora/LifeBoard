@@ -1,0 +1,43 @@
+-- v19 -> v20：新增远程 Agent 的连接配置与会话列表缓存。
+--
+-- ## 为什么建表
+--
+-- 冷启动需要回答「上次连的是哪台机器、停在哪个会话」。
+-- 没有这两张表，每次打开远程页都只能从零开始，用户得重新登录、重新选主机。
+--
+-- ## 为什么只存这些
+--
+-- 评审 RA-08 已定：Host 是唯一权威，首期不在本地建聊天正文镜像，
+-- 也不持久化待发操作和审批句柄。正文与在途状态都能由 Host 快照重建，
+-- 落库只会带来「本地与服务端不一致」的新问题。
+--
+-- token 不进数据库：数据库文件可能被备份/导出，凭据必须走平台安全存储。
+--
+-- ## 为什么 profile 是单行
+--
+-- 首期只支持一个 Server + 一个设备身份；多账号需要独立设计，
+-- 现在留多行只会让「当前生效配置」变得含糊。
+CREATE TABLE `remote_profile` (
+    `id` INTEGER NOT NULL,
+    `serverUrl` TEXT NOT NULL,
+    `deviceId` TEXT NOT NULL,
+    `membershipId` TEXT,
+    `lastHostDeviceId` TEXT,
+    `lastWorkspaceId` TEXT,
+    `lastSessionId` TEXT,
+    `updatedAt` INTEGER NOT NULL,
+    PRIMARY KEY(`id`)
+);
+
+CREATE TABLE `remote_session_cache` (
+    `sessionId` TEXT NOT NULL,
+    `hostDeviceId` TEXT NOT NULL,
+    `title` TEXT,
+    `updatedAt` INTEGER NOT NULL,
+    `running` INTEGER NOT NULL,
+    `blank` INTEGER NOT NULL,
+    PRIMARY KEY(`sessionId`)
+);
+
+CREATE INDEX IF NOT EXISTS `index_remote_session_cache_host`
+    ON `remote_session_cache` (`hostDeviceId`, `updatedAt`);

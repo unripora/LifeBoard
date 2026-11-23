@@ -1,8 +1,10 @@
 package com.lifeboard.shared.plugin.js
 
 import com.lifeboard.jsengine.HostFunctionDispatcher
+import com.lifeboard.shared.plugin.json.PluginJson
 import com.lifeboard.shared.plugin.json.PluginJsonArray
 import java.security.MessageDigest
+import java.security.SecureRandom
 
 /**
  * 把哈希与编解码能力暴露给 JS 的 `ctx.crypto.*` / `ctx.codec.*`。
@@ -23,27 +25,61 @@ import java.security.MessageDigest
  * RC4 不在 JDK 里（且已被认为不安全），但它只是个 256 字节的状态机，
  * 用纯 JS 实现既短又快（每次加密几十字节），所以留在插件侧实现。
  * 本桥只暴露「字节 → 摘要」这一层，不碰具体协议。
+ *
+ * ## 为什么还要 randomBytes 与字节形态编解码
+ *
+ * 上游密码栈（`@dsh-remote/crypto`）用 `crypto.getRandomValues` 取随机数、
+ * 用 `btoa`/`Buffer` 做 base64、用 `TextEncoder` 做 UTF-8。QuickJS 三者都没有。
+ * 缺了它们，插件只能自己手写，而随机数手写就等于没有随机性。
+ * 所以这里补齐这四类基础能力，让上游代码只需注入一层薄 polyfill 即可原样运行。
+ *
+ * 摘要类接口一律「字节进」，不提供字符串进：字符串到字节的编码由插件决定
+ * （UTF-8 / GBK），宿主替它决定会在非 ASCII 输入上产生难以察觉的不一致。
  */
 class JsCryptoBridge : HostFunctionDispatcher {
 
     fun functionNames(): List<String> = JsHostFunctions.CRYPTO
 
     override fun invoke(name: String, argsJson: String): String {
-        val args = runCatching { PluginJsonArray(argsJson) }.getOrElse { return error("参数不是数组") }
+        val args = runCatching { PluginJsonArray(argsJson) }
+            .getOrElse { return HostFunctionDispatcher.error("参数不是数组") }
         return try {
             when (name) {
                 "ctx.crypto.md5Hex" -> md5Hex(bytesArg(args, 0))
                 "ctx.crypto.sha1Base64" -> sha1Base64(bytesArg(args, 0))
                 "ctx.crypto.sha256Base64" -> sha256Base64(bytesArg(args, 0))
                 "ctx.crypto.sha256Hex" -> sha256Hex(bytesArg(args, 0))
+                "ctx.crypto.sha256Bytes" -> bytesToJson(digest("SHA-256", bytesArg(args, 0)))
+                "ctx.crypto.randomBytes" -> randomBytes(countArg(args, 0))
                 "ctx.codec.base64Encode" -> base64Encode(bytesArg(args, 0))
-                "ctx.codec.base64Decode" -> base64Decode(stringArg(args, 0))
-                else -> error("unknown crypto function: $name")
+                "ctx.codec.base64Decode" -> bytesToJson(base64Decode(stringArg(args, 0)))
+                "ctx.codec.base64UrlEncode" -> base64UrlEncode(bytesArg(args, 0))
+                "ctx.codec.base64UrlDecode" -> bytesToJson(base64UrlDecode(stringArg(args, 0)))
+                "ctx.codec.utf8Encode" -> bytesToJson(textArg(args, 0).toByteArray(Charsets.UTF_8))
+                "ctx.codec.utf8Decode" -> PluginJson.quote(String(bytesArg(args, 0), Charsets.UTF_8))
+                else -> HostFunctionDispatcher.error("unknown crypto function: $name")
             }
         } catch (e: IllegalArgumentException) {
-            error(e.message ?: "参数非法")
+            HostFunctionDispatcher.error(e.message ?: "参数非法")
         }
     }
+
+    /**
+     * 取第一个参数当「字节数」。
+     *
+     * 上界 4096 是为了挡住插件把长度写成变量后一路放大到内存耗尽的低级错误；
+     * 密码场景里最长的是握手 payload（约 1KB 级），4096 足够用。
+     */
+    private fun countArg(args: PluginJsonArray, index: Int): Int {
+        val n = args.optInt(index, -1)
+        require(n in 1..MAX_RANDOM_BYTES) { "字节数必须在 1..$MAX_RANDOM_BYTES，实际为 $n" }
+        return n
+    }
+
+    /** 取第一个参数当普通字符串，**允许空串**（空串的 UTF-8 是零字节，合法）。 */
+    private fun textArg(args: PluginJsonArray, index: Int): String =
+        args.optStringOrNull(index)
+            ?: throw IllegalArgumentException("第 ${index + 1} 个参数需要是字符串")
 
     /**
      * 取第一个参数当字节序列。
@@ -64,9 +100,10 @@ class JsCryptoBridge : HostFunctionDispatcher {
         return out
     }
 
+    /** 取第一个参数当字符串。空串合法（空 base64 解出零字节），缺参数不算。 */
     private fun stringArg(args: PluginJsonArray, index: Int): String =
-        args.optStringOrNull(index).takeUnless { it.isNullOrEmpty() }
-            ?: throw IllegalArgumentException("第 ${index + 1} 个参数需要是非空字符串")
+        args.optStringOrNull(index)
+            ?: throw IllegalArgumentException("第 ${index + 1} 个参数需要是字符串")
 
     private fun md5Hex(input: ByteArray): String =
         digest("MD5", input).joinToString("") { "%02X".format(it) }
@@ -93,15 +130,58 @@ class JsCryptoBridge : HostFunctionDispatcher {
         java.util.Base64.getEncoder().encodeToString(input)
 
     /**
-     * 标准 Base64 解码，返回给 JS 的**字节数组 JSON 文本**（如 `[1,2,3]`）。
+     * 标准 Base64 解码，返回**字节数组**。
      *
      * **错误输入返回空数组而不是抛异常**：插件从网络拿到的值可能被截断，
      * 让它自己判断「解出来是空的」比让宿主抛错更好处理。
      */
-    private fun base64Decode(input: String): String {
-        val bytes = runCatching {
-            java.util.Base64.getDecoder().decode(input)
-        }.getOrDefault(ByteArray(0))
-        return bytes.joinToString(prefix = "[", postfix = "]") { (it.toInt() and 0xff).toString() }
+    private fun base64Decode(input: String): ByteArray =
+        runCatching { java.util.Base64.getDecoder().decode(input) }
+            .getOrDefault(ByteArray(0))
+
+    /**
+     * URL-safe Base64 编码，**不带 `=` 补齐**（RFC 4648 §5）。
+     *
+     * 与上游 `toBase64Url` 的输出必须逐字节一致：Noise 协议把公钥、密文
+     * 放进取值参数时，补齐符会与 URL 编码/签名逻辑互相干扰，所以不带补齐。
+     */
+    private fun base64UrlEncode(input: ByteArray): String =
+        java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(input)
+
+    /**
+     * URL-safe Base64 解码。
+     *
+     * JDK 的解码器同时接受带补齐与不带补齐的输入，因此对端多给几个 `=`
+     * 也能解开；非法字符按 [base64Decode] 的约定返回空数组。
+     */
+    private fun base64UrlDecode(input: String): ByteArray =
+        runCatching { java.util.Base64.getUrlDecoder().decode(input) }
+            .getOrDefault(ByteArray(0))
+
+    /**
+     * 安全随机字节。
+     *
+     * 用共享的 [SecureRandom] 实例：它本身线程安全，反复 `new` 反而会因
+     * 重新播种而拖慢首次调用（Android 上尤其明显）。
+     */
+    private fun randomBytes(count: Int): String =
+        bytesToJson(ByteArray(count).also { secureRandom.nextBytes(it) })
+
+    /** 字节 → JS 的 `number[]` JSON 文本（紧凑写法，不带空格）。 */
+    private fun bytesToJson(bytes: ByteArray): String =
+        bytes.joinToString(separator = ",", prefix = "[", postfix = "]") {
+            (it.toInt() and 0xff).toString()
+        }
+
+    private companion object {
+        /**
+         * `randomBytes` 的上界。
+         *
+         * 密码场景里最长的是握手 payload（约 1KB 级），4096 足够；
+         * 设上下界是为了挡住「长度写成变量后一路放大到内存耗尽」这类低级错误。
+         */
+        const val MAX_RANDOM_BYTES = 4096
+
+        val secureRandom: SecureRandom = SecureRandom()
     }
 }

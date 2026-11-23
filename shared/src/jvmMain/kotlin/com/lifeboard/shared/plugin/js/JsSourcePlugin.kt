@@ -11,12 +11,21 @@ import com.lifeboard.plugin.api.MetricSpec
 import com.lifeboard.plugin.api.PluginApi
 import com.lifeboard.plugin.api.PluginContext
 import com.lifeboard.plugin.api.PluginHealth
+import com.lifeboard.plugin.api.SessionAction
+import com.lifeboard.plugin.api.SessionConfig
+import com.lifeboard.plugin.api.SessionEvent
+import com.lifeboard.plugin.api.SessionUiEvent
 import com.lifeboard.plugin.api.SourcePlugin
 import com.lifeboard.plugin.api.UiBlock
 import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.shared.plugin.json.PluginJson
 import com.lifeboard.shared.plugin.json.PluginJsonObject
+import com.lifeboard.shared.platform.StreamingSourcePlugin
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.atomic.AtomicLong
@@ -62,7 +71,13 @@ class JsSourcePlugin(
      * 混用会让上层拿到的版本号既不能判断兼容性也没有别的用处。
      */
     declaredApiVersion: Int = 0,
-) : SourcePlugin {
+    /**
+     * 单次调用的「无进展」等待上限。
+     *
+     * 抽成参数只是为了测试不必真的等 60 秒；生产一律用默认值。
+     */
+    private val inactivityTimeoutMillis: Long = DEFAULT_INACTIVITY_TIMEOUT_MILLIS,
+) : SourcePlugin, StreamingSourcePlugin {
 
     override val apiVersion: Int = PluginApi.VERSION
 
@@ -101,6 +116,62 @@ class JsSourcePlugin(
      */
     @Volatile
     private var collectDate: String = ""
+
+    /**
+     * 当前活跃会话使用的上下文；非会话期间为 null。
+     *
+     * 会话的后台循环在两次调用之间也会被常驻泵推进，那时需要在被推进前
+     * 把上下文重新绑成会话的，否则循环里的 `ctx.*` 会读到上一个短时调用
+     * 留下的临时实例（[PluginContext] 是每次调用构造的）。
+     */
+    @Volatile
+    private var sessionContext: PluginContext? = null
+
+    /**
+     * 增量输出的中转缓冲。
+     *
+     * 用 `DROP_OLDEST` 而不是挂起：`ctx.stream.emit` 是同步宿主函数，调用发生在
+     * 插件单线程上，不能在这里等界面消费——跟不上时宁可丢掉最早的片段，
+     * 也不能把插件卡住。256 条足以覆盖一屏文字的分片。
+     */
+    private val streamBuffer = MutableSharedFlow<String>(
+        replay = 0,
+        extraBufferCapacity = 256,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+
+    override val streamDeltas: SharedFlow<String> = streamBuffer.asSharedFlow()
+
+    /**
+     * 由 `ctx.stream.emit` 桥接调用，把一段文本推给订阅方（详情页）。
+     *
+     * 空串直接丢弃：它不改变界面内容，却会让订阅方以为收到一次更新。
+     */
+    internal fun emitStreamDelta(text: String) {
+        if (text.isNotEmpty()) streamBuffer.tryEmit(text)
+    }
+
+    /**
+     * 会话主动事件的接收方；由宿主在会话开始时注册。
+     *
+     * `@Volatile`：JS 插件在自己的线程上调用 `ctx.session.emit`，
+     * 而注册/解除发生在宿主线程，必须保证可见性。
+     */
+    @Volatile
+    private var sessionUiListener: ((SessionUiEvent) -> Unit)? = null
+
+    override fun setSessionUiListener(listener: ((SessionUiEvent) -> Unit)?) {
+        sessionUiListener = listener
+    }
+
+    /** 由 `ctx.session.emit` 桥接调用；没有监听方时直接丢弃 */
+    internal fun emitSessionUiEvent(event: SessionUiEvent) {
+        sessionUiListener?.invoke(event)
+    }
+
+    init {
+        runtime.setPumpHook { sessionContext?.let(bindContext) }
+    }
 
     override suspend fun login(
         context: PluginContext,
@@ -150,10 +221,64 @@ class JsSourcePlugin(
         return JsTypeConverter.toUiBlocks(raw)
     }
 
-    override suspend fun onAction(context: PluginContext, actionId: String): ActionResult {
-        val raw = invoke(context, "onAction", "[${PluginJson.quote(actionId)}]")
+    override suspend fun onAction(
+        context: PluginContext,
+        actionId: String,
+        value: String?,
+    ): ActionResult {
+        // 第二个实参固定占位：JS 侧 onAction(actionId) 只写一个参数也能正常工作，
+        // 需要输入文本时再取第二个——不必为了可选参数维护两套签名
+        val valueJson = if (value == null) "null" else PluginJson.quote(value)
+        val raw = invoke(context, "onAction", "[${PluginJson.quote(actionId)}, $valueJson]")
             ?: return ActionResult.NoOp
         return JsTypeConverter.toActionResult(raw)
+    }
+
+    /**
+     * 启动会话：转发给 JS 的 `sessionStart(config)`。
+     *
+     * JS 侧必须**显式** `return true` 才算启动成功。不把「没写返回值」当成成功，
+     * 是因为「插件没实现会话」与「实现了但启动失败」在上层都表现为不可用，
+     * 而误判成成功会让 UI 进入一个永远收不到消息的空对话。
+     */
+    override suspend fun onSessionStart(
+        context: PluginContext,
+        config: SessionConfig,
+    ): Boolean {
+        val options = PluginJsonObject().apply {
+            config.options.forEach { (k, v) -> put(k, v) }
+        }
+        sessionContext = context
+        val raw = invoke(context, "sessionStart", "[$options]")
+        if (raw == null) {
+            // 未实现或执行失败：不留会话上下文，泵也就不再为它绑上下文
+            sessionContext = null
+            return false
+        }
+        return raw.trim() == "true"
+    }
+
+    override suspend fun onSessionEvent(
+        context: PluginContext,
+        event: SessionEvent,
+    ): SessionAction {
+        val payload = PluginJsonObject().apply {
+            put("type", event.type)
+            put("payload", event.payload)
+        }
+        val raw = invoke(context, "sessionEvent", "[$payload]")
+            ?: return SessionAction.Continue
+        return JsTypeConverter.toSessionAction(raw)
+    }
+
+    override suspend fun onSessionStop(context: PluginContext) {
+        try {
+            invoke(context, "sessionStop", "[]")
+        } finally {
+            // 无论停止是否成功都要解绑：会话已经不该再占用上下文，
+            // 否则泵会把之后所有后台推进都绑到一个过期的会话上
+            sessionContext = null
+        }
     }
 
     /**
@@ -198,7 +323,7 @@ class JsSourcePlugin(
         // 每次调用一个新键：引擎用它区分「同一次挂起调用的续等」与「新的一次调用」
         val callKey = "$id#$function#${invocationSeq.incrementAndGet()}"
 
-        val deadline = System.currentTimeMillis() + ASYNC_CALL_TIMEOUT_MILLIS
+        val startedAt = System.currentTimeMillis()
 
         while (true) {
             try {
@@ -213,11 +338,18 @@ class JsSourcePlugin(
                 }
             } catch (e: PendingResultException) {
                 // 还没落定。让出线程等回调推进，然后带着同一个键再问一次
-                if (System.currentTimeMillis() >= deadline) {
+                //
+                // 超时按「无进展」而不是「总时长」算：会话类调用可以合理地跑很久
+                // （等用户输入、等下一帧），只要期间有 Promise 落地就算还在推进；
+                // 而真的卡死时不会有任何落地，计时就不会被刷新。
+                // startedAt 必须一起取最大值：否则上一次活动在两分钟前时，
+                // 刚进来的调用一遇到挂起就会被判成「已经超时」。
+                val lastProgress = maxOf(startedAt, runtime.lastActivityAt())
+                if (System.currentTimeMillis() - lastProgress >= inactivityTimeoutMillis) {
                     // 放弃等待：必须丢弃挂起的 Promise，否则它和它的 resolver 会一直挂在引擎里
                     runtime.post { rt -> rt.dropInflightCall(callKey) }
                     AppLogger.warn(
-                        "JS 插件 $id.$function 超过 $ASYNC_CALL_TIMEOUT_MILLIS ms 仍未完成，已放弃"
+                        "JS 插件 $id.$function 已 $inactivityTimeoutMillis ms 无进展（Promise 未落地），已放弃"
                     )
                     return@withLock null
                 }
@@ -243,13 +375,14 @@ class JsSourcePlugin(
 
     private companion object {
         /**
-         * 单次插件调用的等待上限。
+         * 单次插件调用的「无进展」等待上限。
          *
          * 登录链路要串好几轮 HTTP（握手 → 提交密码 → 二次验证），
          * 加上小米服务端偶发慢响应，60 秒是留了余量的值。
-         * 再长就该怀疑插件里有死循环了，那不是等待能解决的。
+         * 语义是「多久没有任何 Promise 落地」，不是调用总时长——
+         * 所以会话类调用只要还在收消息就不会被掐断。
          */
-        const val ASYNC_CALL_TIMEOUT_MILLIS = 60_000L
+        const val DEFAULT_INACTIVITY_TIMEOUT_MILLIS = 60_000L
 
         /**
          * 轮询间隔。

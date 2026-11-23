@@ -32,6 +32,7 @@ import com.lifeboard.shared.panel.ChartAxisSlot
 import com.lifeboard.shared.panel.ChartRenderModel
 import com.lifeboard.shared.panel.PlacedSeries
 import com.lifeboard.shared.panel.chartPoints
+import com.lifeboard.shared.panel.cartesianSeries
 import com.patrykandpatrick.vico.compose.cartesian.CartesianChartHost
 import com.patrykandpatrick.vico.compose.cartesian.VicoScrollState
 import com.patrykandpatrick.vico.compose.cartesian.VicoZoomState
@@ -209,12 +210,9 @@ private fun CartesianChart(
     val labelColor = MaterialTheme.colorScheme.onSurfaceVariant
     val chartHeight = if (compact) 120.dp else 200.dp
 
-    // 配色按「整张图第几条序列」取，两条轴上的序列共用一条色带，
-    // 否则左上第一条和右上第一条会同色，图例分不清。
-    // 键里带下标：两条序列可能同名（同一个指标绑了两个任务），
-    // 只按标签查会互相覆盖，最后两条线画成同一个颜色
-    val seriesEntries = model.series.withIndex().map { (index, placed) ->
-        Triple(placed, index, colors[index % colors.size])
+    // 沿用配置中的序号配色：过滤无数据序列后，其他序列的颜色也保持不变。
+    val seriesEntries = model.series.map { placed ->
+        Triple(placed, placed.sourceIndex, colors[placed.sourceIndex % colors.size])
     }
 
     val labelStyle = MaterialTheme.typography.labelSmall.copy(color = labelColor)
@@ -313,14 +311,8 @@ private fun CartesianChart(
             // "Series keys must be unique."。这里让一条序列在数据层就是连续的，
             // 缺口处 x 直接跳过——Vico 按 x 的真实间距连线，于是缺口那段
             // 斜率是按「缺了几天」摊平的，不会画出一个假的垂直落差。
-            val models = model.series.map { placed ->
-                placed.series.label to chartPoints(
-                    placed.series,
-                    model.xIndexByDate,
-                    scatter = style == SeriesStyle.SCATTER,
-                ).flatten().map { (x, y) ->
-                    x to if (placed.axis == ChartAxisSlot.RIGHT) normalize(y) else y
-                }
+            val models = model.cartesianSeries(scatter = style == SeriesStyle.SCATTER) { placed, y ->
+                if (placed.axis == ChartAxisSlot.RIGHT) normalize(y) else y
             }
             when (style) {
                 SeriesStyle.COLUMN -> columnModel {
@@ -538,12 +530,12 @@ private fun SeriesLegend(model: ChartRenderModel, colors: List<Color>) {
     val dualAxis = model.series.any { it.axis == ChartAxisSlot.LEFT } &&
         model.series.any { it.axis == ChartAxisSlot.RIGHT }
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        model.series.forEachIndexed { index, placed ->
+        model.series.forEach { placed ->
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Box(Modifier.size(10.dp).background(colors[index % colors.size], RoundedCornerShape(2.dp)))
+                Box(Modifier.size(10.dp).background(colors[placed.sourceIndex % colors.size], RoundedCornerShape(2.dp)))
                 Text(placed.series.label, style = MaterialTheme.typography.labelSmall)
                 if (dualAxis) {
                     // 轴名带上单位，用户才知道「右」这根轴量的是什么

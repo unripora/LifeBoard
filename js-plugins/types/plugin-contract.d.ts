@@ -177,11 +177,52 @@ type UiBlock =
       }
     | { type: 'buttonRow'; buttons: ButtonSpec[] }
     | { type: 'chart'; title: string; chart: ChartSpec }
-    | { type: 'customImage'; /** `data:image/...;base64,...` */ dataUri: string; /** 宽高比，默认 1.6 */ aspectRatio?: number };
+    | { type: 'customImage'; /** `data:image/...;base64,...` */ dataUri: string; /** 宽高比，默认 1.6 */ aspectRatio?: number }
+    | { type: 'messageList'; /** 按时间正序，最后一条在底部 */ messages: ChatMessage[] }
+    | {
+          type: 'inputBox';
+          /** 提交时回传给 `onAction` 的标识。 */
+          actionId: string;
+          placeholder?: string;
+          /** 提交按钮文案，默认「发送」。 */
+          submitLabel?: string;
+          /** 默认 true。 */
+          multiline?: boolean;
+          /** 默认 true；连接断开等场合置 false，只展示不可输入。 */
+          enabled?: boolean;
+      }
+    | {
+          type: 'approval';
+          title: string;
+          detail?: string;
+          /** 与按钮同构；点击后回传该项的 actionId。 */
+          options: ButtonSpec[];
+          /** 等待态：只显示「等待处理…」，不显示选项，防止重复提交。 */
+          waiting?: boolean;
+      };
+
+/** 一条消息。`pending` 表示尚未完成（流式输出中或等待回复）。 */
+interface ChatMessage {
+    /** 未知值按 assistant 处理。 */
+    role: 'user' | 'assistant' | 'system';
+    text: string;
+    /** 展示用时间文案，为空不显示。 */
+    timeLabel?: string | null;
+    pending?: boolean;
+}
 
 // ---------------------------------------------------------------------------
 // 按钮动作
 // ---------------------------------------------------------------------------
+
+/**
+ * `onAction(actionId, value?)` 的约定。
+ *
+ * - `buttonRow` / `approval` 的选项：只有 `actionId`，`value` 为 `undefined`
+ * - `inputBox` 提交：`actionId` 是输入框的标识，`value` 是用户输入的文本
+ *
+ * 只写一个形参（`function onAction(actionId)`）同样可用，宿主会多传一个 `value`。
+ */
 
 /**
  * `onAction` 的返回值，决定宿主接下来做什么。

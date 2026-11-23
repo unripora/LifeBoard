@@ -82,6 +82,13 @@ class SqldelightMetricStore(
     override suspend fun deleteMetricsBySource(sourceKey: String): Int =
         q.deleteMetricsBySource(sourceKey).await().toInt()
 
+    override suspend fun deleteMetricsByPlugin(pluginId: String): Int {
+        val prefix = "PLUGIN_${pluginId}:"
+        // SQLite 按码点计数；SQLDelight 将 substr 参数推断为文本，SQLite 会将数字文本解析为长度。
+        val prefixLength = prefix.count { !it.isLowSurrogate() }.toString()
+        return q.deleteMetricsByPlugin(prefixLength, prefix).await().toInt()
+    }
+
     // ---- 插件指标元数据 ----
 
     override suspend fun getMetricMeta(sourceType: String): MetricMeta? =
@@ -130,6 +137,12 @@ class SqldelightMetricStore(
 
     override suspend fun deleteSourceHealth(sourceKey: String): Int =
         q.deleteSourceHealthBySource(sourceKey).await().toInt()
+
+    override suspend fun deleteSourceHealthByPlugin(pluginId: String): Int {
+        val prefix = "PLUGIN_${pluginId}:"
+        val prefixLength = prefix.count { !it.isLowSurrogate() }.toString()
+        return q.deleteSourceHealthByPlugin(prefixLength, prefix).await().toInt()
+    }
 
     override fun observeAppUsageByDate(date: String): Flow<List<AppUsageRecord>> =
         q.observeAppUsageByDate(date).asListFlow().map { rows -> rows.map { it.toModel() } }

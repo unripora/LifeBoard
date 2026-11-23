@@ -84,6 +84,10 @@ INSERT OR REPLACE INTO `metric`(`sourceType`, `date`, `bucket`, `value`) VALUES 
 deleteMetricsBySource:
 DELETE FROM `metric` WHERE `sourceType` = ?;
 
+-- `LIKE` treats `_` and `%` in plugin IDs as wildcards. Compare a fixed-length substring instead.
+deleteMetricsByPlugin:
+DELETE FROM `metric` WHERE substr(`sourceType`, 1, :prefixLength) = :prefix;
+
 -- ---- 插件指标元数据 ----
 
 selectMetricMeta:
@@ -122,6 +126,9 @@ VALUES (?, ?, ?, ?);
 
 deleteSourceHealthBySource:
 DELETE FROM `source_health` WHERE `sourceType` = ?;
+
+deleteSourceHealthByPlugin:
+DELETE FROM `source_health` WHERE substr(`sourceType`, 1, :prefixLength) = :prefix;
 
 -- ---- 分应用用量 ----
 

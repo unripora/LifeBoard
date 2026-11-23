@@ -74,12 +74,38 @@ object JsHostFunctions {
         "ctx.crypto.sha1Base64",
         "ctx.crypto.sha256Base64",
         "ctx.crypto.sha256Hex",
+        "ctx.crypto.sha256Bytes",
+        "ctx.crypto.randomBytes",
         "ctx.codec.base64Encode",
         "ctx.codec.base64Decode",
+        "ctx.codec.base64UrlEncode",
+        "ctx.codec.base64UrlDecode",
+        "ctx.codec.utf8Encode",
+        "ctx.codec.utf8Decode",
+    )
+
+    /** WebSocket 长连接，见 [JsWebSocketBridge] */
+    val WS: List<String> = listOf(
+        "ctx.ws.connect",
+        "ctx.ws.recv",
+        "ctx.ws.send",
+        "ctx.ws.sendBinary",
+        "ctx.ws.close",
+        "ctx.ws.state",
+    )
+
+    /** 增量输出，见 [JsStreamBridge] */
+    val STREAM: List<String> = listOf(
+        "ctx.stream.emit",
+    )
+
+    /** 会话主动推送，见 [JsSessionBridge] */
+    val SESSION: List<String> = listOf(
+        "ctx.session.emit",
     )
 
     /** 全部函数，注册时用。 */
-    val ALL: List<String> = CONTEXT + HTTP + CRYPTO
+    val ALL: List<String> = CONTEXT + HTTP + CRYPTO + WS + STREAM + SESSION
 
     /**
      * 函数名 → 所属能力组。
@@ -89,6 +115,9 @@ object JsHostFunctions {
      */
     fun groupOf(name: String): String = when {
         name.startsWith("ctx.http.") -> "HTTP"
+        name.startsWith("ctx.ws.") -> "WS"
+        name.startsWith("ctx.stream.") -> "STREAM"
+        name.startsWith("ctx.session.") -> "SESSION"
         name.startsWith("ctx.crypto.") || name.startsWith("ctx.codec.") -> "CRYPTO"
         else -> "CONTEXT"
     }

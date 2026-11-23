@@ -9,15 +9,15 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * M2-2.2 验证：`.sq` 建表与 `.sqm` 迁移链是否与 v18 结构一致。
+ * M2-2.2 验证：`.sq` 建表与 `.sqm` 迁移链是否与 v20 结构一致。
  *
  * 这一层不做「数据无损」验证（那是 2.6 用真实库副本做的），
  * 只钉住四件在开发期就会错、且错了很难查的事：
  *
- * 1. 全新建库能成功，且 `user_version` 等于 18（与 Room 侧同号）
- * 2. 16 张业务表、14 个索引、1 个外键全部建出来
+ * 1. 全新建库能成功，且 `user_version` 等于 20（与 Room 侧同号）
+ * 2. 19 张业务表、15 个索引、1 个外键全部建出来
  * 3. 索引里没有唯一索引残留（v13->v14 拆过唯一约束）
- * 4. 从 v1 空库逐版本迁移到 18 不报错，老数据还在、新列拿到预期默认值
+ * 4. 从 v1 空库逐版本迁移到 20 不报错，老数据还在、新列拿到预期默认值
  *
  * 用临时**文件**库而不是 `:memory:`：sqlite-jdbc 的 `:memory:` 是每连接独立库，
  * 与真实场景（一个文件被多次打开、迁移后立刻被另一次打开读）不符。
@@ -38,16 +38,16 @@ class SchemaMigrationChainTest {
         DatabaseDriverFactory(migrate = true).create(dbFile.absolutePath)
 
     @Test
-    fun 全新建库后版本为19() {
+    fun 全新建库后版本为20() {
         assertEquals(
-            19L,
+            20L,
             newDriver().longValue("PRAGMA user_version"),
-            "目标版本必须与最新迁移链一致；18.sqm 引入了 metric_meta",
+            "目标版本必须与最新迁移链一致；19.sqm 引入了远程 Agent 的连接配置与会话缓存",
         )
     }
 
     @Test
-    fun 建库后17张业务表全部存在() {
+    fun 建库后19张业务表全部存在() {
         val names = newDriver().stringColumn(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
         )
@@ -56,6 +56,7 @@ class SchemaMigrationChainTest {
             "raw_notification", "capture_rule", "custom_source", "app_usage",
             "plugin_credential", "dashboard_tab", "dashboard_card", "app_log",
             "plugin_raw_record", "plugin_metric_query", "metric_meta",
+            "remote_profile", "remote_session_cache",
         ).forEach { assertTrue(it in names, "缺表 $it，实际有：$names") }
 
         // M0 探针已删，不该再出现在正式库里
@@ -84,6 +85,7 @@ class SchemaMigrationChainTest {
             "index_plugin_raw_record_pluginId_date_metricKey",
             "index_plugin_metric_query_pluginId_date",
             "index_metric_meta_pluginId",
+            "index_remote_session_cache_host",
         ).forEach { assertTrue(it in defined, "缺索引 $it，实际有：$defined") }
 
         // v13->v14 把 (tabId, type) 从 UNIQUE 改成普通索引。
@@ -124,7 +126,7 @@ class SchemaMigrationChainTest {
     }
 
     @Test
-    fun 从v1空库逐版本迁移到19() {
+    fun 从v1空库逐版本迁移到20() {
         // 按 v1 的结构手工建一个「最老的库」：只有 6 张表、3 个索引，
         // 没有任何后来新增的列
         val driver = DatabaseDriverFactory(migrate = false).create(dbFile.absolutePath)
@@ -147,11 +149,11 @@ class SchemaMigrationChainTest {
             0,
         )
 
-        // 一次性跨完 1 -> 19，SQLDelight 会按顺序跑所有 .sqm
-        LifeBoardDb.Schema.migrate(driver, 1L, 19L).value
-        driver.writeUserVersion(19)
+        // 一次性跨完 1 -> 20，SQLDelight 会按顺序跑所有 .sqm
+        LifeBoardDb.Schema.migrate(driver, 1L, 20L).value
+        driver.writeUserVersion(20)
 
-        assertEquals(19L, driver.longValue("PRAGMA user_version"))
+        assertEquals(20L, driver.longValue("PRAGMA user_version"))
 
         // 后来新增的表都该出现
         val tables = driver.stringColumn(
@@ -161,6 +163,7 @@ class SchemaMigrationChainTest {
             "raw_notification", "capture_rule", "custom_source", "app_usage",
             "plugin_credential", "dashboard_tab", "dashboard_card", "app_log",
             "plugin_raw_record", "plugin_metric_query", "metric_meta",
+            "remote_profile", "remote_session_cache",
         ).forEach { assertTrue(it in tables, "迁移后缺表 $it，实际有：$tables") }
 
         // 老任务仍在，新列拿到的是迁移里写的默认值
@@ -214,6 +217,32 @@ class SchemaMigrationChainTest {
             1L,
             driver.longValue("SELECT count(*) FROM metric_meta"),
             "迁移后 metric_meta 应能正常写入",
+        )
+
+        // 19.sqm 引入的两张表：迁移后必须可写，且只缓存标题不缓存正文
+        driver.execute(
+            null,
+            "INSERT INTO remote_profile " +
+                "(id, serverUrl, deviceId, lastHostDeviceId, lastSessionId, updatedAt) " +
+                "VALUES (1, 'https://relay.example.com', 'dev-1', 'host-1', 'session-1', 0)",
+            0,
+        )
+        driver.execute(
+            null,
+            "INSERT INTO remote_session_cache " +
+                "(sessionId, hostDeviceId, title, updatedAt, running, blank) " +
+                "VALUES ('session-1', 'host-1', '继续写代码', 0, 0, 0)",
+            0,
+        )
+        assertEquals(
+            1L,
+            driver.longValue("SELECT count(*) FROM remote_profile"),
+            "迁移后 remote_profile 应能正常写入",
+        )
+        assertEquals(
+            1L,
+            driver.longValue("SELECT count(*) FROM remote_session_cache"),
+            "迁移后 remote_session_cache 应能正常写入",
         )
     }
 

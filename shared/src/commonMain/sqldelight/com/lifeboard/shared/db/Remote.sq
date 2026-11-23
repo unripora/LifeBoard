@@ -1,0 +1,39 @@
+-- 远程 Agent 的连接配置与会话列表缓存。
+--
+-- ## 为什么没有消息正文表
+--
+-- 评审结论（RA-08）：首期 Host 是唯一权威，不在本地建聊天正文镜像，
+-- 也不持久化待发操作与审批句柄。冷启动只需要知道「连过哪台机器、
+-- 上次停在哪个会话」，正文由 Host 的快照重新拉取。
+--
+-- ## 为什么不存 token
+--
+-- access / refresh token 属于凭据，必须进平台安全存储（Android Keystore），
+-- 数据库文件可能被备份或导出，放这里等于明文落盘。
+
+-- 单行配置：id 恒为 1，新配置覆盖旧值。
+CREATE TABLE `remote_profile` (
+    `id` INTEGER NOT NULL,
+    `serverUrl` TEXT NOT NULL,
+    `deviceId` TEXT NOT NULL,
+    `membershipId` TEXT,
+    `lastHostDeviceId` TEXT,
+    `lastWorkspaceId` TEXT,
+    `lastSessionId` TEXT,
+    `updatedAt` INTEGER NOT NULL,
+    PRIMARY KEY(`id`)
+);
+
+-- 会话列表缓存：只存标题与状态，不存消息。
+CREATE TABLE `remote_session_cache` (
+    `sessionId` TEXT NOT NULL,
+    `hostDeviceId` TEXT NOT NULL,
+    `title` TEXT,
+    `updatedAt` INTEGER NOT NULL,
+    `running` INTEGER NOT NULL,
+    `blank` INTEGER NOT NULL,
+    PRIMARY KEY(`sessionId`)
+);
+
+CREATE INDEX IF NOT EXISTS `index_remote_session_cache_host`
+    ON `remote_session_cache` (`hostDeviceId`, `updatedAt`);

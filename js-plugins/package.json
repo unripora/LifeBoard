@@ -6,10 +6,15 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "npm run typecheck && npm run build:mihealth && npm run verify:mihealth",
+    "build": "npm run typecheck && npm run build:mihealth && npm run verify:mihealth && npm run build:dsh",
     "build:mihealth": "esbuild mihealth/main.ts --bundle --format=esm --target=es2020 --outfile=mihealth/main.js --log-level=warning",
     "verify:mihealth": "node scripts/verify-bundle.mjs mihealth/main.js",
-    "package:mihealth": "node scripts/package-plugin.mjs mihealth"
+    "package:mihealth": "node scripts/package-plugin.mjs mihealth",
+    "build:dsh": "esbuild dsh/main.ts --bundle --format=esm --target=es2020 --inject:dsh/qjs-shim.ts --outfile=dsh/main.js --log-level=warning"
+  },
+  "dependencies": {
+    "@lukeburns/clatterjs": "1.0.0",
+    "@noble/curves": "^2.0.1"
   },
   "devDependencies": {
     "esbuild": "^0.25.0",

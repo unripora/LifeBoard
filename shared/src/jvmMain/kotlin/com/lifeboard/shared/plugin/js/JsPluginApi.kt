@@ -41,16 +41,26 @@ object JsPluginApi {
      *    `ctx.crypto` / `ctx.recentMetrics` / `ctx.reportRawRecords` /
      *    `ctx.reportMetricQueried` / `ctx.pluginId`
      *
-     * 2：补上「写插件时一定会撞到」的四处空白，全部是新增，不破坏 v1：
+     * 2：补上「写插件时一定会撞到」的几处空白，全部是新增，不破坏 v1：
      *    `ctx.http.form`、`ctx.http.postForm`（表单编码）、
      *    `options.timeoutMs` / `options.retry`、
      *    `ctx.files.readBase64` / `writeBase64`（二进制文件）、
-     *    `ctx.http.lastError`（区分超时与其它网络错误）
+     *    `ctx.http.lastError`（区分超时与其它网络错误）、
+     *    `ctx.ws.connect/recv/send/sendBinary/close/state`（长连接）、
+     *    `ctx.crypto.randomBytes` / `ctx.crypto.sha256Bytes`、
+     *    `ctx.codec.base64UrlEncode/base64UrlDecode`、`ctx.codec.utf8Encode/utf8Decode`
+     *    （补齐 QuickJS 缺失的 `crypto.getRandomValues`、`btoa`、`TextEncoder`）
+     *
+     * 3：会话生命周期。新增 `SourcePlugin.onSessionStart/onSessionEvent/onSessionStop`
+     *    三个宿主驱动的方法（默认不实现，老插件不受影响），同时把调用超时语义
+     *    从「总时长 60 秒」改为「60 秒无进展」。函数集没有变化，但插件可以据此
+     *    判断「宿主会不会把长调用提前掐掉」，属于可观察的语义代际，因此单独记一版。
+     *    同版新增 `ctx.stream.emit`：调用过程中把生成中的片段推给界面。
      *
      * 注意：[com.lifeboard.plugin.api.PluginApi.VERSION] 与这里的 [CURRENT] 是两套，
      * 不要拿来互相比较——前者描述编译期契约，后者描述宿主注入的函数集。
      */
-    const val CURRENT: Int = 2
+    const val CURRENT: Int = 3
 
     /**
      * 未声明 `apiVersion` 时按这一版处理。
@@ -79,6 +89,16 @@ object JsPluginApi {
             "ctx.http.lastError",
             "options.timeoutMs/retry",
             "ctx.files.readBase64/writeBase64",
+            "ctx.ws.connect/recv/send/sendBinary/close/state",
+            "ctx.crypto.sha256Bytes/randomBytes",
+            "ctx.codec.base64UrlEncode/base64UrlDecode/utf8Encode/utf8Decode",
+        ),
+        3 to listOf(
+            "SourcePlugin.onSessionStart/onSessionEvent/onSessionStop（JS 导出 sessionStart/sessionEvent/sessionStop）",
+            "调用超时：总时长 60 秒 → 60 秒无进展",
+            "detailUi 新区块：messageList / inputBox / approval",
+            "onAction 第二个实参：输入类动作携带用户文本",
+            "ctx.stream.emit",
         ),
     )
 

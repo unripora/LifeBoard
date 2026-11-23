@@ -4,6 +4,7 @@ import com.lifeboard.core.model.TaskConfig
 import com.lifeboard.core.model.TimeSource
 import com.lifeboard.core.schedule.ScheduleRule
 import com.lifeboard.core.util.Dates
+import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
@@ -94,7 +95,8 @@ object RemindPlanner {
         if (!task.enabled) return Plan(task.id, emptyList(), "task disabled")
 
         val schedule = resolveSchedule(task, ruleSchedule)
-        if (!schedule.isDateActive(LocalDate.now())) {
+        val today = Instant.ofEpochMilli(nowMillis).atZone(Dates.zone).toLocalDate()
+        if (!schedule.isDateActive(today)) {
             return Plan(task.id, emptyList(), "date not active today")
         }
 
@@ -102,7 +104,12 @@ object RemindPlanner {
         if (windows.isEmpty()) return Plan(task.id, emptyList(), "no windows")
 
         val entries = windows.mapIndexedNotNull { index, window ->
-            val trigger = triggerMillisFor(window.endMinute, offsetMinutes, nowMillis) ?: return@mapIndexedNotNull null
+            val trigger = triggerMillisFor(
+                endMinute = window.endMinute,
+                offsetMinutes = offsetMinutes,
+                nowMillis = nowMillis,
+                date = today,
+            ) ?: return@mapIndexedNotNull null
             Entry(task.id, index, trigger)
         }
 
@@ -139,13 +146,14 @@ object RemindPlanner {
         endMinute: Int,
         offsetMinutes: Int,
         nowMillis: Long = System.currentTimeMillis(),
+        date: LocalDate = Instant.ofEpochMilli(nowMillis).atZone(Dates.zone).toLocalDate(),
     ): Long? {
         if (endMinute !in 0 until MINUTES_PER_DAY) return null
         val triggerMinuteOfDay = endMinute + offsetMinutes
         if (triggerMinuteOfDay !in 0 until MINUTES_PER_DAY) return null
 
         val trigger = LocalDateTime.of(
-            LocalDate.now(),
+            date,
             LocalTime.of(triggerMinuteOfDay / 60, triggerMinuteOfDay % 60),
         )
         val millis = trigger.atZone(Dates.zone).toInstant().toEpochMilli()

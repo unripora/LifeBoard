@@ -1,6 +1,7 @@
 package com.lifeboard.shared.ui.plugin.detail
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
@@ -11,6 +12,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -35,6 +38,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.lifeboard.shared.panel.rememberCardDrag
 import com.lifeboard.shared.ui.theme.GlassCard
 
 /** 详情页里需要二次确认的危险操作 */
@@ -89,6 +93,9 @@ fun PluginDetailScreen(
     val state by vm.state.collectAsState()
     val snackbar = remember { SnackbarHostState() }
     var danger by remember { mutableStateOf<Danger?>(null) }
+    var orderMenu by remember { mutableStateOf(false) }
+    // 拖动复用仪表盘卡片的手势与位移逻辑：长按后可跨卡片移动
+    val drag = rememberCardDrag(state.blocks.size) { from, to -> vm.onBlockDrop(from, to) }
 
     LaunchedEffect(state.message) {
         state.message?.let {
@@ -116,6 +123,55 @@ fun PluginDetailScreen(
                         // `material-icons-core` 不在共享层依赖里（桌面端也没有），
                         // 与仪表盘「+」、设置页「✓」的处理保持一致
                         Text("←", style = MaterialTheme.typography.titleLarge)
+                    }
+                },
+                actions = {
+                    if (state.info != null) {
+                        Box {
+                            IconButton(onClick = { orderMenu = true }) {
+                                // 齿轮同样用文字，理由见上面的返回箭头
+                                Text("⚙", style = MaterialTheme.typography.titleLarge)
+                            }
+                            DropdownMenu(
+                                expanded = orderMenu,
+                                onDismissRequest = { orderMenu = false },
+                            ) {
+                                Text(
+                                    "区块顺序",
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(if (state.orderMode == BlockOrderMode.DEFAULT) "✓ 默认（插件顺序）" else "默认（插件顺序）")
+                                    },
+                                    enabled = state.blocks.isNotEmpty(),
+                                    onClick = {
+                                        vm.setOrderMode(BlockOrderMode.DEFAULT)
+                                        orderMenu = false
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(if (state.orderMode == BlockOrderMode.CUSTOM) "✓ 自定义（拖动调整）" else "自定义（拖动调整）")
+                                    },
+                                    enabled = state.blocks.isNotEmpty(),
+                                    onClick = {
+                                        vm.setOrderMode(BlockOrderMode.CUSTOM)
+                                        orderMenu = false
+                                    },
+                                )
+                                if (state.orderMode == BlockOrderMode.CUSTOM) {
+                                    Text(
+                                        "长按卡片拖动排序；输入、审批、会话保持原位。",
+                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
@@ -161,6 +217,9 @@ fun PluginDetailScreen(
                             blocks = state.blocks,
                             busy = state.busy,
                             onAction = vm::onAction,
+                            conversation = vm.conversation,
+                            orderMode = state.orderMode,
+                            drag = drag,
                         )
                     }
                     OperationSection(

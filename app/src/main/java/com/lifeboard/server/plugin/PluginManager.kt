@@ -5,6 +5,10 @@ import android.net.Uri
 import com.lifeboard.plugin.api.ActionResult
 import com.lifeboard.plugin.api.AuthState
 import com.lifeboard.plugin.api.LoginResult
+import com.lifeboard.plugin.api.SessionAction
+import com.lifeboard.plugin.api.SessionConfig
+import com.lifeboard.plugin.api.SessionEvent
+import com.lifeboard.plugin.api.SessionUiEvent
 import com.lifeboard.plugin.api.UiBlock
 import com.lifeboard.server.collect.DailyAggregateWorker
 import com.lifeboard.server.db.DatabaseProviders
@@ -12,6 +16,7 @@ import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.shared.platform.PendingPlugin
 import com.lifeboard.shared.platform.PluginList
 import com.lifeboard.shared.platform.PluginSummary
+import com.lifeboard.shared.platform.StreamingSourcePlugin
 import com.lifeboard.shared.plugin.fs.AndroidPluginFileSystem
 import com.lifeboard.shared.plugin.js.PluginDirWatcher
 import com.lifeboard.shared.repository.PluginDataPurger
@@ -20,9 +25,11 @@ import com.lifeboard.server.plugin.js.JsPluginLoader
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -410,7 +417,12 @@ object PluginManager {
      * 写库完成时间不确定，用户点完按钮立刻读库会拿到旧值，表现为「点一次没反应」。
      * 写完后再重新问一次 [detailUi]，插件返回的区块就能反映最新数据。
      */
-    suspend fun onAction(context: Context, pluginId: String, actionId: String): ActionResult {
+    suspend fun onAction(
+        context: Context,
+        pluginId: String,
+        actionId: String,
+        value: String? = null,
+    ): ActionResult {
         val appContext = context.applicationContext
         val plugin = findPlugin(appContext, pluginId)
             ?: return ActionResult.ShowMessage("插件未加载，请重新扫描")
@@ -421,7 +433,7 @@ object PluginManager {
 
         val result = withContext(Dispatchers.IO) {
             runCatching {
-                plugin.plugin.onAction(HostPluginContext(pluginId, appContext), actionId)
+                plugin.plugin.onAction(HostPluginContext(pluginId, appContext), actionId, value)
             }.getOrElse { e ->
                 // 第三方插件未必守规矩，异常不能打到 UI 上
                 ActionResult.ShowMessage("插件处理操作时出错：${e.message ?: e::class.simpleName}")
@@ -439,6 +451,101 @@ object PluginManager {
         }
         // 采集成功：优先用插件自己刚算好的区块，它最清楚该显示什么
         return ActionResult.RefreshUi(detailUi(appContext, pluginId))
+    }
+
+    /**
+     * 插件在一次调用进行中推送的文本增量。
+     *
+     * 热流、无重放：未加载的插件返回空流，调用方**必须**在发起调用前订阅，
+     * 否则开头的片段会丢。未实现 [StreamingSourcePlugin] 的插件同样返回空流，
+     * 调用方不必区分「支持 / 不支持」。
+     */
+    fun streamDeltas(context: Context, pluginId: String): Flow<String> =
+        (findPlugin(context.applicationContext, pluginId)?.plugin as? StreamingSourcePlugin)
+            ?.streamDeltas ?: emptyFlow()
+
+    // ---- 会话 ----
+
+    /**
+     * 启动会话。
+     *
+     * 与采集链路互不影响：未信任、未加载或插件明确拒绝时返回 false，
+     * 界面据此保持「会话未连接」，不伪造一个空对话。
+     */
+    suspend fun sessionStart(
+        context: Context,
+        pluginId: String,
+        config: SessionConfig,
+    ): Boolean {
+        val appContext = context.applicationContext
+        val plugin = findPlugin(appContext, pluginId) ?: return false
+        if (!plugin.trusted) return false
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                plugin.plugin.onSessionStart(HostPluginContext(pluginId, appContext), config)
+            }.getOrElse {
+                AppLogger.warn("插件 $pluginId 启动会话失败：${it.message ?: it::class.simpleName}")
+                false
+            }
+        }
+    }
+
+    /** 投递一次会话操作；异常按「继续」降级，避免把插件故障当成用户取消 */
+    suspend fun sessionEvent(
+        context: Context,
+        pluginId: String,
+        event: SessionEvent,
+    ): SessionAction {
+        val appContext = context.applicationContext
+        val plugin = findPlugin(appContext, pluginId) ?: return SessionAction.Continue
+        if (!plugin.trusted) return SessionAction.Stop("插件已停止使用")
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                plugin.plugin.onSessionEvent(HostPluginContext(pluginId, appContext), event)
+            }.getOrElse {
+                AppLogger.warn("插件 $pluginId 处理会话事件失败：${it.message ?: it::class.simpleName}")
+                SessionAction.Continue
+            }
+        }
+    }
+
+    /** 结束会话；插件未加载或未信任时什么都不做 */
+    suspend fun sessionStop(context: Context, pluginId: String) {
+        val appContext = context.applicationContext
+        val plugin = findPlugin(appContext, pluginId) ?: return
+        if (!plugin.trusted) return
+        withContext(Dispatchers.IO) {
+            runCatching {
+                plugin.plugin.onSessionStop(HostPluginContext(pluginId, appContext))
+            }.onFailure {
+                AppLogger.warn("插件 $pluginId 停止会话失败：${it.message ?: it::class.simpleName}")
+            }
+        }
+    }
+
+    /**
+     * 会话推送监听；插件未加载时静默忽略。
+     *
+     * @param onClosed 插件侧主动关闭会话时的额外回调（Android 用它撤掉常驻通知）。
+     *   `listener` 为 null（解绑）时不会触发。
+     */
+    fun setSessionUiListener(
+        context: Context,
+        pluginId: String,
+        listener: ((SessionUiEvent) -> Unit)?,
+        onClosed: (() -> Unit)? = null,
+    ) {
+        val plugin = findPlugin(context.applicationContext, pluginId)?.plugin ?: return
+        plugin.setSessionUiListener(
+            if (listener == null) {
+                null
+            } else {
+                { event ->
+                    listener(event)
+                    if (event is SessionUiEvent.Closed) onClosed?.invoke()
+                }
+            },
+        )
     }
 
     // ---- 安装 ----

@@ -1,6 +1,7 @@
 package com.lifeboard.shared.plugin.js
 
 import com.lifeboard.plugin.api.ActionResult
+import com.lifeboard.plugin.api.ApprovalBlock
 import com.lifeboard.plugin.api.AuthState
 import com.lifeboard.plugin.api.BarChartSpec
 import com.lifeboard.plugin.api.ButtonRowBlock
@@ -8,12 +9,17 @@ import com.lifeboard.plugin.api.ButtonSpec
 import com.lifeboard.plugin.api.ChartBlock
 import com.lifeboard.plugin.api.ChartPoint
 import com.lifeboard.plugin.api.ChartSpec
+import com.lifeboard.plugin.api.ChatMessage
+import com.lifeboard.plugin.api.ChatRole
+import com.lifeboard.plugin.api.ConversationBlock
 import com.lifeboard.plugin.api.CredentialSpec
 import com.lifeboard.plugin.api.CustomImageBlock
 import com.lifeboard.plugin.api.FetchResult
+import com.lifeboard.plugin.api.InputBoxBlock
 import com.lifeboard.plugin.api.InputField
 import com.lifeboard.plugin.api.LineChartSpec
 import com.lifeboard.plugin.api.LoginResult
+import com.lifeboard.plugin.api.MessageListBlock
 import com.lifeboard.plugin.api.MetricAggregate
 import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.plugin.api.MetricSpec
@@ -21,6 +27,7 @@ import com.lifeboard.plugin.api.PluginHealth
 import com.lifeboard.plugin.api.PluginMetric
 import com.lifeboard.plugin.api.ProgressRingSpec
 import com.lifeboard.plugin.api.RawRecord
+import com.lifeboard.plugin.api.SessionAction
 import com.lifeboard.plugin.api.StatusCardBlock
 import com.lifeboard.plugin.api.TextBlock
 import com.lifeboard.plugin.api.Tone
@@ -221,7 +228,8 @@ object JsTypeConverter {
         }
     }
 
-    private fun toUiBlock(o: PluginJsonObject): UiBlock? = when (o.optString("type")) {
+    private fun toUiBlock(o: PluginJsonObject): UiBlock? {
+        val block = when (o.optString("type")) {
         "text" -> TextBlock(
             title = o.optString("title"),
             body = o.optString("body"),
@@ -246,7 +254,86 @@ object JsTypeConverter {
             dataUri = o.optString("dataUri"),
             aspectRatio = o.optDouble("aspectRatio", 1.6).toFloat(),
         )
+        // 会话相关的三个区块：没有 actionId 的输入框注定提交无门，
+        // 直接丢弃比渲染出一个「点了没反应」的输入框好
+        "messageList" -> MessageListBlock(
+            messages = o.optJSONArray("messages").toChatMessages(),
+        )
+        "inputBox" -> {
+            val actionId = o.optString("actionId")
+            if (actionId.isBlank()) {
+                null
+            } else {
+                InputBoxBlock(
+                    actionId = actionId,
+                    placeholder = o.optString("placeholder").ifBlank { "输入消息" },
+                    submitLabel = o.optString("submitLabel").ifBlank { "发送" },
+                    multiline = o.optBoolean("multiline", true),
+                    enabled = o.optBoolean("enabled", true),
+                )
+            }
+        }
+        "approval" -> ApprovalBlock(
+            title = o.optString("title"),
+            detail = o.optString("detail"),
+            // 选项与按钮同构：label + actionId + primary/enabled，
+            // 用同一套解析避免两处规则漂移
+            options = o.optJSONArray("options").toButtonSpecs(),
+            waiting = o.optBoolean("waiting", false),
+        )
+        // 会话区块没有 sessionId 就无从绑定，丢弃比渲染一个永远空着的框好
+        "conversation" -> o.optString("sessionId").takeIf { it.isNotBlank() }?.let { sessionId ->
+            ConversationBlock(
+                sessionId = sessionId,
+                title = o.optString("title"),
+                placeholder = o.optString("placeholder").ifBlank { "输入消息" },
+                submitLabel = o.optString("submitLabel").ifBlank { "发送" },
+                emptyHint = o.optString("emptyHint").ifBlank { "还没有消息" },
+            )
+        }
         else -> null
+        } ?: return null
+
+        // 用户自定义顺序需要稳定引用：插件给了 id 就用它，
+        // 没给则由上层按「类型 + 位置」兜底，不影响现有插件
+        val id = o.optString("id")
+        return if (id.isBlank()) block else block.withBlockId(id)
+    }
+
+    /** 把插件声明的 id 写到具体区块上；[UiBlock] 是 sealed，逐分支 copy */
+    private fun UiBlock.withBlockId(id: String): UiBlock = when (this) {
+        is TextBlock -> copy(id = id)
+        is StatusCardBlock -> copy(id = id)
+        is ButtonRowBlock -> copy(id = id)
+        is ChartBlock -> copy(id = id)
+        is CustomImageBlock -> copy(id = id)
+        is MessageListBlock -> copy(id = id)
+        is InputBoxBlock -> copy(id = id)
+        is ApprovalBlock -> copy(id = id)
+        is ConversationBlock -> copy(id = id)
+    }
+
+    /**
+     * 解析消息列表。
+     *
+     * 未知 `role` 按 assistant 处理：聊天里绝大多数消息是对方说的，
+     * 落到中性提示（system）会把正文变成灰色小字，看起来像系统日志。
+     */
+    private fun PluginJsonArray?.toChatMessages(): List<ChatMessage> {
+        if (this == null) return emptyList()
+        return (0 until length()).mapNotNull { i ->
+            val o = optJSONObject(i) ?: return@mapNotNull null
+            ChatMessage(
+                role = when (o.optString("role")) {
+                    "user" -> ChatRole.USER
+                    "system" -> ChatRole.SYSTEM
+                    else -> ChatRole.ASSISTANT
+                },
+                text = o.optString("text"),
+                timeLabel = o.optStringOrNull("timeLabel"),
+                pending = o.optBoolean("pending", false),
+            )
+        }
     }
 
     private fun PluginJsonArray?.toButtonSpecs(): List<ButtonSpec> {
@@ -286,6 +373,23 @@ object JsTypeConverter {
         return (0 until length()).mapNotNull { i ->
             val o = optJSONObject(i) ?: return@mapNotNull null
             ChartPoint(label = o.optString("label"), value = o.optDouble("value", 0.0))
+        }
+    }
+
+    // ---------- 会话事件 ----------
+
+    /**
+     * 解析插件对会话事件的处置。
+     *
+     * 只认 `{"action":"stop","reason":"..."}`；其余一切（含未实现、返回空）
+     * 都按「会话继续」处理——终止会话会让用户丢掉当前对话，
+     * 必须是插件显式要求才做。
+     */
+    fun toSessionAction(json: String): SessionAction {
+        val obj = jsonObjectOrNull(json) ?: return SessionAction.Continue
+        return when (obj.optString("action")) {
+            "stop" -> SessionAction.Stop(obj.optString("reason", "会话已结束"))
+            else -> SessionAction.Continue
         }
     }
 

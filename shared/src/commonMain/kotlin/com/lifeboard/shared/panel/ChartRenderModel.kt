@@ -10,6 +10,8 @@ import java.time.LocalDate
 data class PlacedSeries(
     val series: ChartSeries,
     val axis: ChartAxisSlot,
+    /** 原配置中的序号。名称可以重复，过滤无数据序列后也不能重新编号。 */
+    val sourceIndex: Int,
 )
 
 /** Y 轴归属。与 Vico 的左右两根轴一一对应 */
@@ -132,7 +134,7 @@ fun buildChartRenderModel(
                 "它按${axisName}刻度读出来的值不准确"
         }
 
-        placed += PlacedSeries(series, slot)
+        placed += PlacedSeries(series, slot, sourceIndex = index)
     }
 
     return ChartRenderModel(
@@ -257,6 +259,24 @@ fun chartPoints(
     return continuousRuns(points).map { run ->
         run.map { point -> xIndexByDate.getValue(point.date).toDouble() to point.value }
     }
+}
+
+/** 渲染事务的序列输入，key 与用户可编辑的图例名称无关。 */
+internal data class CartesianSeriesInput(
+    val key: Int,
+    val points: List<Pair<Double, Double>>,
+)
+
+internal fun ChartRenderModel.cartesianSeries(
+    scatter: Boolean,
+    transformY: (PlacedSeries, Double) -> Double = { _, value -> value },
+): List<CartesianSeriesInput> = series.map { placed ->
+    CartesianSeriesInput(
+        key = placed.sourceIndex,
+        points = chartPoints(placed.series, xIndexByDate, scatter).flatten().map { (x, y) ->
+            x to transformY(placed, y)
+        },
+    )
 }
 
 /**

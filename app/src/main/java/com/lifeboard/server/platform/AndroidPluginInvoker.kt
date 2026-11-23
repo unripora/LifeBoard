@@ -8,14 +8,20 @@ import com.lifeboard.plugin.api.MetricSample
 import com.lifeboard.plugin.api.MetricSeries
 import com.lifeboard.plugin.api.MetricSpec
 import com.lifeboard.plugin.api.PluginHealth
+import com.lifeboard.plugin.api.SessionAction
+import com.lifeboard.plugin.api.SessionConfig
+import com.lifeboard.plugin.api.SessionEvent
+import com.lifeboard.plugin.api.SessionUiEvent
 import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.plugin.api.UiBlock
 import com.lifeboard.server.collect.DailyAggregateWorker
 import com.lifeboard.server.db.DatabaseProviders
 import com.lifeboard.server.plugin.PluginManager
+import com.lifeboard.server.remote.RemoteConnectionService
 import com.lifeboard.shared.platform.CollectOutcome
 import com.lifeboard.shared.platform.PluginInvoker
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
 import java.time.LocalDate
 
@@ -44,8 +50,54 @@ class AndroidPluginInvoker(
     override suspend fun detailUi(pluginId: String): List<UiBlock> =
         PluginManager.detailUi(appContext, pluginId)
 
-    override suspend fun onAction(pluginId: String, actionId: String): ActionResult =
-        PluginManager.onAction(appContext, pluginId, actionId)
+    override suspend fun onAction(pluginId: String, actionId: String, value: String?): ActionResult =
+        PluginManager.onAction(appContext, pluginId, actionId, value)
+
+    /** 增量输出，同桌面端：热流，必须在发起调用前订阅 */
+    override fun streamDeltas(pluginId: String): Flow<String> =
+        PluginManager.streamDeltas(appContext, pluginId)
+
+    override suspend fun sessionStart(pluginId: String, config: SessionConfig): Boolean {
+        // 先起前台服务再连：反过来的话，握手期间用户息屏就可能被系统回收，
+        // 表现是「第一次进详情页必失败、第二次成功」
+        RemoteConnectionService.start(appContext, "正在连接…")
+        val started = PluginManager.sessionStart(appContext, pluginId, config)
+        if (started) {
+            RemoteConnectionService.update(appContext, "会话已连接")
+        } else {
+            // 没连上就别留着一条「正在连接」的常驻通知
+            RemoteConnectionService.stop(appContext)
+        }
+        return started
+    }
+
+    override suspend fun sessionEvent(pluginId: String, event: SessionEvent): SessionAction {
+        val action = PluginManager.sessionEvent(appContext, pluginId, event)
+        // 插件在事件处理里判定会话结束（例如用户发了 /exit）
+        if (action is SessionAction.Stop) {
+            RemoteConnectionService.stop(appContext)
+        }
+        return action
+    }
+
+    override suspend fun sessionStop(pluginId: String) {
+        try {
+            PluginManager.sessionStop(appContext, pluginId)
+        } finally {
+            // finally：插件停机抛异常也要撤掉通知，否则用户会看到
+            // 一条永远消不掉的「会话已连接」
+            RemoteConnectionService.stop(appContext)
+        }
+    }
+
+    override fun setSessionUiListener(
+        pluginId: String,
+        listener: ((SessionUiEvent) -> Unit)?,
+    ) = PluginManager.setSessionUiListener(appContext, pluginId, listener) {
+        // 插件侧关闭会话时通知栏要同步消失：控制器已把会话标成结束，
+        // 通知却还挂着「会话已连接」，用户会以为连接还在
+        RemoteConnectionService.stop(appContext)
+    }
 
     /**
      * 插件健康状态。
