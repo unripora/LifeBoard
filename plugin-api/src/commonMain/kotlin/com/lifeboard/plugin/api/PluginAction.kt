@@ -9,12 +9,12 @@ package com.lifeboard.plugin.api
 sealed interface ActionResult {
 
     /**
-     * 界面内容变了，用新的区块重新渲染。
+     * 界面内容变了，用新的节点树重新渲染。
      *
-     * 这是最常用的返回：插件处理完动作后把最新的 [UiBlock] 列表一起带回来，
+     * 这是最常用的返回：插件处理完动作后把最新的根节点一起带回来，
      * 宿主不必再问一次 [SourcePlugin.detailUi]，也就不会出现「点了按钮先闪一下旧内容」。
      */
-    data class RefreshUi(val blocks: List<UiBlock>) : ActionResult
+    data class RefreshUi(val root: PluginNode?) : ActionResult
 
     /**
      * 只弹一句提示，界面不变。

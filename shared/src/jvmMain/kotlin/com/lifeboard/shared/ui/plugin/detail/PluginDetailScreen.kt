@@ -39,6 +39,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.lifeboard.shared.panel.rememberCardDrag
+import kotlinx.coroutines.flow.MutableStateFlow
 import com.lifeboard.shared.ui.theme.GlassCard
 
 /** 详情页里需要二次确认的危险操作 */
@@ -74,8 +75,8 @@ private sealed interface Danger {
  * `viewModel()` / `collectAsStateWithLifecycle()` 都用不了。
  * 改成调用方持有 VM 并传进来，代价是调用方要在离开时调 [PluginDetailViewModel.close]。
  *
- * 本页只展示**宿主掌握的**通用信息与通用操作，插件自定义区块由
- * [UiBlockList] 渲染。
+ * 本页只展示**宿主掌握的**通用信息与通用操作，插件自定义界面由
+ * [PluginNodeTree] 渲染。
  *
  * **不提供登录入口**：登录是多轮状态机，列表页已有一套完整实现。
  * 这里只读展示登录态，并引导用户回列表页操作。
@@ -94,8 +95,13 @@ fun PluginDetailScreen(
     val snackbar = remember { SnackbarHostState() }
     var danger by remember { mutableStateOf<Danger?>(null) }
     var orderMenu by remember { mutableStateOf(false) }
-    // 拖动复用仪表盘卡片的手势与位移逻辑：长按后可跨卡片移动
-    val drag = rememberCardDrag(state.blocks.size) { from, to -> vm.onBlockDrop(from, to) }
+    // 拖动复用仪表盘卡片的手势与位移逻辑：长按后可跨卡片移动。
+    // 计数必须用「根节点的直接子节点数」而不是节点总数：只有顶层参与排序，
+    // 用总数会让 LaunchedEffect 的重置时机与实际卡片数错开。
+    val topLevelCount = rootChildren(state.root).size
+    // 至少得有一个可拖的节点，排序菜单才有意义
+    val canReorder = rootChildren(state.root).any { isReorderableNode(it) }
+    val drag = rememberCardDrag(topLevelCount) { from, to -> vm.onBlockDrop(from, to) }
 
     LaunchedEffect(state.message) {
         state.message?.let {
@@ -146,7 +152,7 @@ fun PluginDetailScreen(
                                     text = {
                                         Text(if (state.orderMode == BlockOrderMode.DEFAULT) "✓ 默认（插件顺序）" else "默认（插件顺序）")
                                     },
-                                    enabled = state.blocks.isNotEmpty(),
+                                    enabled = canReorder,
                                     onClick = {
                                         vm.setOrderMode(BlockOrderMode.DEFAULT)
                                         orderMenu = false
@@ -156,7 +162,7 @@ fun PluginDetailScreen(
                                     text = {
                                         Text(if (state.orderMode == BlockOrderMode.CUSTOM) "✓ 自定义（拖动调整）" else "自定义（拖动调整）")
                                     },
-                                    enabled = state.blocks.isNotEmpty(),
+                                    enabled = canReorder,
                                     onClick = {
                                         vm.setOrderMode(BlockOrderMode.CUSTOM)
                                         orderMenu = false
@@ -164,7 +170,7 @@ fun PluginDetailScreen(
                                 )
                                 if (state.orderMode == BlockOrderMode.CUSTOM) {
                                     Text(
-                                        "长按卡片拖动排序；输入、审批、会话保持原位。",
+                                        "长按卡片拖动排序；输入、选择与开关保持原位。",
                                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -209,18 +215,38 @@ fun PluginDetailScreen(
                         availableRange = state.availableRange,
                         onSelectRange = vm::selectRange,
                     )
-                    // 插件自定义区块放在通用信息与通用操作之间：
+                    // 插件自定义内容放在通用信息与通用操作之间：
                     // 上面的信息是宿主对插件的认定，下面的操作是宿主提供的兜底，
                     // 插件内容夹在中间，既不会冒充宿主信息，也不会盖住危险操作
-                    if (state.blocks.isNotEmpty()) {
-                        UiBlockList(
-                            blocks = state.blocks,
-                            busy = state.busy,
-                            onAction = vm::onAction,
-                            conversation = vm.conversation,
-                            orderMode = state.orderMode,
-                            drag = drag,
-                        )
+                    val root = state.root
+                    if (root != null) {
+                        val pluginId = state.info?.pluginId.orEmpty()
+                        // 先收集树里出现的所有绑定，逐一订阅成 Compose 状态，
+                        // 再在每次重组时求值。直接读 StateFlow.value 不会触发重组，
+                        // 消息来了界面不会动——这是通用绑定最容易踩的坑。
+                        val refs = remember(root) { collectBindingRefs(root) }
+                        val values = refs.map { ref ->
+                            val flow = remember(pluginId, ref) {
+                                PluginBindingRegistry.sourceOf(pluginId, ref.source)
+                                    ?.observe(ref.key, ref.field)
+                                    ?: MutableStateFlow(BoundValue.Unavailable)
+                            }
+                            flow.collectAsState().value
+                        }
+                        val byRef = refs.zip(values).toMap()
+                        val resolved = resolveNodes(root) { ref ->
+                            byRef[ref] ?: BoundValue.Unavailable
+                        }
+                        if (resolved != null) {
+                            PluginNodeTree(
+                                root = resolved,
+                                busy = state.busy,
+                                onAction = vm::onAction,
+                                onSessionSubmit = vm::submitToSession,
+                                orderMode = state.orderMode,
+                                drag = drag,
+                            )
+                        }
                     }
                     OperationSection(
                         info = info,

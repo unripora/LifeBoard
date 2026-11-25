@@ -28,6 +28,22 @@
 
 ## JS 接口版本（`manifest.apiVersion`）
 
+### v4 — 详情页改为可组合节点树 + `ctx.report`
+
+**破坏性**：`detailUi` 不再返回 9 种固定区块（`text`/`statusCard`/`buttonRow`/`chart`/
+`customImage`/`messageList`/`inputBox`/`approval`/`conversation`），改为返回节点树。
+旧 `type` 会被渲染成「此版本暂不支持」的占位，**不再有对话区**。请按
+[插件编写指南](./插件编写指南.md) 的「详情页 UI：可组合节点树」改写。
+
+| 变化 | 说明 |
+|---|---|
+| `detailUi` 返回 `UiNode` 或 `UiNode[]` | 容器（`column`/`row`/`collapsible`/`spacer`/`divider`）+ 内容 + 交互 + 媒体节点，可任意嵌套 |
+| `{binding:'<source>:<key>:<field>'}` | 新增绑定点：只允许用在 `list.items` / `text.body` / `statusCard.value` / `input.enabled`。本期数据源仅 `session`（`messages`/`status`/`inputEnabled`） |
+| `input.submitTo` | 输入直接投给数据源（会话就是这么收输入的），不进 `onAction` |
+| `onAction` 的 `refreshUi` | 字段由 `blocks` 改为 `root`（单棵节点树） |
+| `ctx.report(key, value, at?)` | **新增**：事件型指标的即时累加上报。同一天多次调用累加；key 须在 `manifest.metrics` 声明 |
+| `ctx.stream.emit` | **函数保留、详情页不再显示**。原有落点（往最后一个消息列表追加）随固定区块一起删除；流式文本请用 `ctx.session.emit` 的 `delta` |
+
 ### v2 — 表单、超时重试、错误分类、二进制文件
 
 纯新增，**不破坏 v1**。声明 `1` 的插件照常工作。
@@ -84,19 +100,26 @@
 
 与 JS 插件无关，只有写 Kotlin 插件的人需要关心。
 
+### v5 — 详情页改为可组合节点树
+
+`SourcePlugin.detailUi` 由 `List<UiBlock>` 改为返回 `PluginNode?`，`ActionResult.RefreshUi`
+的字段由 `blocks` 改为 `root`。旧 `UiBlock` 系列类型**整体删除**，不保留兼容层。
+
+对**编译型**插件是二进制破坏（旧插件编译出 `()Ljava/util/List;`，新宿主调
+`()Lcom/lifeboard/plugin/api/PluginNode;`），必须重新编译。
+
+> ⚠️ `PluginApi.MIN_VERSION` 已抬到 5，但**当前仓内没有任何代码读取它**——
+> 也就是说它只是契约声明，不会真的拦下旧插件。别指望它挡人，靠发布新版插件包。
+
 ### v4 — `fetch` 返回 `FetchResult`
 
 `SourcePlugin.fetch` 从 `List<PluginMetric>` 改为返回 `FetchResult`。
 
 **这是破坏性变更**：已编译的旧插件在二进制层面就对不上，调用会抛 `NoSuchMethodError`。
-所以宿主现在会：
-
-- 拒绝 `apiVersion < 4` 的 APK 插件，提示「契约版本过旧，请联系插件作者更新」
-- 拒绝 `apiVersion > 4` 的 APK 插件，提示用户升级 App
 
 ### v3 — 详情页声明式 UI
 
-新增 `detailUi` / `onAction` 与 `UiBlock`、`ActionResult`。
+新增 `detailUi` / `onAction` 与 `UiBlock`（v5 已删除，由 `PluginNode` 取代）、`ActionResult`。
 两个方法都有默认实现，**非破坏性**：声明 2 的插件照常加载，只是详情页没有自己的区块。
 
 ### v2 — 多轮登录

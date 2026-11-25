@@ -92,25 +92,34 @@ interface SourcePlugin {
     /**
      * 详情页里由插件自己决定的那部分内容。
      *
-     * 宿主会把返回的区块渲染在「通用信息」（包名、版本、签名、健康度）之下、
+     * 宿主会把返回的节点树渲染在「通用信息」（包名、版本、签名、健康度）之下、
      * 「通用操作」（停止使用、清除凭据、卸载）之上。这两个通用区由宿主固定，
      * 插件插不进去也改不了：装的是哪个包、签名是什么，必须由宿主说了算。
      *
-     * 默认返回空列表，此时详情页只显示通用信息与通用操作。
-     * 插件不需要展示任何自有内容时不必重写本方法。
+     * 返回值是一棵**可组合节点树**（见 [PluginNode]），通常是
+     * `ColumnNode(children = ...)`。想平铺几个卡片时，把子节点依次放进
+     * [ColumnNode] 即可——树只有一个根，所以不存在「顶层列表」与「嵌套列表」
+     * 两套规则。
+     *
+     * 返回 `null` 时详情页只显示通用信息与通用操作。插件不需要展示任何自有内容时
+     * 不必重写本方法。
      *
      * **不要在这里发网络请求**：用户点进详情页只是想看细节，
      * 不期望顺便触发一次采集。需要实时数据请用 [ActionResult.TriggerSync] 显式触发。
      */
-    suspend fun detailUi(context: PluginContext): List<UiBlock> = emptyList()
+    suspend fun detailUi(context: PluginContext): PluginNode? = null
 
     /**
      * 用户在详情页触发了某个交互。
      *
-     * 三类来源共用这一个入口：
-     * - [ButtonRowBlock] 的按钮：只带 `actionId`
-     * - [InputBoxBlock] 提交：`actionId` 是输入框的标识，[value] 是用户输入的文本
-     * - [ApprovalBlock] 的选项：只带该项的 `actionId`
+     * 所有交互节点共用这一个入口：
+     * - [ButtonNode]：只带 `actionId`（以及声明的 `payload`）
+     * - [InputNode] 提交：`actionId` 是输入框的标识，[value] 是用户输入的文本
+     * - [SelectNode]：单选带选中项的 value；多选带 JSON 数组文本
+     * - [ToggleNode]：带 `"true"` / `"false"`
+     *
+     * 例外：声明了 `submitTo` 的 [InputNode] 不会到这里——它的输入直接投给绑定
+     * 数据源（会话就是这么收输入的），由宿主侧控制器接管。
      *
      * 宿主会在本方法返回前禁用该按钮，插件不必自己防连点；
      * 但**同一插件可能被并发调用**（两个按钮几乎同时点），需要互斥时请自行加锁。
@@ -118,8 +127,8 @@ interface SourcePlugin {
      * 失败不要抛异常：异常会被宿主兜住并转成一句通用错误，
      * 用户看不到原因。要说明情况请返回 [ActionResult.ShowMessage]。
      *
-     * @param actionId 插件在 [ButtonSpec] / [InputBoxBlock] 里给出的标识
-     * @param value 输入类动作携带的用户文本；非输入类动作为 `null`
+     * @param actionId 插件在交互节点里给出的标识
+     * @param value 交互产生的载荷；无载荷时为 `null`
      */
     suspend fun onAction(
         context: PluginContext,

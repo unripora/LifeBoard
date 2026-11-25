@@ -1,9 +1,9 @@
 package com.lifeboard.shared.ui.plugin.detail
 
 import com.lifeboard.plugin.api.ActionResult
-import com.lifeboard.plugin.api.ConversationBlock
+import com.lifeboard.plugin.api.ColumnNode
+import com.lifeboard.plugin.api.PluginNode
 import com.lifeboard.plugin.api.SessionConfig
-import com.lifeboard.plugin.api.UiBlock
 import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.shared.platform.PlatformDependencies
 import com.lifeboard.shared.platform.PluginRawPage
@@ -45,20 +45,20 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
-    /** 插件本次返回的原始顺序；用户切回「默认」时直接用它 */
-    private var pluginBlocks: List<UiBlock> = emptyList()
+    /** 插件本次返回的原始树；用户切回「默认」时直接用它 */
+    private var pluginRoot: PluginNode? = null
 
     /** 当前插件的 id，用于读写顺序偏好 */
     private var currentPluginId: String = ""
 
-    /** 当前会话控制器；插件没有会话区块时保持 null */
+    /** 当前会话控制器；插件没有会话绑定时保持 null */
     private var sessionController: PluginSessionController? = null
 
     /**
-     * 会话区块的绑定。
+     * 会话绑定。
      *
      * 用稳定对象转发到当前控制器，而不是直接把控制器传进界面：
-     * 区块在控制器装配之前就已经存在于组合树里，绑定若为 null，
+     * 节点树在控制器装配之前就已经被求值，绑定若为 null，
      * 页面切回默认实现后就再也不会被重新订阅。
      */
     val conversation: ConversationBinding = object : ConversationBinding {
@@ -83,20 +83,27 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
         )
         _state.value = _state.value.copy(
             orderMode = mode,
-            blocks = displayBlocks(pluginBlocks, mode),
+            root = displayRoot(pluginRoot, mode),
         )
     }
 
-    /** 拖动结束：只在自定义模式下生效，并把新顺序落盘 */
+    /**
+     * 拖动结束：只在自定义模式下生效，并把新顺序落盘。
+     *
+     * 参数是根 children 的下标——渲染层只对根的直接子节点开放拖动，
+     * 所以这里不需要处理嵌套层级。
+     */
     fun onBlockDrop(from: Int, to: Int) {
         if (_state.value.orderMode != BlockOrderMode.CUSTOM) return
-        val moved = moveBlock(_state.value.blocks, from, to)
-        if (moved == _state.value.blocks) return
+        val root = _state.value.root ?: return
+        val children = rootChildren(root)
+        val moved = moveNode(children, from, to)
+        if (moved == children) return
         deps.settings.putString(
             BLOCK_ORDER_KEY_PREFIX + currentPluginId,
-            Json.encodeToString(blockOrderKeys(moved)),
+            Json.encodeToString(nodeOrderKeys(moved)),
         )
-        _state.value = _state.value.copy(blocks = moved)
+        _state.value = _state.value.copy(root = withRootChildren(root, moved))
     }
 
     private fun readOrderMode(pluginId: String): BlockOrderMode =
@@ -112,8 +119,18 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
         return runCatching { Json.decodeFromString<List<String>>(text) }.getOrDefault(emptyList())
     }
 
-    private fun displayBlocks(blocks: List<UiBlock>, mode: BlockOrderMode): List<UiBlock> =
-        if (mode == BlockOrderMode.CUSTOM) applyBlockOrder(blocks, readSavedOrder(currentPluginId)) else blocks
+    /**
+     * 按顺序策略套用用户偏好。
+     *
+     * 只重排根节点 children：树结构下给每个容器维护独立顺序偏好会让设置项
+     * 指数膨胀，且插件每次调整结构都会让保存的顺序错位。
+     */
+    private fun displayRoot(root: PluginNode?, mode: BlockOrderMode): PluginNode? {
+        if (root == null || mode != BlockOrderMode.CUSTOM) return root
+        val children = rootChildren(root)
+        if (children.isEmpty()) return root
+        return withRootChildren(root, applyNodeOrder(children, readSavedOrder(currentPluginId)))
+    }
 
     /** 界面离开时调用，取消在途的协程 */
     fun close() {
@@ -131,14 +148,14 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
                 return@launch
             }
 
-            // 插件区块单独取：它失败不该连带通用信息也打不开
-            val blocks = if (summary.trusted) {
+            // 插件内容单独取：它失败不该连带通用信息也打不开
+            val root = if (summary.trusted) {
                 runCatching { withContext(Dispatchers.IO) { deps.pluginInvoker.detailUi(pluginId) } }
-                    .onFailure { AppLogger.warn("读取插件 $pluginId 的自定义区块失败：${it.message}") }
-                    .getOrElse { emptyList() }
+                    .onFailure { AppLogger.warn("读取插件 $pluginId 的自定义界面失败：${it.message}") }
+                    .getOrNull()
             } else {
                 // 未信任时不去碰插件：调它的 detailUi 等于让不受信任的代码跑起来
-                emptyList()
+                null
             }
 
             _state.value = _state.value.copy(
@@ -146,32 +163,55 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
                 missing = false,
                 info = buildDetailInfo(deps, summary),
                 orderMode = readOrderMode(pluginId),
-                blocks = emptyList(),
+                root = null,
             )
             this@PluginDetailViewModel.currentPluginId = pluginId
-            pluginBlocks = blocks
-            val ordered = displayBlocks(blocks, _state.value.orderMode)
-            _state.value = _state.value.copy(blocks = ordered)
-            startConversationIfNeeded(pluginId, ordered)
+            pluginRoot = root
+            val ordered = displayRoot(root, _state.value.orderMode)
+            _state.value = _state.value.copy(root = ordered)
+            startBindingIfNeeded(pluginId, ordered)
             reloadRaw(pluginId, _state.value.rawRange)
         }
     }
 
     /**
-     * 区块里出现 `conversation` 时装配并启动会话。
+     * 节点树里出现会话绑定时装配并启动会话。
      *
      * 一个插件只起一条会话（首期单会话）：同一插件再次进入详情页时，
      * 注册表会复用已在运行的控制器，消息不会丢。
+     *
+     * 判定依据是树里有没有 `session:*` 绑定，而不是「有没有某个节点类型」——
+     * 这正是通用绑定相对专用会话节点的好处：插件可以把消息列表放在
+     * 卡片里、折叠块里、甚至拆成两处，宿主都能找得到。
      */
-    private fun startConversationIfNeeded(pluginId: String, blocks: List<UiBlock>) {
-        val block = blocks.filterIsInstance<ConversationBlock>().firstOrNull() ?: return
+    private fun startBindingIfNeeded(pluginId: String, root: PluginNode?) {
+        val refs = collectBindingRefs(root)
+        val sessionKeys = refs
+            .filter { it.source == SessionBindingSource.SOURCE_NAME }
+            .map { it.key }
+            .toSet()
+        if (sessionKeys.isEmpty()) return
+
         val controller = PluginSessionRegistry.controllerFor(pluginId) {
             PluginInvokerSessionEndpoint(deps.pluginInvoker, pluginId)
         }
         sessionController = controller
+        // 注册数据源，渲染层求值时按 source 名查表
+        PluginBindingRegistry.attach(pluginId, SessionBindingSource(conversation))
         if (!controller.isActive) {
-            controller.startAsync(block.sessionId, SessionConfig())
+            controller.startAsync(sessionKeys.first(), SessionConfig())
         }
+    }
+
+    /**
+     * 把输入框的内容投给会话。
+     *
+     * 与 [onAction] 分开：`onAction` 是「一次插件调用」（返回结果、可能重绘界面），
+     * 而这里是把一句话送进常驻会话，由会话控制器异步收发。混在一起会让
+     * `onAction` 承担两种职责，也让「输入框在等回复时该禁用」这类状态无从判断。
+     */
+    fun submitToSession(sessionKey: String, text: String) {
+        sessionController?.submit(sessionKey, text)
     }
 
     /** 切换时间段，重新读该范围内的原始条目 */
@@ -244,18 +284,10 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
         TaskCenter.launch("插件操作", info.displayName ?: info.pluginId) {
             _state.value = _state.value.copy(busy = true)
 
-            // 先订阅再调用：增量流没有重放，订阅晚了会丢掉开头几段。
-            // 订阅只覆盖这一次操作——否则插件在别处（例如会话后台循环）
-            // 推送的内容会串进当前这条消息。
-            val streamJob = launch {
-                deps.pluginInvoker.streamDeltas(info.pluginId).collect { delta ->
-                    withContext(Dispatchers.Main) {
-                        _state.value = _state.value.copy(
-                            blocks = appendStreamDelta(_state.value.blocks, delta),
-                        )
-                    }
-                }
-            }
+            // 不再订阅 streamDeltas：详情页改成节点树后，增量没有可靠的落点
+            // （绑定到会话的列表由会话源推送，静态列表不该被增量污染）。
+            // ctx.stream.emit 仍可用，但它的产物在详情页不显示——见
+            // JsPluginApi.CAPABILITIES 里的废弃说明。
 
             // 取消要原样抛出：runCatching 会把 CancellationException
             // 一起收成 null，再被翻译成「操作失败」——把「用户离开了」
@@ -267,22 +299,20 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
             } catch (e: Throwable) {
                 AppLogger.warn("插件 ${info.pluginId} 的动作 $actionId 失败：${e.message}")
                 null
-            } finally {
-                streamJob.cancel()
             }
 
             // 界面状态必须回到主线程改
             withContext(Dispatchers.Main) {
                 _state.value = when (result) {
-                    // 成功也要有反馈：只换区块的话，用户点完「立即同步」
+                    // 成功也要有反馈：只换界面的话，用户点完「立即同步」
                     // 界面没有任何变化提示，只能靠猜
                     is ActionResult.RefreshUi -> {
-                        // 刷新后仍是同一批区块，只是内容变了：顺序偏好要重新套上，
+                        // 刷新后仍是同一批节点，只是内容变了：顺序偏好要重新套上，
                         // 否则用户调好的顺序每同步一次就被插件打回原形
-                        pluginBlocks = result.blocks
+                        pluginRoot = result.root
                         _state.value.copy(
                             busy = false,
-                            blocks = displayBlocks(result.blocks, _state.value.orderMode),
+                            root = displayRoot(result.root, _state.value.orderMode),
                             message = "已完成",
                         )
                     }
@@ -293,8 +323,8 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
                     else -> _state.value.copy(busy = false, message = "已完成")
                 }
 
-                // 插件可能是在这次操作之后才给出会话区块
-                startConversationIfNeeded(info.pluginId, _state.value.blocks)
+                // 插件可能是在这次操作之后才给出会话绑定
+                startBindingIfNeeded(info.pluginId, _state.value.root)
 
                 // 同步类动作可能改了健康度与登录态，通用信息要跟着变
                 if (result is ActionResult.RefreshUi) {
@@ -339,6 +369,9 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
             // 等于让「已停止使用」的代码还在后台收发消息
             sessionController?.stopAsync()
             PluginSessionRegistry.remove(info.pluginId)
+            // 绑定源必须一起清：否则再进详情页时列表仍指向已停止的控制器，
+            // 会一直显示旧消息，而且不会有任何报错
+            PluginBindingRegistry.detach(info.pluginId)
             sessionController = null
         }
     }
@@ -367,6 +400,7 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
             if (result.isSuccess) {
                 sessionController?.stopAsync()
                 PluginSessionRegistry.remove(info.pluginId)
+                PluginBindingRegistry.detach(info.pluginId)
                 sessionController = null
             }
         }

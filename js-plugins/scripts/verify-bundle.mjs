@@ -89,13 +89,33 @@ if (!Array.isArray(result)) {
     }
 }
 
-const ui = typeof mod.detailUi === 'function' ? await mod.detailUi() : [];
-if (!Array.isArray(ui)) {
-    console.error('detailUi 必须返回数组');
+// detailUi 现在返回节点树：单个节点对象，或（便利写法）节点数组。
+// 两种都会被宿主接受，但绝不能是别的东西——返回 undefined 会让详情页空白。
+const ui = typeof mod.detailUi === 'function' ? await mod.detailUi() : null;
+if (ui !== null && typeof ui !== 'object') {
+    console.error('detailUi 必须返回节点树（对象）或节点数组');
     process.exit(1);
 }
+
+/** 递归收集树里出现的 binding 引用：打包时把插件绑了什么打出来，便于自查 */
+const bindings = new Set();
+const walk = (node) => {
+    if (Array.isArray(node)) {
+        node.forEach(walk);
+        return;
+    }
+    if (node === null || typeof node !== 'object') return;
+    for (const [key, value] of Object.entries(node)) {
+        if (key === 'binding' && typeof value === 'string') bindings.add(value);
+        else walk(value);
+    }
+};
+walk(ui);
 
 console.log(`产物合规：${basename(file)}`);
 console.log(`  导出：${Object.keys(mod).join(', ')}`);
 console.log(`  fetch 返回：${Array.isArray(result) ? `裸数组(${result.length})` : `status=${result.status}`}`);
-console.log(`  detailUi 区块数：${ui.length}`);
+console.log(`  detailUi 根：${Array.isArray(ui) ? `数组(${ui.length} 项)` : (ui === null ? '无' : `节点 ${ui.type}`)}`);
+if (bindings.size > 0) {
+    console.log(`  detailUi 绑定：${[...bindings].join(', ')}`);
+}

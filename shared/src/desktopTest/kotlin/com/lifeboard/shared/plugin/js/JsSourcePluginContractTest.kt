@@ -1,22 +1,25 @@
 package com.lifeboard.shared.plugin.js
 
 import com.lifeboard.plugin.api.ActionResult
-import com.lifeboard.plugin.api.ApprovalBlock
 import com.lifeboard.plugin.api.AuthState
-import com.lifeboard.plugin.api.ChatRole
-import com.lifeboard.plugin.api.ConversationBlock
+import com.lifeboard.plugin.api.Bound
+import com.lifeboard.plugin.api.ColumnNode
 import com.lifeboard.plugin.api.CredentialSpec
 import com.lifeboard.plugin.api.CredentialStore
 import com.lifeboard.plugin.api.FetchResult
-import com.lifeboard.plugin.api.InputBoxBlock
+import com.lifeboard.plugin.api.InputNode
+import com.lifeboard.plugin.api.ListNode
 import com.lifeboard.plugin.api.LoginResult
-import com.lifeboard.plugin.api.MessageListBlock
 import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.plugin.api.MetricSample
 import com.lifeboard.plugin.api.MetricSpec
 import com.lifeboard.plugin.api.PluginContext
 import com.lifeboard.plugin.api.PluginHealth
 import com.lifeboard.plugin.api.RawRecord
+import com.lifeboard.plugin.api.RowNode
+import com.lifeboard.plugin.api.StatusCardNode
+import com.lifeboard.plugin.api.TextNode
+import com.lifeboard.plugin.api.UnsupportedNode
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -257,23 +260,28 @@ class JsSourcePluginContractTest {
     // ---- 详情页 ----
 
     @Test
-    fun detailUiReturnsBlocks() {
+    fun detailUiReturnsNodeTree() {
         val plugin = buildPlugin(
             """
             export function detailUi() {
                 return [
                     { type: 'text', title: '说明', body: '这是正文' },
                     { type: 'statusCard', label: '上次同步', value: '刚刚', tone: 'ok' },
-                    { type: 'buttonRow', buttons: [
-                        { label: '立即同步', actionId: 'sync', primary: true }
+                    { type: 'row', card: false, children: [
+                        { type: 'button', label: '立即同步', actionId: 'sync', primary: true }
                     ]}
                 ]
             }
             """.trimIndent()
         )
 
-        val blocks = runBlocking { plugin.detailUi(fakeContext) }
-        assertEquals(3, blocks.size)
+        val root = runBlocking { plugin.detailUi(fakeContext) }
+        // 插件返回数组，解析层包一层不套卡片的 column
+        val column = root as ColumnNode
+        assertEquals(3, column.children.size)
+        assertTrue(column.children[0] is TextNode)
+        assertTrue(column.children[1] is StatusCardNode)
+        assertTrue(column.children[2] is RowNode)
     }
 
     @Test
@@ -325,7 +333,7 @@ class JsSourcePluginContractTest {
                 ctx.stream.emit('你');
                 ctx.stream.emit('');
                 ctx.stream.emit('好');
-                return { type: 'refreshUi', blocks: [] }
+                return { type: 'refreshUi', root: { type: 'text', body: '完成' } }
             }
             """.trimIndent()
         )
@@ -345,83 +353,97 @@ class JsSourcePluginContractTest {
         assertEquals("片段应按推送顺序到达，空串被丢弃", listOf("你", "好"), deltas)
     }
 
+    /**
+     * 会话界面由插件用普通原语自己拼，靠 `binding` 接宿主推送。
+     *
+     * 这是通用绑定的核心约定：没有专用会话节点，插件写
+     * `{binding:'session:<key>:<field>'}` 就把那块数据交给宿主托管。
+     */
     @Test
-    fun detailUiParsesSessionBlocks() {
+    fun detailUiParsesSessionBindings() {
         val plugin = buildPlugin(
             """
             export function detailUi() {
-                return [
-                    { type: 'messageList', messages: [
-                        { role: 'user', text: '你好', timeLabel: '10:00' },
-                        { role: 'assistant', text: '在的', pending: true },
-                        { role: 'system', text: '已连接' }
-                    ]},
-                    { type: 'inputBox', actionId: 'send', placeholder: '说点什么' },
-                    { type: 'approval', title: '执行 rm -rf？', detail: '危险操作',
-                      options: [{ label: '允许', actionId: 'allow', primary: true },
-                                { label: '拒绝', actionId: 'deny' }] },
-                    { type: 'approval', title: '等待对方确认', options: [], waiting: true },
-                    // 没有 actionId 的输入框提交无门，应当被丢弃
-                    { type: 'inputBox' }
-                ]
+                return {
+                    type: 'column',
+                    children: [
+                        { type: 'list', maxHeightDp: 320, emptyHint: '暂无对话',
+                          items: { binding: 'session:main:messages' } },
+                        { type: 'input', actionId: 'dsh.send', placeholder: '说点什么',
+                          submitTo: 'session:main',
+                          enabled: { binding: 'session:main:inputEnabled' } },
+                        { type: 'text', body: { binding: 'session:main:status' } }
+                    ]
+                }
             }
             """.trimIndent()
         )
 
-        val blocks = runBlocking { plugin.detailUi(fakeContext) }
-        assertEquals("实际：$blocks", 4L, blocks.size.toLong())
+        val column = runBlocking { plugin.detailUi(fakeContext) } as ColumnNode
+        assertEquals(3, column.children.size)
 
-        val list = blocks[0] as MessageListBlock
-        assertEquals(ChatRole.USER, list.messages[0].role)
-        assertEquals("10:00", list.messages[0].timeLabel)
-        assertEquals(ChatRole.ASSISTANT, list.messages[1].role)
-        assertTrue(list.messages[1].pending)
-        assertEquals(ChatRole.SYSTEM, list.messages[2].role)
+        val list = column.children[0] as ListNode
+        assertEquals("session:main:messages", (list.items as Bound.Ref).ref)
+        assertEquals(320, list.maxHeightDp)
+        assertEquals("暂无对话", list.emptyHint)
 
-        val input = blocks[1] as InputBoxBlock
-        assertEquals("send", input.actionId)
-        assertEquals("说点什么", input.placeholder)
-        assertEquals("发送", input.submitLabel)
+        val input = column.children[1] as InputNode
+        assertEquals("dsh.send", input.actionId)
+        assertEquals("session", input.submitTo?.source)
+        assertEquals("main", input.submitTo?.key)
+        assertEquals("session:main:inputEnabled", (input.enabled as Bound.Ref).ref)
 
-        val approval = blocks[2] as ApprovalBlock
-        assertEquals(2, approval.options.size)
-        assertTrue(approval.options[0].primary)
-        assertTrue(!approval.waiting)
-
-        assertTrue((blocks[3] as ApprovalBlock).waiting)
+        val status = column.children[2] as TextNode
+        assertEquals("session:main:status", (status.body as Bound.Ref).ref)
     }
 
+    /**
+     * 畸形绑定退回静态默认值，不能让整页打不开。
+     *
+     * 插件传来的 JSON 不可信，一个拼错的三段式不该把详情页变成空白。
+     */
     @Test
-    fun detailUiParsesConversationBlock() {
+    fun malformedBindingFallsBackToStatic() {
+        val plugin = buildPlugin(
+            """
+            export function detailUi() {
+                return {
+                    type: 'column',
+                    children: [
+                        { type: 'text', body: { binding: 'oops' } },
+                        { type: 'list', items: { binding: 'session:only-two' } }
+                    ]
+                }
+            }
+            """.trimIndent()
+        )
+
+        val column = runBlocking { plugin.detailUi(fakeContext) } as ColumnNode
+        val text = column.children[0] as TextNode
+        assertEquals("", (text.body as Bound.Static).value)
+        val list = column.children[1] as ListNode
+        assertTrue((list.items as Bound.Static).value.isEmpty())
+    }
+
+    /** 旧区块类型不再被识别，降级为占位而不是静默消失 */
+    @Test
+    fun legacyBlockTypeDegradesToUnsupported() {
         val plugin = buildPlugin(
             """
             export function detailUi() {
                 return [
-                    { type: 'conversation', sessionId: 'main', title: '远程会话',
-                      placeholder: '说点什么', submitLabel: '发送', emptyHint: '暂无对话' },
-                    // 缺省字段走宿主默认值
-                    { type: 'conversation', sessionId: 'side' },
-                    // 没有 sessionId 无法绑定，应当被丢弃
-                    { type: 'conversation', title: '无主会话' }
+                    { type: 'conversation', sessionId: 'main' },
+                    { type: 'messageList', messages: [] }
                 ]
             }
             """.trimIndent()
         )
 
-        val blocks = runBlocking { plugin.detailUi(fakeContext) }
-        assertEquals("实际：$blocks", 2L, blocks.size.toLong())
-
-        val main = blocks[0] as ConversationBlock
-        assertEquals("main", main.sessionId)
-        assertEquals("远程会话", main.title)
-        assertEquals("说点什么", main.placeholder)
-        assertEquals("暂无对话", main.emptyHint)
-
-        val side = blocks[1] as ConversationBlock
-        assertEquals("side", side.sessionId)
-        assertEquals("输入消息", side.placeholder)
-        assertEquals("发送", side.submitLabel)
-        assertEquals("还没有消息", side.emptyHint)
+        val column = runBlocking { plugin.detailUi(fakeContext) } as ColumnNode
+        // 两者都必须出现（占位），不能被静默丢弃
+        assertEquals(2, column.children.size)
+        assertTrue(column.children[0] is UnsupportedNode)
+        assertTrue(column.children[1] is UnsupportedNode)
     }
 
     // ---- 可选实现与异常兜底 ----
@@ -434,7 +456,8 @@ class JsSourcePluginContractTest {
         )
 
         runBlocking {
-            assertTrue(plugin.detailUi(fakeContext).isEmpty())
+            // 未实现 detailUi 时返回 null（不是空列表）：「没有自定义内容」
+            assertNull(plugin.detailUi(fakeContext))
             assertTrue(plugin.onAction(fakeContext, "x") is ActionResult.NoOp)
             // authState 未实现时必须报错而不是「未登录」：
             // 把「没问出来」当成「插件说它未登录」，界面就会在用户

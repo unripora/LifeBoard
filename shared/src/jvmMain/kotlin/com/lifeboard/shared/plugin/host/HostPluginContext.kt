@@ -150,6 +150,36 @@ class HostPluginContext(
     }
 
     /**
+     * 事件型指标的即时上报（累加）。
+     *
+     * ## 为什么校验 metricKey
+     *
+     * 未声明的指标没有量纲（bucket），写进去就是一行没人能解释的数据。
+     * 声明的权威来源是 `metric_meta` 表——它在插件安装/同步时由 manifest 写入，
+     * 这里查一次即可。查不到就丢弃并记 warn：静默写入比报错更危险，
+     * 因为图表上会出现一个没有名字、没有单位的序列。
+     *
+     * ## 为什么不更新健康度
+     *
+     * 一次事件上报成功不代表采集链路健康：插件的 `fetch` 可能一直在失败，
+     * 但它仍然能上报「这一轮失败了」。两者混在一起会让状态灯失去意义。
+     */
+    override suspend fun report(metricKey: String, value: Double, at: String) {
+        if (metricKey.isBlank() || value == 0.0) return
+        // 本插件名下的 metricKey 拼成落库用的 sourceType
+        val source = SourceRef.pluginKey(pluginId, metricKey)
+        val meta = metricStore.getMetricMeta(source)
+        if (meta == null) {
+            com.lifeboard.shared.log.AppLogger.warn(
+                "插件 $pluginId 上报了未声明的指标 $metricKey，已丢弃",
+            )
+            return
+        }
+        val date = at.ifBlank { LocalDate.now(ZoneId.systemDefault()).toString() }
+        metricStore.incrementMetric(sourceKey = source, date = date, bucket = meta.bucket, delta = value)
+    }
+
+    /**
      * 当前正在采集的日期，供 [reportRawRecords] 在插件没传日期时兜底。
      *
      * 由调用方在调 `fetch` 前设置：插件只知道「我拉到了什么」，

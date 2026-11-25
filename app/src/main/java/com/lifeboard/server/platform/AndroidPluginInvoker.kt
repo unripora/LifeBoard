@@ -13,7 +13,7 @@ import com.lifeboard.plugin.api.SessionConfig
 import com.lifeboard.plugin.api.SessionEvent
 import com.lifeboard.plugin.api.SessionUiEvent
 import com.lifeboard.plugin.api.SourceRef
-import com.lifeboard.plugin.api.UiBlock
+import com.lifeboard.plugin.api.PluginNode
 import com.lifeboard.server.collect.DailyAggregateWorker
 import com.lifeboard.server.db.DatabaseProviders
 import com.lifeboard.server.plugin.PluginManager
@@ -47,7 +47,7 @@ class AndroidPluginInvoker(
     override suspend fun authState(pluginId: String): AuthState? =
         PluginManager.authState(appContext, pluginId)
 
-    override suspend fun detailUi(pluginId: String): List<UiBlock> =
+    override suspend fun detailUi(pluginId: String): PluginNode? =
         PluginManager.detailUi(appContext, pluginId)
 
     override suspend fun onAction(pluginId: String, actionId: String, value: String?): ActionResult =

@@ -57,10 +57,15 @@ object JsPluginApi {
      *    判断「宿主会不会把长调用提前掐掉」，属于可观察的语义代际，因此单独记一版。
      *    同版新增 `ctx.stream.emit`：调用过程中把生成中的片段推给界面。
      *
+     * 4：详情页 UI 改为可组合节点树（`detailUi` 返回节点不再是一组固定区块），
+     *    并新增通用绑定 `{binding:'<source>:<key>:<field>'}`。同版新增 `ctx.report`
+     *    （事件型指标的即时累加上报）；`ctx.stream.emit` 的函数保留但**详情页不再
+     *    显示它的产物**——旧的「往最后一个消息列表里追加」逻辑随固定区块一起删除。
+     *
      * 注意：[com.lifeboard.plugin.api.PluginApi.VERSION] 与这里的 [CURRENT] 是两套，
      * 不要拿来互相比较——前者描述编译期契约，后者描述宿主注入的函数集。
      */
-    const val CURRENT: Int = 3
+    const val CURRENT: Int = 4
 
     /**
      * 未声明 `apiVersion` 时按这一版处理。
@@ -87,6 +92,7 @@ object JsPluginApi {
         2 to listOf(
             "ctx.http.form/postForm",
             "ctx.http.lastError",
+            "ctx.http.caCertificate/trustCa",
             "options.timeoutMs/retry",
             "ctx.files.readBase64/writeBase64",
             "ctx.ws.connect/recv/send/sendBinary/close/state",
@@ -96,9 +102,22 @@ object JsPluginApi {
         3 to listOf(
             "SourcePlugin.onSessionStart/onSessionEvent/onSessionStop（JS 导出 sessionStart/sessionEvent/sessionStop）",
             "调用超时：总时长 60 秒 → 60 秒无进展",
-            "detailUi 新区块：messageList / inputBox / approval",
+            // 这批区块已在 v4 全部删除，改为可组合节点树；保留此条只为让
+            // 插件作者能查出「我当时用的是哪一版」
+            "detailUi 区块：messageList / inputBox / approval / conversation（v4 已废弃）",
             "onAction 第二个实参：输入类动作携带用户文本",
             "ctx.stream.emit",
+            // 废弃说明单独一行：以 `ctx.` 开头会被一致性测试当成函数名去展开
+            "说明：ctx.stream.emit 自 v4 起在详情页不再显示（函数保留以免旧插件报错）",
+            "ctx.session.emit",
+            "ctx.credentials.set",
+        ),
+        4 to listOf(
+            "detailUi 改为可组合节点树：text / statusCard / chart / image / list / input / button / " +
+                "select / toggle / row / column / collapsible / table / keyValue / progress / code / " +
+                "audio / video（媒体本期降级为占位）",
+            "绑定点 Bound<T>：{binding:'<source>:<key>:<field>'}，本期数据源只有 session",
+            "ctx.report",
         ),
     )
 

@@ -17,6 +17,7 @@ import kotlinx.coroutines.runBlocking
  * | JS 侧 | 行为 |
  * |---|---|
  * | `ctx.credentials.get(slot)` | 读凭据，返回字符串或 null |
+ * | `ctx.credentials.set(slot, value)` | 写凭据；`value` 为 null 表示删除该槽位 |
  * | `ctx.credentials.put(slot, value)` | 写凭据 |
  * | `ctx.credentials.remove(slot)` | 删单个槽位 |
  * | `ctx.credentials.clear()` | 清空本插件凭据 |
@@ -28,6 +29,7 @@ import kotlinx.coroutines.runBlocking
  * | `ctx.recentMetrics(key, days)` | 读本插件已落库指标，返回 `[{date,value}]` |
  * | `ctx.reportRawRecords(key, records, date?)` | 上报原始条目 |
  * | `ctx.reportMetricQueried(key, date?)` | 标记「查过但没数据」 |
+ * | `ctx.report(key, value, at?)` | 事件型指标的即时累加上报 |
  * | `ctx.log.d/i/w/e(tag, msg)` | 写宿主日志 |
  * | `ctx.pluginId()` | 取本插件 id |
  *
@@ -86,6 +88,7 @@ class JsPluginContextBridge(
         return try {
             when (name) {
                 "ctx.credentials.get" -> credentialGet(args.stringOrNull(0))
+                "ctx.credentials.set" -> credentialSet(args.stringOrNull(0), args.stringOrNull(1))
                 "ctx.credentials.put" -> credentialPut(args.stringOrNull(0), args.stringOrNull(1))
                 "ctx.credentials.remove" -> credentialRemove(args.stringOrNull(0))
                 "ctx.credentials.clear" -> credentialClear()
@@ -100,6 +103,7 @@ class JsPluginContextBridge(
                 "ctx.recentMetrics" -> recentMetrics(args.stringOrNull(0), args.optInt(1, 7))
                 "ctx.reportRawRecords" -> reportRawRecords(args)
                 "ctx.reportMetricQueried" -> reportMetricQueried(args)
+                "ctx.report" -> report(args)
                 "ctx.log.d", "ctx.log.i", "ctx.log.w", "ctx.log.e" ->
                     log(name.substringAfterLast('.'), args.stringOrNull(0), args.stringOrNull(1))
                 "ctx.pluginId" -> PluginJson.quote(pluginId)
@@ -120,6 +124,25 @@ class JsPluginContextBridge(
         }
         val value = runBlocking { pluginContext.credentials.get(slot) }
         return if (value == null) "null" else PluginJson.quote(value)
+    }
+
+    /**
+     * 写入或删除一个凭据槽位。
+     *
+     * 与 [credentialPut] 的唯一区别是 `null` 表示**删除**：插件登出时要清掉
+     * 整个槽位，用 `put(slot, "")` 会留下一个空串，下次 `get` 拿到的不是 null，
+     * 「有没有登录过」这个判断就永远为真。
+     */
+    private fun credentialSet(slot: String?, value: String?): String {
+        if (slot.isNullOrBlank()) {
+            return HostFunctionDispatcher.error("credentials.set 需要 slot")
+        }
+        if (value == null) {
+            runBlocking { pluginContext.credentials.remove(slot) }
+        } else {
+            runBlocking { pluginContext.credentials.put(slot, value) }
+        }
+        return "null"
     }
 
     private fun credentialPut(slot: String?, value: String?): String {
@@ -268,6 +291,25 @@ class JsPluginContextBridge(
             ?: return HostFunctionDispatcher.error("reportMetricQueried 需要 metricKey")
         val date = args.stringOrNull(1).orEmpty().ifBlank { collectDate }
         runBlocking { pluginContext.reportMetricQueried(metricKey, date) }
+        return "null"
+    }
+
+    /**
+     * `ctx.report(metricKey, value, at?)`：事件型指标的即时累加上报。
+     *
+     * 与 [reportRawRecords] 的区别：那个是「这次同步拿到的明细」，只在 fetch 内
+     * 有意义；这个是「刚刚发生了一件事」，任意时刻都能调。会话完成一轮、
+     * 任务失败一次，都走这条。
+     */
+    private fun report(args: PluginJsonArray): String {
+        val metricKey = args.stringOrNull(0)
+            ?: return HostFunctionDispatcher.error("report 需要 metricKey")
+        val value = args.optDouble(1, Double.NaN)
+        if (value.isNaN()) {
+            return HostFunctionDispatcher.error("report 的 value 必须是数字")
+        }
+        val at = args.stringOrNull(2).orEmpty()
+        runBlocking { pluginContext.report(metricKey, value, at) }
         return "null"
     }
 

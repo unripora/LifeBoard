@@ -5,11 +5,11 @@ import com.lifeboard.plugin.api.AuthState
 import com.lifeboard.plugin.api.LoginResult
 import com.lifeboard.plugin.api.MetricSeries
 import com.lifeboard.plugin.api.PluginHealth
+import com.lifeboard.plugin.api.PluginNode
 import com.lifeboard.plugin.api.SessionAction
 import com.lifeboard.plugin.api.SessionConfig
 import com.lifeboard.plugin.api.SessionEvent
 import com.lifeboard.plugin.api.SessionUiEvent
-import com.lifeboard.plugin.api.UiBlock
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
 
@@ -67,17 +67,17 @@ interface PluginInvoker {
     suspend fun authState(pluginId: String): AuthState?
 
     /**
-     * 插件自己的详情区块（图表、按钮、说明）。
+     * 插件自己的详情页内容：一棵可组合节点树。
      *
-     * 空列表表示插件没有自定义界面，调用方应展示通用内容（指标列表等）。
+     * `null` 表示插件没有自定义界面，调用方应展示通用内容（指标列表等）。
      */
-    suspend fun detailUi(pluginId: String): List<UiBlock>
+    suspend fun detailUi(pluginId: String): PluginNode?
 
     /**
      * 执行详情页上某个交互。
      *
-     * @param actionId 来自 [UiBlock] 里的 action 标识
-     * @param value 输入类动作携带的用户文本；按钮类动作传 `null`
+     * @param actionId 来自节点树里交互节点的 action 标识
+     * @param value 交互产生的载荷；按钮类动作通常为 `null`
      */
     suspend fun onAction(pluginId: String, actionId: String, value: String? = null): ActionResult
 

@@ -34,6 +34,13 @@ data class JsPluginManifest(
     val credentialSpec: CredentialSpec,
     /** manifest 自称的内容哈希（发布者计算），可为空表示未声明 */
     val declaredHash: String? = null,
+    /**
+     * 插件要信任的自签 CA 的 SHA-256 指纹（小写十六进制）。
+     *
+     * 为空表示只用系统信任库。声明了它，插件就能连自签证书的局域网服务
+     * （例如电脑上的 DSH 移动网关），而其余证书一律拒绝——见 [_pluginTls]。
+     */
+    val pinnedCaSha256: String? = null,
     val description: String? = null,
     val author: String? = null,
     val homepage: String? = null,
@@ -62,6 +69,18 @@ data class JsPluginManifest(
 
         /** 入口脚本默认名 */
         const val DEFAULT_ENTRY = "main.js"
+
+        /**
+         * `pinnedCaSha256` 的哨兵值：指纹由运行时提供。
+         *
+         * 用于「一个包分发给多个用户」：每台电脑的 dsh-mobile 都会生成自己的 CA，
+         * 指纹无法预先写进包。插件改为从用户粘贴的配对链接里取 `instance=`
+         * （网关把它设为 CA 指纹），再交给 `ctx.http.trustCa` 比对。
+         *
+         * 安全强度不降低：指纹仍由用户从自己电脑取得、带外交给 App，
+         * 中间人伪造的证书算不出这个指纹。
+         */
+        const val PINNED_CA_RUNTIME = "runtime"
 
         /**
          * 解析 manifest。
@@ -95,6 +114,19 @@ data class JsPluginManifest(
                 metrics = JsTypeConverter.toMetricSpecs(o.optJSONArray("metrics")),
                 credentialSpec = JsTypeConverter.toCredentialSpec(o.optJSONArray("credentialSpec")),
                 declaredHash = o.optString("sha256").ifBlank { null },
+                // 只接受规范格式：写错的指纹必须让包加载失败，
+                // 而不是静默退化成「信任系统证书」——那会让插件以为连上了自签服务
+                //
+                // `runtime` 是哨兵值：指纹不在包里写死，由插件在配对时从
+                // 用户粘贴的配对链接（`instance=` 段）取，见 [PINNED_CA_RUNTIME]。
+                // 这是「一个包分发给多个用户」的唯一可行方式——每台电脑的
+                // dsh-mobile 首次启动都会生成自己的 CA，指纹不可能预先知道。
+                pinnedCaSha256 = o.optString("pinnedCaSha256")
+                    .ifBlank { null }
+                    ?.let { raw ->
+                        if (raw.equals(PINNED_CA_RUNTIME, ignoreCase = true)) PINNED_CA_RUNTIME
+                        else PluginTls.normalizeFingerprint(raw) ?: return null
+                    },
                 description = o.optString("description").ifBlank { null },
                 author = o.optString("author").ifBlank { null },
                 homepage = o.optString("homepage").ifBlank { null },

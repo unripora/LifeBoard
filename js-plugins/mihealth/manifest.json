@@ -1,9 +1,9 @@
 {
   "id": "com.lifeboard.plugin.mihealth",
   "name": "小米运动健康",
-  "version": "1.6.0",
-  "versionCode": 26,
-  "apiVersion": 1,
+  "version": "1.7.1",
+  "versionCode": 28,
+  "apiVersion": 4,
   "entry": "main.js",
   "description": "从小米运动健康云端拉取步数、距离、热量、睡眠（含深睡/效率/清醒次数/规律性）、心率、静息心率、血氧、压力与等级、体重与全部身体成分、训练负荷、能量、耳机噪声、每日目标达成等指标",
   "author": "LifeBoard",

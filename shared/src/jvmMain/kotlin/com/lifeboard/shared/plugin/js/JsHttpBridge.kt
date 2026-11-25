@@ -48,10 +48,179 @@ class JsHttpBridge(
      */
     private val tokenProvider: () -> String,
     private val client: OkHttpClient = defaultClient(),
+    /**
+     * manifest 声明要信任的自签 CA 指纹。null 表示不信任任何非系统 CA。
+     *
+     * 由加载器从 manifest 传进来；`ctx.http.trustCa` 拿到的证书必须与它一致，
+     * 否则拒绝——插件不能自己决定信任谁。
+     */
+    private val pinnedCaSha256: String? = null,
+    /**
+     * CA 校验通过并装入 HTTP 客户端后的回调。
+     *
+     * WebSocket 与 HTTP 用的是同一个网关证书，却各自持有独立的
+     * `OkHttpClient`。早先只给 HTTP 装了信任，于是配对那一刻的 HTTPS
+     * 全部正常，详情页一建 `wss://` 就报
+     * `PKIX path building failed`——证书没错，只是另一套 client 还不认识它。
+     *
+     * 由加载器接到同一插件的 [JsWebSocketBridge.installPinnedCa] 上，
+     * 保证「信任一张 CA」对插件是**一次生效、两种通道都生效**。
+     */
+    private val onCaTrusted: ((ByteArray) -> Unit)? = null,
 ) : HostFunctionDispatcher {
 
     /** token → 已发出的请求，用于插件卸载时统一取消。 */
     private val inflight = ConcurrentHashMap<String, Call>()
+
+    /**
+     * 钉扎 CA 之后的 client；未声明 CA 的插件保持 null，走系统信任库。
+     *
+     * 懒建：多数插件不连自签服务，没必要在每个插件加载时都造一份 SSLContext。
+     */
+    @Volatile
+    private var pinnedClient: OkHttpClient? = null
+
+    /**
+     * 安装自签 CA。
+     *
+     * 由加载器在**校验指纹与 manifest 一致之后**调用；桥接本身不再比对指纹，
+     * 因为它拿不到 manifest，也不该有机会「自己决定信任谁」。
+     *
+     * 必须在第一次请求之前调用：已建好的会话 client 是派生副本，
+     * 晚到的 CA 不会回溯生效。
+     */
+    fun installPinnedCa(caDer: ByteArray) {
+        pinnedClient = PluginTls.pin(client, caDer)
+        // 会话 client 是**派生副本且被缓存**（见 clientFor）：在装 CA 之前
+        // 建过的会话仍指向未钉扎的基 client，之后每次请求都 PKIX 失败。
+        //
+        // 这不是理论问题：插件的会话通常在配对前就建好了（先建会话、
+        // 再取 CA、再 trustCa），于是「日志里写着已信任网关 CA，紧接着
+        // 请求仍然报 unable to find valid certification path」。
+        // 清掉缓存后，下一次请求会基于新的基 client 重新派生；CookieJar
+        // 引用的是同一个 jar 实例，cookie 不会丢。
+        sessionClients.clear()
+    }
+
+    /**
+     * `ctx.http.trustCa(caBase64[, expectedSha256])`：信任一张自签 CA。
+     *
+     * ## 为什么要绕一圈而不是直接用指纹建信任
+     *
+     * 指纹只能证明「是这张证书」，不能提供证书本身。证书要由插件从服务端
+     * 取（`GET /mobile-access/ca.cer`），但取它的那次请求本身还没有可信 TLS。
+     * 所以流程是：先用**不校验**的方式把证书取回来（只为了拿到公开的 CA 证书，
+     * 不含私钥），再把算出的指纹与期望值比对——一致才真正装上信任。
+     *
+     * 不校验那一步的安全边界由后面的指纹比对兜住：中间人给的证书过不了比对。
+     *
+     * ## 期望指纹从哪来
+     *
+     * - manifest `pinnedCaSha256` 写死：用包里的值，第二个参数忽略
+     * - manifest 写 `runtime`：用第二个参数。分发给多用户时必须这样——
+     *   每台电脑的 dsh-mobile 各有自己的 CA，包不可能预先知道指纹
+     */
+    private fun trustCa(args: PluginJsonArray): String {
+        val declared = pinnedCaSha256
+            ?: return HostFunctionDispatcher.error(
+                "本插件未在 manifest 声明 pinnedCaSha256，不能信任自签证书"
+            )
+        // 两种模式：
+        // - manifest 写死 64 位指纹：只认那一张，第二个参数被忽略（最严格）
+        // - manifest 写 `runtime`：必须由第二个参数给出期望指纹，用于分发给
+        //   多个用户（每台电脑的 CA 不同，指纹只能来自各自的配对链接）
+        val expected = if (declared.equals(JsPluginManifest.PINNED_CA_RUNTIME, ignoreCase = true)) {
+            PluginTls.normalizeFingerprint(args.stringOrNull(1) ?: "")
+                ?: return HostFunctionDispatcher.error(
+                    "manifest 为 runtime 模式，trustCa 需要第二个参数：期望的 CA 指纹（64 位十六进制）"
+                )
+        } else {
+            declared
+        }
+        val base64 = args.stringOrNull(0)
+            ?: return HostFunctionDispatcher.error("trustCa 需要 CA 证书的 base64")
+        val der = runCatching { java.util.Base64.getMimeDecoder().decode(base64) }
+            .getOrElse { return HostFunctionDispatcher.error("trustCa 的 base64 无法解码") }
+        if (der.isEmpty()) return HostFunctionDispatcher.error("trustCa 的证书为空")
+
+        val actual = PluginTls.fingerprintOf(der)
+        if (actual != expected) {
+            // 指纹不符时绝不能装：这正是防中间人的那一步
+            return HostFunctionDispatcher.error(
+                "CA 指纹不符：声明 $expected，实际 $actual"
+            )
+        }
+        return runCatching {
+            installPinnedCa(der)
+            // 同一份 CA 也要装进 WebSocket 客户端：缺了这一步，HTTPS 一切正常，
+            // 只有 WSS 握手会 PKIX 失败，而错误会被归到「上次连接失败」里，
+            // 很容易误判成配对过期或网关没起来。
+            onCaTrusted?.invoke(der)
+            "null"
+        }.getOrElse {
+            HostFunctionDispatcher.error("CA 安装失败：${it.message ?: it::class.simpleName}")
+        }
+    }
+
+    /** 实际使用的基 client：钉扎过就用自己的，否则用默认的 */
+    private fun baseClient(): OkHttpClient = pinnedClient ?: client
+
+    /**
+     * 抓取自签服务的 CA 证书本身（`ctx.http.caCertificate(url)`）。
+     *
+     * ## 为什么不复用普通请求
+     *
+     * 请求 CA 的那一刻，CA 还没被信任——用普通 client 会直接 SSL 失败，
+     * 形成「要信任它才能取到它，要取到它才能信任它」的死循环。
+     *
+     * ## 为什么可以放宽校验
+     *
+     * CA 证书是**公开信息**（只含公钥，私钥在服务端），取错一张也不泄露什么；
+     * 真正的安全边界在 [trustCa] 的指纹比对：中间人替换的证书过不了那一步。
+     * 因此这里只放宽 TLS，其它一切照旧（超时、重定向、体积上限）。
+     *
+     * 只允许 https：http 明文取回一张「CA」毫无意义，且会掩盖配置错误。
+     */
+    private fun caCertificate(args: PluginJsonArray): String {
+        val url = args.stringOrNull(0)
+            ?: return HostFunctionDispatcher.error("caCertificate 需要 url")
+        if (!url.startsWith("https://", ignoreCase = true)) {
+            return HostFunctionDispatcher.error("caCertificate 只支持 https 地址")
+        }
+        val token = tokenProvider()
+        val lenient = client.newBuilder()
+            .sslSocketFactory(InsecureTls.socketFactory(), InsecureTls.trustManager())
+            .hostnameVerifier { _, _ -> true }
+            .build()
+        val request = runCatching { Request.Builder().url(url).get().build() }
+            .getOrElse { return HostFunctionDispatcher.error("caCertificate 的 url 非法：$url") }
+        val call = lenient.newCall(request)
+        inflight[token] = call
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                inflight.remove(token)
+                runtime.resolveAndDrain(token, error = "取回 CA 证书失败：${e.message ?: "网络错误"}")
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                inflight.remove(token)
+                response.use {
+                    val bytes = it.body?.bytes()
+                    if (bytes == null || !it.isSuccessful) {
+                        runtime.resolveAndDrain(
+                            token,
+                            error = "取回 CA 证书失败：HTTP ${it.code}",
+                        )
+                        return
+                    }
+                    // 直接给 base64：插件侧要把它交给 trustCa 比对指纹
+                    val b64 = java.util.Base64.getEncoder().encodeToString(bytes)
+                    runtime.resolveAndDrain(token, PluginJson.quote(b64))
+                }
+            }
+        })
+        return HostFunctionDispatcher.pending(token)
+    }
 
     /**
      * 本插件专属的重试调度器。
@@ -106,6 +275,10 @@ class JsHttpBridge(
             "ctx.http.lastError" -> lastError()
             // 表单编码是纯字符串运算，不发起请求
             "ctx.http.form" -> form(args)
+            // 声明信任一张自签 CA；指纹由 manifest 校验，插件不能自己决定信任谁
+            "ctx.http.trustCa" -> trustCa(args)
+            // 取回 CA 证书本身：这一刻还没信任它，必须走放宽校验的通道
+            "ctx.http.caCertificate" -> caCertificate(args)
             else -> {
                 val url = args.stringOrNull(0)
                     ?: return HostFunctionDispatcher.error("$name 需要 url")
@@ -118,9 +291,18 @@ class JsHttpBridge(
                         "POST", url, args.stringOrNull(1), args.optJSONObject(2),
                         args.stringOrNull(3),
                     )
+                    // request(method, url, body?, options?, session?)：
+                    // **method 在第 0 位、url 在第 1 位**，与 get/post 的
+                    // 「url 永远第 0 位」不同（见 ctx.d.ts 的 HttpApi.request）。
+                    // 早期这里复用了外层的 `url = args[0]`，于是 method 被当成
+                    // url 传下去，报出「只支持 http/https：POST」，看起来像
+                    // 协议不支持，实际是参数错位。
                     "ctx.http.request" -> launch(
-                        method = args.stringOrNull(1) ?: "GET",
-                        url = url,
+                        method = args.stringOrNull(0) ?: "GET",
+                        url = args.stringOrNull(1)
+                            ?: return HostFunctionDispatcher.error(
+                                "ctx.http.request 需要 (method, url, ...)：第 1 个参数应为 url"
+                            ),
                         body = args.stringOrNull(2),
                         options = args.optJSONObject(3),
                         sessionName = args.stringOrNull(4),
@@ -183,7 +365,7 @@ class JsHttpBridge(
     private fun clientFor(sessionName: String): OkHttpClient =
         sessionClients.computeIfAbsent(sessionName) { key ->
             val jar = sessions.getValue(key).jar
-            client.newBuilder()
+            baseClient().newBuilder()
                 .cookieJar(
                     object : okhttp3.CookieJar {
                         override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) {

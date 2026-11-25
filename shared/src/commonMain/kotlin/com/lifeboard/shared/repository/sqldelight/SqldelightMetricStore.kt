@@ -79,6 +79,14 @@ class SqldelightMetricStore(
         )
     }
 
+    override suspend fun incrementMetric(sourceKey: String, date: String, bucket: String, delta: Double) {
+        // 累加交给 SQL，且两步放进同一事务：方言是 sqlite 3.18，没有 UPSERT 语法
+        q.transaction {
+            q.insertMetricIfAbsent(sourceType = sourceKey, date = date, bucket = bucket)
+            q.incrementMetricValue(value_ = delta, sourceType = sourceKey, date = date, bucket = bucket)
+        }
+    }
+
     override suspend fun deleteMetricsBySource(sourceKey: String): Int =
         q.deleteMetricsBySource(sourceKey).await().toInt()
 

@@ -55,6 +55,18 @@ interface MetricStore {
 
     suspend fun saveMetric(metric: MetricRecord)
 
+    /**
+     * 给某个源某天的值**加上** [delta]（没有该行则新建）。
+     *
+     * 事件型指标（「今天完成了几轮对话」）必须走累加：同一天多次上报是常态，
+     * 覆盖式写入会让最后一次覆盖前面全部计数，表现为「明明完成了很多轮，
+     * 图上只有 1」。
+     *
+     * 累加在 SQL 层完成，不是读-改-写：上报可能来自插件的后台线程，
+     * 读改写之间会被另一次上报插进来而丢更新。
+     */
+    suspend fun incrementMetric(sourceKey: String, date: String, bucket: String, delta: Double)
+
     /** 删除某个数据源的全部指标，返回删除行数。源被移除后清理残留 */
     suspend fun deleteMetricsBySource(sourceKey: String): Int
 

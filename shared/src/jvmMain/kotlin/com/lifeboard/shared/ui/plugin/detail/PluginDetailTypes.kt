@@ -1,6 +1,6 @@
 package com.lifeboard.shared.ui.plugin.detail
 
-import com.lifeboard.plugin.api.UiBlock
+import com.lifeboard.plugin.api.PluginNode
 
 /**
  * 详情页展示的插件通用信息。
@@ -34,8 +34,8 @@ data class PluginDetailUiState(
     /** 插件已不存在（例如在列表页停留期间被卸载），UI 应提示后退出 */
     val missing: Boolean = false,
     val info: PluginDetailInfo? = null,
-    /** 插件自己决定要展示的区块；插件未实现 detailUi 时为空 */
-    val blocks: List<UiBlock> = emptyList(),
+    /** 插件自己决定要展示的节点树；插件未实现 detailUi 时为 null */
+    val root: PluginNode? = null,
     /** 区块顺序策略：默认按插件给的顺序，自定义按用户拖动后的顺序 */
     val orderMode: BlockOrderMode = BlockOrderMode.DEFAULT,
     /** 「全部数据」：上次同步拿到的原始条目，按指标分组 */

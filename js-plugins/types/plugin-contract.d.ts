@@ -1,4 +1,4 @@
-/**
+﻿﻿/**
  * LifeBoard JS 插件契约的类型声明。
  *
  * 对照宿主实现：
@@ -144,62 +144,123 @@ type ChartSpec =
     | { kind: 'bar'; bars: ChartPoint[]; unit?: string; /** 高亮第几根（如「今天」），-1 表示都不高亮 */ highlightIndex?: number }
     | { kind: 'progressRing'; /** 0..1，越界由宿主收敛 */ fraction: number; centerText: string; subtitle?: string };
 
-/** 单个按钮。 */
-interface ButtonSpec {
-    /** 显示文案，留空则用 actionId。 */
-    label?: string;
+/** 间距档位。宿主按设计系统映射到具体 dp，插件不能写像素。 */
+type Spacing = 'none' | 'compact' | 'normal' | 'loose';
 
-    /** 回传给 `onAction` 的标识，插件内唯一且必填。 */
-    actionId: string;
-
-    /** 主操作按钮，一行里只应有一个。 */
-    primary?: boolean;
-
-    /** 默认 true。 */
-    enabled?: boolean;
-}
+/** 文字层级。宿主映射到标题 / 正文 / 说明三档字号。 */
+type Emphasis = 'heading' | 'body' | 'caption';
 
 /**
- * 详情页的一个区块，用 `type` 区分。
+ * 一个「要么给静态值、要么指向宿主数据源」的字段。
  *
- * 不认识的 `type` 会被宿主直接跳过（旧宿主遇到新插件的区块时只少显示一块），
- * 不会整页报错。
+ * 只有 `list.items`、`text.body`、`statusCard.value`、`input.enabled`
+ * 支持绑定。写成 `{ binding: '<source>:<key>:<field>' }` 即把该字段交给宿主托管：
+ * 数据变了宿主自己重绘，插件不必每来一条消息就重调 `detailUi`。
+ *
+ * 本期只有一个数据源 `session`，字段为 `messages` / `status` / `inputEnabled`。
  */
-type UiBlock =
-    | { type: 'text'; title: string; body?: string; tone?: Tone }
+type Bound<T> = T | { binding: string };
+
+/**
+ * 详情页的一个节点，用 `type` 区分。
+ *
+ * 宿主不认识 `type` 时会画一个「此版本暂不支持」的占位，不会整页报错，
+ * 也不会静默消失——后者会让用户以为插件坏了。
+ *
+ * 每个节点都支持 `id`（排序用的稳定标识）与 `locked`（显式禁止拖动）。
+ */
+type UiNode =
+    // ---- 容器 ----
     | {
-          type: 'statusCard';
-          label: string;
-          value: string;
-          tone?: Tone;
-          /** 补充说明，如「上次成功：11-17 08:00」。 */
-          detail?: string | null;
+          type: 'column';
+          children: UiNode[];
+          /** 间距档位，默认 normal */
+          spacing?: Spacing;
+          /** 是否套一层卡片，默认 true。**只有这里能决定套不套卡片**，嵌套容器一般写 false */
+          card?: boolean;
+          title?: string;
+          id?: string;
+          locked?: boolean;
       }
-    | { type: 'buttonRow'; buttons: ButtonSpec[] }
-    | { type: 'chart'; title: string; chart: ChartSpec }
-    | { type: 'customImage'; /** `data:image/...;base64,...` */ dataUri: string; /** 宽高比，默认 1.6 */ aspectRatio?: number }
-    | { type: 'messageList'; /** 按时间正序，最后一条在底部 */ messages: ChatMessage[] }
+    | { type: 'row'; children: UiNode[]; spacing?: Spacing; /** 窄屏自动折行，默认 true */ wrap?: boolean; id?: string; locked?: boolean }
+    | { type: 'collapsible'; title: string; children: UiNode[]; /** 初始是否折叠，默认 true */ collapsed?: boolean; /** 折叠时标题右侧的摘要 */ summary?: string; id?: string; locked?: boolean }
+    | { type: 'spacer'; size?: Spacing; id?: string; locked?: boolean }
+    | { type: 'divider'; id?: string; locked?: boolean }
+
+    // ---- 内容 ----
+    | { type: 'text'; title?: string; body?: Bound<string>; tone?: Tone; emphasis?: Emphasis; id?: string; locked?: boolean }
+    | { type: 'statusCard'; label: string; value: Bound<string>; tone?: Tone; detail?: string; id?: string; locked?: boolean }
+    | { type: 'chart'; chart: ChartSpec; title?: string; id?: string; locked?: boolean }
+    | { type: 'image'; dataUri: string; /** 宽高比，默认 1.6 */ aspectRatio?: number; contentDescription?: string; id?: string; locked?: boolean }
+    | { type: 'progress'; /** 0..1，越界由宿主收敛 */ fraction: number; label?: string; valueText?: string; tone?: Tone; id?: string; locked?: boolean }
+    | { type: 'code'; code: string; language?: string; id?: string; locked?: boolean }
+
+    // ---- 集合 ----
     | {
-          type: 'inputBox';
-          /** 提交时回传给 `onAction` 的标识。 */
+          type: 'list';
+          /**
+           * 静态条目时是「每项的节点数组」，或绑定到会话消息源。
+           *
+           * 两层结构（条目 → 条目内的节点）让宿主能给每项插入分隔线与稳定 key。
+           */
+          items?: Bound<UiNode[][]>;
+          dense?: boolean;
+          /** 条目之间的分隔线，默认 true */
+          separator?: boolean;
+          /** 超过后内部滚动；0 表示不限制。消息列表通常给 320 */
+          maxHeightDp?: number;
+          emptyHint?: string;
+          id?: string;
+          locked?: boolean;
+      }
+    | { type: 'table'; columns: Array<{ title: string; /** 列宽权重，<=0 表示按内容自适应 */ weight?: number; align?: 'start' | 'center' | 'end' }>; rows: string[][]; id?: string; locked?: boolean }
+    | { type: 'keyValue'; entries: Array<{ key: string; value: string; tone?: Tone }>; id?: string; locked?: boolean }
+
+    // ---- 交互 ----
+    | {
+          type: 'button';
+          label: string;
+          /** 为空时渲染成禁用态。 */
+          actionId?: string;
+          primary?: boolean;
+          enabled?: boolean;
+          /** 点击时回传给 `onAction` 的固定 value，多个按钮共用一个 actionId 时用它区分 */
+          payload?: string;
+          id?: string;
+          locked?: boolean;
+      }
+    | {
+          type: 'input';
           actionId: string;
           placeholder?: string;
-          /** 提交按钮文案，默认「发送」。 */
           submitLabel?: string;
-          /** 默认 true。 */
           multiline?: boolean;
-          /** 默认 true；连接断开等场合置 false，只展示不可输入。 */
-          enabled?: boolean;
+          enabled?: Bound<boolean>;
+          /**
+           * 填了就把输入投给数据源（如 `session:main`），**不进** `onAction`。
+           * 会话就是这么收输入的。
+           */
+          submitTo?: string;
+          id?: string;
+          locked?: boolean;
       }
     | {
-          type: 'approval';
-          title: string;
-          detail?: string;
-          /** 与按钮同构；点击后回传该项的 actionId。 */
-          options: ButtonSpec[];
-          /** 等待态：只显示「等待处理…」，不显示选项，防止重复提交。 */
-          waiting?: boolean;
-      };
+          type: 'select';
+          actionId: string;
+          options: Array<{ value: string; label?: string }>;
+          label?: string;
+          multiple?: boolean;
+          /** 非空时出现确认按钮；单选留空=选中即提交 */
+          submitLabel?: string;
+          enabled?: boolean;
+          id?: string;
+          locked?: boolean;
+      }
+    | { type: 'toggle'; actionId: string; label: string; checked?: boolean; enabled?: boolean; id?: string; locked?: boolean }
+
+    // ---- 媒体（宿主当前降级为「暂不支持」占位，可先写，等宿主实现播放器）----
+    | { type: 'audio'; source: string; title?: string; subtitle?: string; durationSeconds?: number; id?: string; locked?: boolean }
+    | { type: 'video'; source: string; posterDataUri?: string; aspectRatio?: number; title?: string; autoplay?: boolean; id?: string; locked?: boolean };
 
 /** 一条消息。`pending` 表示尚未完成（流式输出中或等待回复）。 */
 interface ChatMessage {
@@ -218,8 +279,10 @@ interface ChatMessage {
 /**
  * `onAction(actionId, value?)` 的约定。
  *
- * - `buttonRow` / `approval` 的选项：只有 `actionId`，`value` 为 `undefined`
- * - `inputBox` 提交：`actionId` 是输入框的标识，`value` 是用户输入的文本
+ * - `button`：只有 `actionId`，`value` 是声明的 `payload`（未声明则为空）
+ * - `input` 提交：`value` 是用户输入的文本。**声明了 `submitTo` 的输入框不会到这里**
+ * - `select`：单选传选中项的 value；多选传 JSON 数组文本，如 `["a","c"]`
+ * - `toggle`：传 `"true"` / `"false"`
  *
  * 只写一个形参（`function onAction(actionId)`）同样可用，宿主会多传一个 `value`。
  */
@@ -230,8 +293,8 @@ interface ChatMessage {
  * 插件**不能**直接操作宿主界面。
  */
 type ActionResult =
-    /** 界面内容变了，用新区块重绘。最常用：处理完动作顺手带回最新 UI。 */
-    | { type: 'refreshUi'; blocks: UiBlock[] }
+    /** 界面内容变了，用新的节点树重绘。最常用：处理完动作顺手带回最新 UI。 */
+    | { type: 'refreshUi'; root: UiNode }
     /** 只弹一句提示，界面不变。不得拼入凭据等敏感内容。 */
     | { type: 'showMessage'; text?: string }
     /** 请求宿主立刻跑一次完整采集并落库。 */

@@ -359,19 +359,26 @@ class JsPluginLoader(
                 contextProvider = { contextRef.require() },
                 pluginIdProvider = { manifest.id },
             )
-            // HTTP 桥不持有 JsRuntime：OkHttp 回调在别的线程，
-            // 必须把结果投回插件专用线程，由 JsPluginRuntime 统一调度
-            val http = JsHttpBridge(
-                runtime = runtime,
-                tokenProvider = { "js#${httpTokenSeq.incrementAndGet()}" },
-            )
-            val crypto = JsCryptoBridge()
             // WebSocket 桥同样只持有 runtime：OkHttp 回调在别的线程，
             // 帧统一投回插件专用线程再落地 Promise
             val ws = JsWebSocketBridge(
                 runtime = runtime,
                 tokenProvider = { "ws#${wsTokenSeq.incrementAndGet()}" },
+                pinnedCaSha256 = manifest.pinnedCaSha256,
             )
+            // HTTP 桥不持有 JsRuntime：OkHttp 回调在别的线程，
+            // 必须把结果投回插件专用线程，由 JsPluginRuntime 统一调度
+            val http = JsHttpBridge(
+                runtime = runtime,
+                tokenProvider = { "js#${httpTokenSeq.incrementAndGet()}" },
+                pinnedCaSha256 = manifest.pinnedCaSha256,
+                // 配对时插件只调用一次 `ctx.http.trustCa`，但网关的 HTTPS 与 WSS
+                // 用的是同一张自签 CA。只装 HTTP 的后果是配对顺利、详情页一建
+                // `wss://` 就 PKIX 失败——从界面看只是「上次连接失败」，
+                // 很难联想到另一套客户端还没信任这张证书。
+                onCaTrusted = { der -> ws.installPinnedCa(der) },
+            )
+            val crypto = JsCryptoBridge()
             httpHolder[0] = http
             wsHolder[0] = ws
             bridgeHolder[0] = contextBridge
@@ -414,6 +421,7 @@ class JsPluginLoader(
             contextBridge = contextBridge,
             bindContext = { ctx -> contextRef.set(ctx) },
             declaredApiVersion = manifest.apiVersion,
+            pinnedCaSha256 = manifest.pinnedCaSha256,
         )
         streamHolder[0] = plugin
 

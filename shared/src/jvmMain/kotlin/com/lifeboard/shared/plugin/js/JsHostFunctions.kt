@@ -31,6 +31,7 @@ object JsHostFunctions {
     /** 凭据与文件、历史、日志、id，见 [JsPluginContextBridge] */
     val CONTEXT: List<String> = listOf(
         "ctx.credentials.get",
+        "ctx.credentials.set",
         "ctx.credentials.put",
         "ctx.credentials.remove",
         "ctx.credentials.clear",
@@ -42,6 +43,8 @@ object JsHostFunctions {
         "ctx.recentMetrics",
         "ctx.reportRawRecords",
         "ctx.reportMetricQueried",
+        // 事件型指标的即时累加上报：会话完成一轮、任务失败一次都走这条
+        "ctx.report",
         "ctx.log.d",
         "ctx.log.i",
         "ctx.log.w",
@@ -66,6 +69,9 @@ object JsHostFunctions {
         "ctx.http.cookieRemove",
         "ctx.http.cookieClear",
         "ctx.http.cookieAll",
+        // 自签证书：取回 CA（放宽校验）→ 比对 manifest 指纹 → 装信任
+        "ctx.http.caCertificate",
+        "ctx.http.trustCa",
     )
 
     /** 摘要与编解码，见 [JsCryptoBridge] */

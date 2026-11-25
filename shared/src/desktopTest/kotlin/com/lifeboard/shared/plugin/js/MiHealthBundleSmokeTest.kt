@@ -1,6 +1,7 @@
 package com.lifeboard.shared.plugin.js
 
 import com.lifeboard.plugin.api.AuthState
+import com.lifeboard.plugin.api.ColumnNode
 import com.lifeboard.plugin.api.CredentialSpec
 import com.lifeboard.plugin.api.CredentialStore
 import com.lifeboard.plugin.api.MetricBucket
@@ -127,12 +128,16 @@ class MiHealthBundleSmokeTest {
         val auth = runBlocking { plugin.authState(fakeContext) }
         assertTrue("无凭据时 authState 应为 LoggedOut，实际：$auth", auth is AuthState.LoggedOut)
 
-        // detailUi 走 recentMetrics + 拼装 UiBlock，覆盖最容易在打包后出错的对象构造
+        // detailUi 走 recentMetrics + 拼装节点树，覆盖最容易在打包后出错的对象构造
         val ui = runBlocking { plugin.detailUi(fakeContext) }
-        assertTrue("detailUi 不应为空，实际 ${ui.size} 块", ui.isNotEmpty())
+        assertTrue("detailUi 不应为空，实际 $ui", ui != null)
+        // 插件返回的是平铺数组，解析层会包一层不套卡片的 column
+        val column = ui as? ColumnNode
+        assertTrue("detailUi 根应是 ColumnNode，实际：${ui!!::class.simpleName}", column != null)
+        assertTrue("detailUi 根不应为空列表", column!!.children.isNotEmpty())
         assertTrue(
-            "detailUi 第一块应是状态卡，实际：${ui.first()}",
-            ui.first().toString().contains("StatusCard") || ui.first().toString().contains("statusCard"),
+            "detailUi 第一块应是状态卡，实际：${column.children.first()}",
+            column.children.first().toString().contains("StatusCard"),
         )
 
         // health 在无凭据时返回 broken，不触网

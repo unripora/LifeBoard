@@ -9,7 +9,7 @@ import com.lifeboard.plugin.api.SessionAction
 import com.lifeboard.plugin.api.SessionConfig
 import com.lifeboard.plugin.api.SessionEvent
 import com.lifeboard.plugin.api.SessionUiEvent
-import com.lifeboard.plugin.api.UiBlock
+import com.lifeboard.plugin.api.PluginNode
 import com.lifeboard.server.collect.DailyAggregateWorker
 import com.lifeboard.server.db.DatabaseProviders
 import com.lifeboard.shared.log.AppLogger
@@ -203,6 +203,11 @@ object PluginManager {
      *
      * 只标记该插件不可调度，**不重建整个列表**：重建会连带换掉其他正在采集的插件实例。
      * 撤销的目的就是「别再用了」，让正在跑的那次自然结束即可。
+     *
+     * 标记会同时从 `SourceProviderRegistry` 撤掉该插件的 Provider（见
+     * `JsPluginLoader.registerProviders` 按 `trusted` 过滤），因此界面里
+     * 不会再有它的数据源入口；已经取走的采集器会通过同一个包装上的
+     * `trusted = false` 观察到停止标记。
      */
     fun revokeTrust(context: Context, pluginId: String) {
         val appContext = context.applicationContext
@@ -392,17 +397,17 @@ object PluginManager {
     /**
      * 插件自己在详情页要展示的内容。
      *
-     * 插件未加载、未信任或抛异常时返回空列表：详情页还有宿主固定的通用信息与通用操作，
+     * 插件未加载、未信任或抛异常时返回 null：详情页还有宿主固定的通用信息与通用操作，
      * 不该因为插件自己出错就整页打不开；未信任的更不该再被调用。
      */
-    suspend fun detailUi(context: Context, pluginId: String): List<UiBlock> {
+    suspend fun detailUi(context: Context, pluginId: String): PluginNode? {
         val appContext = context.applicationContext
-        val plugin = findPlugin(appContext, pluginId) ?: return emptyList()
-        if (!plugin.trusted) return emptyList()
+        val plugin = findPlugin(appContext, pluginId) ?: return null
+        if (!plugin.trusted) return null
         return withContext(Dispatchers.IO) {
             runCatching {
                 plugin.plugin.detailUi(HostPluginContext(pluginId, appContext))
-            }.getOrElse { emptyList() }
+            }.getOrNull()
         }
     }
 

@@ -10,11 +10,39 @@
 
 /// <reference path="../index.d.ts" />
 
-import type { UiBlock } from '../index.js';
+import type { UiNode } from '../index.js';
 
-/** 构造一个详情页状态卡，验证 UiBlock 联合类型的写法。 */
-export function statusCard(label: string, value: string): UiBlock {
-    return { type: 'statusCard', label, value, tone: 'ok', detail: null };
+/** 构造一个详情页状态卡，验证节点联合类型的写法。 */
+export function statusCard(label: string, value: string): UiNode {
+    return { type: 'statusCard', label, value, tone: 'ok', detail: '' };
+}
+
+/**
+ * 验证绑定写法能被类型系统接受，且静态值与绑定可以共用同一套节点类型。
+ *
+ * 会话界面就是这么拼的：消息列表与输入框各是一个普通节点，
+ * 数据由 `binding` 指向宿主数据源。
+ */
+export function sessionView(): UiNode {
+    return {
+        type: 'column',
+        children: [
+            {
+                type: 'list',
+                maxHeightDp: 320,
+                emptyHint: '还没有消息',
+                items: { binding: 'session:main:messages' },
+            },
+            {
+                type: 'input',
+                actionId: 'send',
+                placeholder: '说点什么',
+                submitTo: 'session:main',
+                enabled: { binding: 'session:main:inputEnabled' },
+            },
+            { type: 'text', emphasis: 'caption', body: { binding: 'session:main:status' } },
+        ],
+    };
 }
 
 /** 验证 ctx 的能力都在声明里，且参数顺序与宿主一致。 */

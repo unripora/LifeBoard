@@ -1,4 +1,4 @@
-// 小米运动健康 JS 插件 —— 契约实现
+﻿﻿﻿﻿﻿﻿// 小米运动健康 JS 插件 —— 契约实现
 //
 // 这是整个插件唯一的入口。宿主通过 callFunction 调用本模块的导出函数：
 //   login(inputs) / logout() / authState() / fetch(date) / health() / detailUi() / onAction(actionId)
@@ -29,10 +29,10 @@ import type {
     AuthState,
     FetchResult,
     LoginResult,
+    UiNode,
     PluginHealth,
     PluginMetric,
     Tone,
-    UiBlock,
 } from '../types/index.js';
 
 import {
@@ -1383,7 +1383,10 @@ async function startLogin(account: string, password: string): Promise<LoginResul
     // ① 握手。服务端响应带 &&&START&&& 前缀，只能用插件自己的 parseMiapi 解析
     // （serviceLogin 内部就是这么做的），不能读宿主给的 json 字段：
     // 宿主是严格 JSON 解析，遇到前缀必然失败并返回 null。
-    const handshake = await serviceLogin(session);
+    // 必须传 account：服务端靠 `userId=<账号>` cookie 定位账号，
+    // 缺了它不下发 _sign（回一个 code:0 + psecurity 的「已登录」型响应），
+    // 表现为「未拿到 _sign」，换任何密码都无效。
+    const handshake = await serviceLogin(session, account);
     if (!handshake || !handshake._sign) {
         log('e', '握手失败：未拿到 _sign，响应=' + JSON.stringify(handshake || null).slice(0, 200));
         return { type: 'failure', message: '登录握手失败：无法连接小米登录服务或未拿到 _sign' };
@@ -1625,8 +1628,8 @@ export async function health(): Promise<PluginHealth> {
  * 这里**不发网络请求**：详情页可能被频繁打开，每次进来都拉一次接口
  * 既慢又浪费。要更新数据由用户点「立即同步」，走 triggerSync。
  */
-export async function detailUi(): Promise<UiBlock[]> {
-    const blocks: UiBlock[] = [];
+export async function detailUi(): Promise<UiNode[]> {
+    const blocks: UiNode[] = [];
     try {
         const auth = await authState();
 
@@ -1643,7 +1646,7 @@ export async function detailUi(): Promise<UiBlock[]> {
             detail = auth.message || '';
         }
 
-        blocks.push({ type: 'statusCard', label: '登录状态', value: label, tone, detail: detail || null });
+        blocks.push({ type: 'statusCard', label: '登录状态', value: label, tone, detail: detail });
 
         const recentSteps = recentValues(STEPS_KEY);
         const recentSleep = recentValues(SLEEP_KEY);
@@ -1707,7 +1710,7 @@ export async function detailUi(): Promise<UiBlock[]> {
             const deepRatio = recentValues(SLEEP_DEEP_RATIO_KEY);
             const efficiency = recentValues(SLEEP_EFFICIENCY_KEY);
             const regularity = recentValues(SLEEP_REGULARITY_KEY);
-            const detailCards: UiBlock[] = [];
+            const detailCards: UiNode[] = [];
             if (deepRatio.length > 0) {
                 detailCards.push({
                     type: 'statusCard',
@@ -1745,10 +1748,12 @@ export async function detailUi(): Promise<UiBlock[]> {
         }
 
         const loggedIn = auth.state === 'loggedIn';
+        // 一排按钮：不套卡片（row 本来就不套），与旧 buttonRow 的视觉一致
         blocks.push({
-            type: 'buttonRow',
-            buttons: [
+            type: 'row',
+            children: [
                 {
+                    type: 'button',
                     label: '立即同步',
                     actionId: ACTION_SYNC,
                     primary: true,
@@ -1756,6 +1761,7 @@ export async function detailUi(): Promise<UiBlock[]> {
                     enabled: loggedIn,
                 },
                 {
+                    type: 'button',
                     label: '回补近 ' + BACKFILL_DAYS + ' 天',
                     actionId: ACTION_BACKFILL,
                     // 回补只补原始条目（供查看核对），不改历史聚合值与得分

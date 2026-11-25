@@ -1,5 +1,6 @@
 package com.lifeboard.shared.plugin.js
 
+import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.shared.plugin.json.PluginJsonArray
 import com.lifeboard.shared.plugin.json.PluginJsonObject
 import java.util.concurrent.ConcurrentHashMap
@@ -145,19 +146,28 @@ class SessionCookieJar {
      */
     fun put(name: String, value: String, domain: String, path: String = "/") {
         // OkHttp 的 Cookie.Builder 会自动处理前导点（表示包含子域），
-        // 所以这里只要把点去掉，行为与浏览器一致
+        // 所以这里只要把点去掉，行为与浏览器一致。
+        //
+        // 刻意**不**替插件剥端口：cookie 的 domain 按规范只能是主机名，
+        // 带端口本身就不合法。这里宽容会让插件的参数错误一直潜伏下去，
+        // 换个运行时（比如浏览器内核）就又要重新踩。插件应按契约传主机名。
         val host = domain.trim().trimStart('.')
         if (host.isEmpty() || name.isEmpty()) return
-        runCatching {
-            save(
-                okhttp3.Cookie.Builder()
-                    .name(name)
-                    .value(value)
-                    .path(path.ifBlank { "/" })
-                    .domain(host)
-                    .build(),
-            )
+        val cookie = runCatching {
+            okhttp3.Cookie.Builder()
+                .name(name)
+                .value(value)
+                .path(path.ifBlank { "/" })
+                .domain(host)
+                .build()
+        }.getOrElse { error ->
+            // 早期这里静默吞掉异常：cookie 根本没进 jar，后续请求全部 401，
+            // 表现成「配对成功，一进详情页就说会话已失效」，完全看不出是这一行。
+            // 不替插件修参数，但必须让错误可见。
+            AppLogger.warn("写 cookie 失败：$name @ $domain（${error.message ?: error::class.simpleName}）")
+            return
         }
+        save(cookie)
     }
 
     /** 供桥接层拼调试日志：只给键名，不给值 */

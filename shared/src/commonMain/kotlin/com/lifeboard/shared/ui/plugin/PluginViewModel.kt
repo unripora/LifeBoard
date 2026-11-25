@@ -14,11 +14,14 @@ import com.lifeboard.shared.task.TaskCenter
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 插件页面上的一行「已装可用」插件。
@@ -170,6 +173,16 @@ class PluginViewModel(
     val state: StateFlow<PluginUiState> = _state.asStateFlow()
 
     /**
+     * 宿主的盘面流。
+     *
+     * 只取一次：实现方（两端都是 `StateFlow`）在 `snapshots()` 里
+     * 顺带启动目录监听，[refresh] 若重复调用会重复登记一遍。
+     * 引擎不可用时为 null，此时不订阅、也不扫描。
+     */
+    private val snapshotFlow: Flow<PluginList>? =
+        if (deps.plugins.engineAvailable()) deps.plugins.snapshots() else null
+
+    /**
      * 订阅插件盘面。
      *
      * 宿主在插件目录变化时会自己重扫并推新值，所以这里不需要轮询，
@@ -182,9 +195,10 @@ class PluginViewModel(
     init {
         // 引擎不可用时直接定版：不再订阅盘面。宿主在缺库的机型上
         // 扫描必然失败，订阅只会让界面在「加载中」与空列表之间空转
-        if (deps.plugins.engineAvailable()) {
+        val flow = snapshotFlow
+        if (flow != null) {
             scope.launch {
-                deps.plugins.snapshots().collect { list -> applyList(list) }
+                flow.collect { list -> applyList(list) }
             }
         } else {
             _state.value = PluginUiState(loading = false, engineUnavailable = true)
@@ -194,7 +208,7 @@ class PluginViewModel(
     /**
      * 最近一次从宿主收到的盘面。
      *
-     * **为什么必须自己存**：`snapshots()` 是 `StateFlow`，宿主重扫后若
+     * **为什么必须自己存**：实现方返回的是 `StateFlow`，宿主重扫后若
      * 装了什么、版本、指标都没变，它推来的 `PluginList` 与旧值**相等**，
      * StateFlow 会直接吞掉这次发射。而「登录态变了」恰恰不体现在
      * `PluginList` 里（它在 [toRow] 里现问插件），于是列表会一直停在
@@ -245,7 +259,7 @@ class PluginViewModel(
     /**
      * 手动刷新。
      *
-     * 列表本身已经靠 [snapshots] 自动更新，这个入口只保留给
+     * 列表本身已经靠 [snapshotFlow] 自动更新，这个入口只保留给
      * 「刚改完文件、不想等轮询间隔」的场景与界面的显式刷新按钮。
      *
      * 扫完一定再 [reloadRows] 一次：重扫结果与旧值相等时 StateFlow 不会发射，
@@ -253,6 +267,25 @@ class PluginViewModel(
      */
     fun refresh() {
         scope.launch {
+            // 宿主已经扫过（盘面 ready）就直接用缓存，**不再重扫**。
+            //
+            // 页面重建会走到这里：切到别的页签再切回来时，`PluginScreen`
+            // 的 `rememberCoroutineScope` 随组合销毁，VM 被重建、`lastList`
+            // 归零。此时若照旧全量重扫，`scan()` 会释放并重建所有插件运行时——
+            // 正在跑的采集会被打断，且运行时被占用时 scan 可能返回空列表，
+            // 界面就变成「一个插件都没有」。用缓存盘面重建列表既快又安全。
+            //
+            // 接口签名是 `Flow`，取不到同步值；而两端实现都是 `StateFlow`，
+            // 订阅后当前值会立刻到手。首启时宿主还没扫完（ready = false），
+            // 等到超时再走下面真正的重扫，保证第一次打开仍能列出插件。
+            val flow = snapshotFlow ?: return@launch
+            val cached = withTimeoutOrNull(CACHED_SNAPSHOT_WAIT_MS) {
+                flow.first { it.ready }
+            }
+            if (cached != null) {
+                applyList(cached)
+                return@launch
+            }
             _state.value = _state.value.copy(loading = true)
             runCatching { deps.plugins.refresh() }
                 .onFailure { error ->
@@ -611,6 +644,14 @@ class PluginViewModel(
                 is LoginResult.Success -> {
                     _state.value = _state.value.copy(login = null, message = "$displayName 登录成功")
                     refresh()
+                    // 登录成功后立刻同步一次。
+                    //
+                    // 健康度存在 `source_health` 表里，是**上一次采集的快照**：
+                    // 上一轮因为未登录失败过，那里就留着一条「登录已失效，请重新登录」。
+                    // 不重新采集就覆盖不掉，卡片会同时显示「已登录」和红色的失效提示，
+                    // 看起来像是登录没生效。采集成功会 markHealth(healthy = true) 抹平它。
+                    _state.value.installed.firstOrNull { it.pluginId == pluginId }
+                        ?.let { collectNow(it) }
                 }
 
                 is LoginResult.NeedInput -> {
@@ -663,5 +704,17 @@ class PluginViewModel(
             _state.value = _state.value.copy(message = "已退出 ${row.displayName}")
             refresh()
         }
+    }
+
+    private companion object {
+        /**
+         * 等「宿主已扫过的盘面」的上限。
+         *
+         * 页面重建时实现方给的是 `StateFlow`，当前值会立刻到手，几乎不耗时。
+         * 首启时这个上限要覆盖宿主的首扫：订阅 `snapshots()` 本身就会触发一次
+         * 扫描（解压 + 建 QuickJS 运行时，可能要几秒），等它出结果比在超时后
+         * 再补一次全量重扫更划算——重扫会重复释放重建运行时。
+         */
+        const val CACHED_SNAPSHOT_WAIT_MS = 3_000L
     }
 }

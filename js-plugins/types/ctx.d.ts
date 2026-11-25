@@ -178,7 +178,9 @@ interface HttpApi {
      *
      * 主要用在**伪造客户端身份**：服务端要求先看到某个它没下发过的 cookie。
      *
-     * @param domain 必填，不能为空
+     * @param domain 必填，**只能是主机名，不能带端口**（`example.com`，不是
+     *   `example.com:8443`）。带端口时 cookie 会被拒绝、静默种不进去，
+     *   随后每个请求都拿不到它。注意与 `Host` 头区分：后者要带端口。
      * @param path 默认 `/`
      */
     cookieSet(session: string, name: string, value: string, domain: string, path?: string): void;
@@ -191,6 +193,31 @@ interface HttpApi {
 
     /** 导出会话全部 cookie 为 `{ name: value }`。 */
     cookieAll(session: string): Record<string, string>;
+
+    /**
+     * 取回一个自签服务的 CA 证书（DER 的 base64）。
+     *
+     * 这一步**不校验**服务端 TLS——此刻 CA 还没被信任，正常校验必然失败。
+     * 安全性由随后的 {@link HttpApi.trustCa trustCa} 指纹比对保证：
+     * 中间人替换的证书过不了那一步。
+     *
+     * @param url 必须是 `https://`；http 拿回一张「CA」毫无意义
+     */
+    caCertificate(url: string): Promise<string>;
+
+    /**
+     * 信任一张自签 CA。
+     *
+     * 只在指纹与期望值一致时装上，否则抛错——插件确实可以声明信任目标，
+     * 但只能在 manifest 允许的范围内：写死指纹时只认那一张；写 `runtime`
+     * 时必须由 `expectedSha256` 明确给出。装好之后，本插件的 `ctx.http.*`
+     * 与 `ctx.ws.*` 都只信任这张 CA。必须在第一次业务请求之前调用。
+     *
+     * @param caBase64 `caCertificate` 返回的 base64，或包内自带的证书
+     * @param expectedSha256 manifest 为 `runtime` 时必填：期望的 CA 指纹
+     *   （64 位十六进制，通常取自配对链接的 `instance=` 段）
+     */
+    trustCa(caBase64: string, expectedSha256?: string): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +228,17 @@ interface HttpApi {
 interface WsOptions {
     /** 握手请求额外请求头。 */
     headers?: HeaderMap;
+
+    /**
+     * 复用 HTTP 会话的 cookie。
+     *
+     * WS 与 HTTP 是两套客户端，`CookieJar` 挂在 HTTP 会话上，握手不会自动带上。
+     * 给会话名后，宿主取该会话里对握手 URL 生效的 cookie 并写成 `Cookie` 头；
+     * 插件自己写了 `Cookie` 头时以插件为准。
+     *
+     * 网关这类「只读 Cookie 鉴权」的服务必须给，否则握手会被当成匿名请求拒绝。
+     */
+    session?: string;
 }
 
 /** `ctx.ws.state()` 的返回值。 */
@@ -525,6 +563,28 @@ interface PluginCtx {
      * @param date 缺省用本次采集日
      */
     reportMetricQueried(metricKey: string, date?: string): void;
+
+    /**
+     * 给某个指标**加上**一个值（累加，不是覆盖）。
+     *
+     * ## 和 `fetch` 的分工
+     *
+     * `fetch` 是宿主定时拉取的「每日聚合量」；这个函数是插件在任意时刻上报的
+     * 「刚刚发生了一件事」。会话完成一轮、任务失败一次，都走这条。
+     *
+     * 同一天同一指标多次调用会累加——这正是事件计数想要的。
+     * 需要覆盖语义请返回 `fetch` 的结果，不要用 `report` 硬凑。
+     *
+     * `metricKey` 必须属于 manifest 的 `metrics`；未声明的键会被丢弃并记一条
+     * 宿主告警（写进去就是一行没有量纲、没人能解释的数据）。
+     *
+     * **不保证幂等**：只在自己确知「这件事发生了一次」时调用，
+     * 不要在重试循环里调用。
+     *
+     * @param value 本次增量，通常是 1
+     * @param at 归属日期 `yyyy-MM-dd`；缺省为宿主本地时区的今天
+     */
+    report(metricKey: string, value: number, at?: string): void;
 
     /** 本插件 id。 */
     pluginId(): string;

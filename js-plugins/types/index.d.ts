@@ -9,7 +9,7 @@
  *
  * ## 为什么用 `declare global` 而不是直接写 `declare const`
  *
- * 契约类型（`UiBlock`、`FetchResult` 等）需要能被 `import type` 引入，
+ * 契约类型（`UiNode`、`FetchResult` 等）需要能被 `import type` 引入，
  * 而一个纯脚本式的 `.d.ts`（没有顶层 import/export）里的类型无法被导出。
  * 所以文件本身是模块，靠 `declare global` 把 `ctx` 挂到全局，
  * 其余类型用普通 `export` 暴露。
@@ -29,17 +29,20 @@
 export type {
     ActionResult,
     AuthState,
-    ButtonSpec,
+    Bound,
     ChartPoint,
     ChartSpec,
+    ChatMessage,
+    Emphasis,
     FetchResult,
     FetchResultObject,
     InputField,
     LoginResult,
     PluginHealth,
     PluginMetric,
+    Spacing,
     Tone,
-    UiBlock,
+    UiNode,
 } from './plugin-contract.js';
 
 export type {

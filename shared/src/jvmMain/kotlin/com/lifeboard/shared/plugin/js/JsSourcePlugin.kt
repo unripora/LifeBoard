@@ -11,12 +11,12 @@ import com.lifeboard.plugin.api.MetricSpec
 import com.lifeboard.plugin.api.PluginApi
 import com.lifeboard.plugin.api.PluginContext
 import com.lifeboard.plugin.api.PluginHealth
+import com.lifeboard.plugin.api.PluginNode
 import com.lifeboard.plugin.api.SessionAction
 import com.lifeboard.plugin.api.SessionConfig
 import com.lifeboard.plugin.api.SessionEvent
 import com.lifeboard.plugin.api.SessionUiEvent
 import com.lifeboard.plugin.api.SourcePlugin
-import com.lifeboard.plugin.api.UiBlock
 import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.shared.plugin.json.PluginJson
 import com.lifeboard.shared.plugin.json.PluginJsonObject
@@ -71,6 +71,12 @@ class JsSourcePlugin(
      * 混用会让上层拿到的版本号既不能判断兼容性也没有别的用处。
      */
     declaredApiVersion: Int = 0,
+    /**
+     * manifest 里声明的自签 CA 指纹。
+     *
+     * 非空时，桥接层会把 HTTP/WS 的 TLS 信任收敛到「只认这张证书」。
+     */
+    internal val pinnedCaSha256: String? = null,
     /**
      * 单次调用的「无进展」等待上限。
      *
@@ -216,9 +222,15 @@ class JsSourcePlugin(
         return JsTypeConverter.toPluginHealth(raw)
     }
 
-    override suspend fun detailUi(context: PluginContext): List<UiBlock> {
-        val raw = invoke(context, "detailUi", "[]") ?: return emptyList()
-        return JsTypeConverter.toUiBlocks(raw)
+    override suspend fun detailUi(context: PluginContext): PluginNode? {
+        val raw = invoke(context, "detailUi", "[]") ?: return null
+        val parsed = JsTypeConverter.toUiTree(raw)
+        // 截断与未知类型都要在日志里留痕：用户在界面上只会看到「内容略多」
+        // 或「暂不支持」的占位，没有日志就无从判断是插件写错还是宿主太旧
+        if (parsed.truncated) {
+            AppLogger.warn("插件 ${context.pluginId} 的详情页节点数超上限，已截断")
+        }
+        return parsed.root
     }
 
     override suspend fun onAction(

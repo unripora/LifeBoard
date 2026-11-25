@@ -59,6 +59,12 @@ class JsWebSocketBridge(
      */
     private val tokenProvider: () -> String,
     private val client: OkHttpClient = sharedClient(),
+    /**
+     * manifest 声明要信任的自签 CA 指纹；与 [JsHttpBridge] 用同一个值。
+     *
+     * 声明了它，插件就能连 `wss://` 的自签网关；否则只能连系统信任的证书。
+     */
+    private val pinnedCaSha256: String? = null,
 ) : HostFunctionDispatcher {
 
     /**
@@ -69,6 +75,33 @@ class JsWebSocketBridge(
      * `recv` 拿到 close 帧、靠 `state` 读到终态。
      */
     private val conns = ConcurrentHashMap<String, Conn>()
+
+    /**
+     * 钉扎 CA 之后的 client；未声明 CA 的插件保持 null，走系统信任库。
+     *
+     * WebSocket 也要过 TLS：自签网关的 `wss://` 与 `https://` 用的是同一张证书，
+     * 只给 HTTP 配信任而漏掉 WS，表现是「能登录但发不出消息」，很难联想。
+     */
+    @Volatile
+    private var pinnedClient: OkHttpClient? = null
+
+    /**
+     * 安装自签 CA。由加载器在校验指纹与 manifest 一致之后调用。
+     *
+     * 对已建立的连接不生效——CA 必须在第一次 `connect` 之前装好。
+     *
+     * 加锁：HTTP 桥在插件线程上装完 CA 后回调进来，而 `connect` 也在插件线程，
+     * 看起来天然串行；但 [cancelAll] 允许从加载器线程进入，将来若在别的线程
+     * 重装 CA，裸引用赋值会让某次握手读到半成品状态。用锁把「只改一次引用」
+     * 这件事说清楚，代价可以忽略。
+     */
+    fun installPinnedCa(caDer: ByteArray) {
+        synchronized(this) {
+            pinnedClient = PluginTls.pin(client, caDer)
+        }
+    }
+
+    private fun baseClient(): OkHttpClient = synchronized(this) { pinnedClient ?: client }
 
     fun functionNames(): List<String> = JsHostFunctions.WS
 
@@ -118,7 +151,7 @@ class JsWebSocketBridge(
         val token = tokenProvider()
         // 回调里只带 id，不持有 Conn：回调可能早于本方法返回，
         // 状态一律在插件线程上按 id 查表，避免跨线程共享对象。
-        val socket = client.newWebSocket(request, Listener(id))
+        val socket = baseClient().newWebSocket(request, Listener(id))
         val conn = Conn(socket)
         conn.openToken = token
         conns[id] = conn

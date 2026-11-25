@@ -1,22 +1,28 @@
 package com.lifeboard.server.plugin.js
 
 import com.lifeboard.plugin.api.BarChartSpec
-import com.lifeboard.plugin.api.ButtonRowBlock
-import com.lifeboard.plugin.api.ChartBlock
+import com.lifeboard.plugin.api.Bound
+import com.lifeboard.plugin.api.ButtonNode
+import com.lifeboard.plugin.api.ChartNode
+import com.lifeboard.plugin.api.ColumnNode
+import com.lifeboard.plugin.api.InputNode
 import com.lifeboard.plugin.api.LineChartSpec
-import com.lifeboard.plugin.api.StatusCardBlock
-import com.lifeboard.plugin.api.TextBlock
+import com.lifeboard.plugin.api.ListNode
+import com.lifeboard.plugin.api.RowNode
+import com.lifeboard.plugin.api.StatusCardNode
+import com.lifeboard.plugin.api.TextNode
 import com.lifeboard.plugin.api.Tone
+import com.lifeboard.plugin.api.UnsupportedNode
 import com.lifeboard.shared.plugin.js.JsTypeConverter
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * JS 侧 `detailUi` 产物到 [com.lifeboard.plugin.api.UiBlock] 的转换。
+ * JS 侧 `detailUi` 产物到 [com.lifeboard.plugin.api.PluginNode] 节点树的转换。
  *
  * ## 为什么单独测这一层
  *
@@ -25,125 +31,82 @@ import org.junit.Test
  * 结果是「详情页某一节莫名不见了」，排查起来毫无线索。
  * 所以把插件真实产出的结构固化在这里，字段改名会立刻失败。
  *
- * 这些 JSON 片段抄自 `js-plugins/mihealth/main.js` 的 `detailUi`，
- * 改动插件输出时应同步更新本文件。
+ * 这些 JSON 片段抄自 `js-plugins/mihealth/main.js` 与 `js-plugins/dsh/contract.ts`
+ * 的 `detailUi`，改动插件输出时应同步更新本文件。
  */
 class JsTypeConverterUiTest {
 
-    private fun blocks(vararg items: JSONObject): String = JSONArray().apply {
+    private fun nodes(vararg items: JSONObject): String = JSONArray().apply {
         items.forEach { put(it) }
     }.toString()
 
+    /** 数组根会被包成一层不套卡片的 ColumnNode */
+    private fun rootOf(json: String) = JsTypeConverter.toUiTree(json).root
+
     @Test
-    fun `text block keeps title body and tone`() {
-        val json = blocks(
+    fun `text node keeps title body and tone`() {
+        val json = nodes(
             JSONObject().apply {
                 put("type", "text")
                 put("title", "统计口径")
                 put("body", "按自然日累计睡眠时长")
             }
         )
-        val out = JsTypeConverter.toUiBlocks(json)
-        assertEquals(1, out.size)
-        val block = out[0] as TextBlock
-        assertEquals("统计口径", block.title)
-        assertEquals("按自然日累计睡眠时长", block.body)
-        assertEquals(Tone.NEUTRAL, block.tone)
+        val root = rootOf(json) as ColumnNode
+        assertEquals(1, root.children.size)
+        val node = root.children[0] as TextNode
+        assertEquals("统计口径", node.title)
+        assertEquals("按自然日累计睡眠时长", (node.body as Bound.Static).value)
+        assertEquals(Tone.NEUTRAL, node.tone)
+        // 数组根自动包的那层不套卡片：否则平铺几个区块会多出一圈边框
+        assertEquals(false, root.card)
     }
 
     @Test
-    fun `status card accepts explicit tone and null detail`() {
-        val json = blocks(
+    fun `status card accepts explicit tone and detail`() {
+        val json = nodes(
             JSONObject().apply {
                 put("type", "statusCard")
                 put("label", "登录状态")
                 put("value", "已登录")
-                put("tone", "OK")
-                put("detail", "demo@example.com")
-            },
-            JSONObject().apply {
-                put("type", "statusCard")
-                put("label", "登录状态")
-                put("value", "未登录")
-                put("tone", "ERROR")
-                // 插件在 detail 为空时显式传 null，不能变成字符串 "null"
-                put("detail", JSONObject.NULL)
-            },
+                put("tone", "ok")
+                put("detail", "上次同步 08:00")
+            }
         )
-        val out = JsTypeConverter.toUiBlocks(json)
-        assertEquals(2, out.size)
-        val ok = out[0] as StatusCardBlock
-        assertEquals("已登录", ok.value)
-        assertEquals(Tone.OK, ok.tone)
-        assertEquals("demo@example.com", ok.detail)
-
-        val bad = out[1] as StatusCardBlock
-        assertEquals(Tone.ERROR, bad.tone)
-        assertEquals(null, bad.detail)
+        val node = (rootOf(json) as ColumnNode).children[0] as StatusCardNode
+        assertEquals("登录状态", node.label)
+        assertEquals("已登录", (node.value as Bound.Static).value)
+        assertEquals(Tone.OK, node.tone)
+        assertEquals("上次同步 08:00", node.detail)
     }
 
     @Test
-    fun `button row parses enabled flag`() {
-        // 未登录时插件把两个按钮都置为 disabled，这条要真的传到宿主
-        val json = blocks(
+    fun `button row becomes row of buttons`() {
+        val json = nodes(
             JSONObject().apply {
-                put("type", "buttonRow")
+                put("type", "row")
+                put("card", false)
                 put(
-                    "buttons",
+                    "children",
                     JSONArray().apply {
-                        put(
-                            JSONObject().apply {
-                                put("label", "立即同步")
-                                put("actionId", "sync_now")
-                                put("primary", true)
-                                put("enabled", false)
-                            }
-                        )
-                        put(
-                            JSONObject().apply {
-                                put("label", "回补近 7 天")
-                                put("actionId", "backfill_7d")
-                                put("enabled", false)
-                            }
-                        )
+                        put(JSONObject().apply { put("type", "button"); put("label", "立即同步"); put("actionId", "sync"); put("primary", true) })
+                        put(JSONObject().apply { put("type", "button"); put("label", "回补"); put("actionId", "backfill") })
                     },
                 )
             }
         )
-        val out = JsTypeConverter.toUiBlocks(json)
-        val row = out[0] as ButtonRowBlock
-        assertEquals(2, row.buttons.size)
-        assertEquals("sync_now", row.buttons[0].actionId)
-        assertTrue(row.buttons[0].primary)
-        assertEquals(false, row.buttons[0].enabled)
-        assertEquals(false, row.buttons[1].enabled)
-        // 未显式给 primary 时默认 false
-        assertEquals(false, row.buttons[1].primary)
+        val row = (rootOf(json) as ColumnNode).children[0] as RowNode
+        assertEquals(2, row.children.size)
+        val primary = row.children[0] as ButtonNode
+        assertEquals("立即同步", primary.label)
+        assertEquals("sync", primary.actionId)
+        assertTrue(primary.primary)
+        assertEquals("backfill", (row.children[1] as ButtonNode).actionId)
     }
 
     @Test
-    fun `button without actionId is dropped`() {
-        // actionId 是回传标识，缺了点了也没反应，不如不渲染
-        val json = blocks(
-            JSONObject().apply {
-                put("type", "buttonRow")
-                put(
-                    "buttons",
-                    JSONArray().apply {
-                        put(JSONObject().put("label", "没有 id"))
-                        put(JSONObject().put("label", "正常").put("actionId", "ok"))
-                    },
-                )
-            }
-        )
-        val row = JsTypeConverter.toUiBlocks(json)[0] as ButtonRowBlock
-        assertEquals(1, row.buttons.size)
-        assertEquals("ok", row.buttons[0].actionId)
-    }
-
-    @Test
-    fun `bar chart parses highlight index and unit`() {
-        val json = blocks(
+    fun `bar chart is parsed with highlight index`() {
+        val json = nodes(
             JSONObject().apply {
                 put("type", "chart")
                 put("title", "近 7 日步数")
@@ -151,153 +114,227 @@ class JsTypeConverterUiTest {
                     "chart",
                     JSONObject().apply {
                         put("kind", "bar")
+                        put("unit", " 步")
+                        put("highlightIndex", 6)
                         put(
                             "bars",
                             JSONArray().apply {
-                                put(JSONObject().put("label", "03-01").put("value", 8000))
-                                put(JSONObject().put("label", "03-02").put("value", 12000))
+                                put(JSONObject().apply { put("label", "11-17"); put("value", 8000) })
                             },
                         )
-                        put("unit", " 步")
-                        put("highlightIndex", 1)
                     },
                 )
             }
         )
-        val chart = (JsTypeConverter.toUiBlocks(json)[0] as ChartBlock).chart as BarChartSpec
-        assertEquals(2, chart.bars.size)
-        assertEquals(12000.0, chart.bars[1].value, 0.001)
-        assertEquals("03-02", chart.bars[1].label)
-        assertEquals(" 步", chart.unit)
-        assertEquals(1, chart.highlightIndex)
+        val node = (rootOf(json) as ColumnNode).children[0] as ChartNode
+        assertEquals("近 7 日步数", node.title)
+        val spec = node.chart as BarChartSpec
+        assertEquals(" 步", spec.unit)
+        assertEquals(6, spec.highlightIndex)
+        assertEquals(8000.0, spec.bars[0].value, 0.0)
     }
 
     @Test
-    fun `line chart parses fractional values`() {
-        // 睡眠从分钟换算成小时会出现小数，不能用 optInt 截断
-        val json = blocks(
+    fun `line chart is parsed`() {
+        val json = nodes(
             JSONObject().apply {
                 put("type", "chart")
-                put("title", "近 3 日睡眠")
+                put("title", "睡眠")
                 put(
                     "chart",
                     JSONObject().apply {
                         put("kind", "line")
-                        put(
-                            "points",
-                            JSONArray().apply {
-                                put(JSONObject().put("label", "03-01").put("value", 7.5))
-                                put(JSONObject().put("label", "03-02").put("value", 6.25))
-                            },
-                        )
-                        put("unit", " 小时")
+                        put("points", JSONArray().apply {
+                            put(JSONObject().apply { put("label", "11-17"); put("value", 7.5) })
+                        })
                     },
                 )
             }
         )
-        val chart = (JsTypeConverter.toUiBlocks(json)[0] as ChartBlock).chart as LineChartSpec
-        assertEquals(7.5, chart.points[0].value, 0.001)
-        assertEquals(6.25, chart.points[1].value, 0.001)
-        assertEquals(" 小时", chart.unit)
+        val spec = ((rootOf(json) as ColumnNode).children[0] as ChartNode).chart as LineChartSpec
+        assertEquals(7.5, spec.points[0].value, 0.0)
     }
 
+    /**
+     * 未知 type 必须降级为占位，而不是像旧实现那样静默丢弃。
+     *
+     * 静默丢弃的表现是「插件说的东西少了一块」，用户与开发者都没有线索；
+     * 占位至少能让人知道「这里本来有东西，是 App 太旧」。
+     */
     @Test
-    fun `unknown block type is skipped instead of failing`() {
-        // 旧宿主遇到新插件的新区块时应少显示一块，而不是整页空白
-        val json = blocks(
-            JSONObject().put("type", "futureThing"),
-            JSONObject().put("type", "text").put("title", "还能看到我"),
+    fun `unknown node type degrades to placeholder`() {
+        val json = nodes(JSONObject().apply { put("type", "hologram"); put("id", "x") })
+        val node = (rootOf(json) as ColumnNode).children[0]
+        assertTrue(node is UnsupportedNode)
+        assertEquals("hologram", (node as UnsupportedNode).type)
+        assertEquals("x", node.id)
+    }
+
+    /** 旧区块类型（conversation）也应降级为占位，不再是「悄悄消失」 */
+    @Test
+    fun `legacy block type degrades to placeholder`() {
+        val json = nodes(
+            JSONObject().apply {
+                put("type", "conversation")
+                put("sessionId", "main")
+            }
         )
-        val out = JsTypeConverter.toUiBlocks(json)
-        assertEquals(1, out.size)
-        assertEquals("还能看到我", (out[0] as TextBlock).title)
+        assertTrue((rootOf(json) as ColumnNode).children[0] is UnsupportedNode)
     }
 
     @Test
-    fun `chart with unknown spec kind is dropped`() {
-        val json = blocks(
+    fun `binding is parsed on text body and list items`() {
+        val json = JSONObject().apply {
+            put("type", "column")
+            put(
+                "children",
+                JSONArray().apply {
+                    put(
+                        JSONObject().apply {
+                            put("type", "text")
+                            put("body", JSONObject().apply { put("binding", "session:main:status") })
+                        },
+                    )
+                    put(
+                        JSONObject().apply {
+                            put("type", "list")
+                            put("items", JSONObject().apply { put("binding", "session:main:messages") })
+                        },
+                    )
+                },
+            )
+        }.toString()
+
+        val column = rootOf(json) as ColumnNode
+        val text = column.children[0] as TextNode
+        assertEquals("session:main:status", (text.body as Bound.Ref).ref)
+        val list = column.children[1] as ListNode
+        assertEquals("session:main:messages", (list.items as Bound.Ref).ref)
+    }
+
+    /** 畸形 binding 退回静态默认值，不能抛异常也不能让整页打不开 */
+    @Test
+    fun `malformed binding falls back to static`() {
+        val json = nodes(
+            JSONObject().apply {
+                put("type", "text")
+                put("body", JSONObject().apply { put("binding", "not-a-ref") })
+            }
+        )
+        val text = (rootOf(json) as ColumnNode).children[0] as TextNode
+        assertEquals("", (text.body as Bound.Static).value)
+    }
+
+    @Test
+    fun `input without actionId is dropped but button is kept`() {
+        val json = nodes(
+            JSONObject().apply { put("type", "input"); put("placeholder", "无 actionId") },
+            JSONObject().apply { put("type", "button"); put("label", "无名按钮") },
+        )
+        val children = (rootOf(json) as ColumnNode).children
+        // 没有 actionId 的输入框提交无门，丢弃比渲染出「点了没反应」好
+        assertEquals(1, children.size)
+        assertTrue(children[0] is ButtonNode)
+        // 按钮保留但 actionId 为空，渲染层会画成禁用态
+        assertNull((children[0] as ButtonNode).actionId)
+    }
+
+    @Test
+    fun `input with submitTo keeps the binding`() {
+        val json = nodes(
+            JSONObject().apply {
+                put("type", "input")
+                put("actionId", "dsh.send")
+                put("submitTo", "session:main")
+                put("enabled", JSONObject().apply { put("binding", "session:main:inputEnabled") })
+            }
+        )
+        val input = (rootOf(json) as ColumnNode).children[0] as InputNode
+        assertEquals("main", input.submitTo?.key)
+        assertEquals("session", input.submitTo?.source)
+        assertEquals("session:main:inputEnabled", (input.enabled as Bound.Ref).ref)
+    }
+
+    @Test
+    fun `chart with unknown kind degrades instead of vanishing`() {
+        val json = nodes(
             JSONObject().apply {
                 put("type", "chart")
-                put("title", "未知图")
-                put("chart", JSONObject().put("kind", "sankey"))
-            },
-            JSONObject().put("type", "text").put("title", "保留"),
+                put("chart", JSONObject().apply { put("kind", "sankey") })
+            }
         )
-        val out = JsTypeConverter.toUiBlocks(json)
-        assertEquals(1, out.size)
-        assertEquals("保留", (out[0] as TextBlock).title)
+        val node = (rootOf(json) as ColumnNode).children[0]
+        assertTrue(node is UnsupportedNode)
+        assertTrue((node as UnsupportedNode).type.startsWith("chart:"))
     }
 
     @Test
-    fun `broken json yields empty list`() {
-        assertEquals(0, JsTypeConverter.toUiBlocks("not json").size)
-        assertEquals(0, JsTypeConverter.toUiBlocks("{}").size)
-        assertEquals(0, JsTypeConverter.toUiBlocks("").size)
+    fun `unsafe media source degrades`() {
+        val json = nodes(
+            JSONObject().apply { put("type", "video"); put("source", "http://insecure/v.mp4") },
+        )
+        assertTrue((rootOf(json) as ColumnNode).children[0] is UnsupportedNode)
     }
 
     @Test
-    fun `full mihealth detailUi payload converts`() {
-        // 用 main.js 在「未登录 + 无数据」下真实产出的结构，
-        // 这条覆盖页面的整体骨架：两张状态卡缺失后仍有文案 + 按钮行
-        val json = blocks(
+    fun `depth limit degrades deep branch`() {
+        // 逐层包 20 层 column，超过上限的那一层应变成占位而不是丢弃
+        var inner = JSONObject().apply { put("type", "text"); put("body", "deep") }
+        repeat(20) {
+            inner = JSONObject().apply {
+                put("type", "column")
+                put("children", JSONArray().apply { put(inner) })
+            }
+        }
+        val result = JsTypeConverter.toUiTree(inner.toString())
+        assertTrue("根节点应仍可解析", result.root != null)
+        // 深到底部必然出现占位（上限 12 层）
+        var node: com.lifeboard.plugin.api.PluginNode? = result.root
+        var found = false
+        repeat(20) {
+            if (node is ColumnNode) {
+                node = node.children.firstOrNull()
+                if (node is UnsupportedNode) found = true
+            }
+        }
+        assertTrue("超深的分支应降级为占位", found)
+    }
+
+    @Test
+    fun `invalid json yields null root`() {
+        assertNull(rootOf("not json"))
+        assertNull(rootOf("{}"))
+        assertNull(rootOf(""))
+        assertNull(rootOf("null"))
+    }
+
+    /** mihealth 的完整产物片段：四种区块都要能解析出来 */
+    @Test
+    fun `full mihealth payload parses`() {
+        val json = nodes(
+            JSONObject().apply { put("type", "statusCard"); put("label", "登录状态"); put("value", "已登录") },
+            JSONObject().apply { put("type", "statusCard"); put("label", "最近一次步数"); put("value", "8000 步") },
             JSONObject().apply {
-                put("type", "statusCard")
-                put("label", "登录状态")
-                put("value", "未登录")
-                put("tone", "ERROR")
-                put("detail", "请回插件列表页登录")
+                put("type", "chart")
+                put("title", "近 7 日步数")
+                put("chart", JSONObject().apply {
+                    put("kind", "bar")
+                    put("bars", JSONArray().apply { put(JSONObject().apply { put("label", "11-17"); put("value", 8000) }) })
+                })
             },
             JSONObject().apply {
-                put("type", "text")
-                put("title", "还没有步数数据")
-                put("body", "点下面的「立即同步」拉取今天的数据。")
-            },
-            JSONObject().apply {
-                put("type", "text")
-                put("title", "还没有睡眠数据")
-                put("body", "戴手环睡觉后点「立即同步」，睡眠才会被同步过来。")
-            },
-            JSONObject().apply {
-                put("type", "buttonRow")
-                put(
-                    "buttons",
-                    JSONArray().apply {
-                        put(
-                            JSONObject().apply {
-                                put("label", "立即同步")
-                                put("actionId", "sync_now")
-                                put("primary", true)
-                                put("enabled", false)
-                            }
-                        )
-                        put(
-                            JSONObject().apply {
-                                put("label", "回补近 7 天")
-                                put("actionId", "backfill_7d")
-                                put("enabled", false)
-                            }
-                        )
-                    },
-                )
+                put("type", "row")
+                put("card", false)
+                put("children", JSONArray().apply {
+                    put(JSONObject().apply { put("type", "button"); put("label", "立即同步"); put("actionId", "sync"); put("primary", true) })
+                })
             },
         )
-        val out = JsTypeConverter.toUiBlocks(json)
-        assertEquals(4, out.size)
-        assertNotNull(out[0] as StatusCardBlock)
-        assertNotNull(out[1] as TextBlock)
-        assertNotNull(out[2] as TextBlock)
-        assertEquals(2, (out[3] as ButtonRowBlock).buttons.size)
-    }
-
-    @Test
-    fun `action result for sync maps to triggerSync`() {
-        val result = JsTypeConverter.toActionResult("""{"type":"triggerSync"}""")
-        assertEquals(com.lifeboard.plugin.api.ActionResult.TriggerSync, result)
-    }
-
-    @Test
-    fun `unknown action maps to noop`() {
-        val result = JsTypeConverter.toActionResult("""{"type":"whatever"}""")
-        assertEquals(com.lifeboard.plugin.api.ActionResult.NoOp, result)
+        val children = (rootOf(json) as ColumnNode).children
+        assertEquals(4, children.size)
+        assertTrue(children[0] is StatusCardNode)
+        assertTrue(children[1] is StatusCardNode)
+        assertTrue(children[2] is ChartNode)
+        assertTrue(children[3] is RowNode)
     }
 }

@@ -25,7 +25,8 @@ docs/
 mihealth-log.txt
 .trae/rules/编码规范.md
 dist/
-
+.trae/
+tmp/
 # JS 插件构建链
 js-plugins/node_modules/
 js-plugins/package-lock.json

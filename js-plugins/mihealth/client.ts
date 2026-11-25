@@ -457,9 +457,29 @@ export async function fetchCaptcha(session: MiSession): Promise<string> {
  *
  * 直接返回解析后的对象，与 Python 的 service_login 一致。
  * 解析只用插件自己的 parseMiapi（会剥 &&&START&&& 前缀），
- * 不读宿主给的 json 字段——宿主是严格 JSON 解析，遇到前缀恒为 null。
+ * 不读宿主给的 json 字段——宿主是严格 JSON 解析，遇到前缀必然失败并返回 null。
+ *
+ * ## 必须带 `userId=<账号>` cookie
+ *
+ * API.md「必须的客户端伪装」表把它列为硬性要求，参考实现
+ * `login.py:login_with_password` 也是这么做的
+ * （`cookies={"userId": username}`）。
+ *
+ * 不带这个 cookie 时服务端定位不到账号，**不下发 `_sign`**，
+ * 转而回一个 `code:0` + `psecurity` + `cUserId` 的「已登录」型响应。
+ * 这种响应看起来毫无问题，于是插件卡在「未拿到 _sign」，
+ * 且换任何密码都没用——实测账号 153****80 稳定复现。
+ *
+ * @param account 用户输入的账号（手机号/邮箱/小米 ID），作为 `userId` cookie 的取值
  */
-export async function serviceLogin(session: MiSession): Promise<any> {
+export async function serviceLogin(session: MiSession, account: string): Promise<any> {
+    // 走 jar 而不是手写 Cookie 头：手写会**覆盖**整组认证 cookie
+    // （sendRaw 里 `if (!headers.Cookie)` 的短路），首次握手 jar 为空时
+    // 恰好没事，一旦复用就会把 passToken/cUserId 全丢掉。
+    // 参考实现是 `cookies={"userId": username}` 与既有 cookie 合并，
+    // 语义上对应「往 jar 里补一条」，这里保持一致。
+    const uid = String(account || '');
+    if (uid) session.setCookie('userId', uid, '.account.xiaomi.com');
     const res = await session.send(
         'GET',
         ACCOUNT + '/pass/serviceLogin?sid=miothealth&_json=true',
@@ -547,18 +567,35 @@ export async function serviceLoginAuth2(
         locale: 'zh_CN',
     };
     if (captCode) body.captCode = captCode;
-
-    const res = await session.send('POST', ACCOUNT + '/pass/serviceLoginAuth2', {
-        headers: {
-            Referer: ACCOUNT + '/',
-            'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: formEncode(body),
-        contentType: 'application/x-www-form-urlencoded',
-        // 不能自动跟随：登录结果里的 location 是下一步要走的 STS 回调，
-        // 跟着跳会让 serviceToken 下发在中间跳，插件再也拿不到
-        followRedirects: false,
+    // 拼进 query 前剔掉空值：query 里出现 `_sign=undefined` 比不带更糟，
+    // 服务端会当成非法签名而不是缺签名。handshake 缺 _sign 时上层已拦，
+    // 这里只做兜底。
+    Object.keys(body).forEach((k) => {
+        if (body[k] === undefined || body[k] === null) delete body[k];
     });
+
+    // 字段放 **query**，不是 body。
+    //
+    // API.md「必须的客户端伪装」表写明：密码提交走
+    // `POST serviceLoginAuth2`，字段放 query（`params=fields`）。
+    // 参考实现 login.py 也是 `post(params=fields)`，并注明「社区实现验证可用」。
+    //
+    // 放 body 会被服务端判为不合法的提交方式，回来的是 70016，
+    // 而 70016 的文案像风控/密码错误，极易误导排查方向。
+    const res = await session.send(
+        'POST',
+        ACCOUNT + '/pass/serviceLoginAuth2?' + formEncode(body),
+        {
+            headers: {
+                Referer: ACCOUNT + '/',
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            contentType: 'application/x-www-form-urlencoded',
+            // 不能自动跟随：登录结果里的 location 是下一步要走的 STS 回调，
+            // 跟着跳会让 serviceToken 下发在中间跳，插件再也拿不到
+            followRedirects: false,
+        },
+    );
     return parseMiapi(res.body);
 }
 

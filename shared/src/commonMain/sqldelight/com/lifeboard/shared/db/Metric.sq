@@ -81,6 +81,20 @@ WHERE `sourceType` = ? AND `bucket` = ? AND `date` BETWEEN ? AND ?;
 insertMetric:
 INSERT OR REPLACE INTO `metric`(`sourceType`, `date`, `bucket`, `value`) VALUES (?, ?, ?, ?);
 
+-- 事件型指标的累加写入（`ctx.report`）。
+--
+-- 方言是 sqlite 3.18，不支持 `ON CONFLICT ... DO UPDATE`（3.24 才有），
+-- 所以拆成「先插 0 再累加」两步。这两步都是单语句原子操作，且都进了同一个事务，
+-- 效果等价于 upsert。
+--
+-- 为什么不在 Kotlin 里「读出来加完再写回」：插件在会话后台线程里随时可能上报，
+-- 读改写之间会被另一次写入插进来，结果是丢更新（计数偏小且无法察觉）。
+insertMetricIfAbsent:
+INSERT OR IGNORE INTO `metric`(`sourceType`, `date`, `bucket`, `value`) VALUES (?, ?, ?, 0);
+
+incrementMetricValue:
+UPDATE `metric` SET `value` = `value` + ? WHERE `sourceType` = ? AND `date` = ? AND `bucket` = ?;
+
 deleteMetricsBySource:
 DELETE FROM `metric` WHERE `sourceType` = ?;
 

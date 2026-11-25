@@ -19,6 +19,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * 会话在插件侧的窄接口。
@@ -79,18 +81,48 @@ class PluginSessionController(
 
     private var deltaJob: Job? = null
 
-    val isActive: Boolean get() = active
-
     /** 是否已经有一条等待补全的 assistant 消息（流式增量接在它后面） */
     private var pendingAssistant = false
+
+    /**
+     * 串行化启动与停机。
+     *
+     * 详情页的 `load()` 和动作后的 `startConversationIfNeeded` 都会调
+     * [startAsync]，两者可能交错：`active` 的检查与置位若不是原子的，
+     * 就会出现两次 `setListener` 与两条 `deltaJob`，消息被重复追加。
+     */
+    private val lifecycle = Mutex()
+
+    /**
+     * 标记「启动流程已经发起」，避免重复启动。
+     *
+     * 不能用 [active] 担当这个角色：`start` 是挂起函数，中间会让出，
+     * 期间 `active` 已经为 true，但握手还没完成。
+     */
+    @Volatile
+    private var starting: Boolean = false
+
+    /** 是否有一条正在建立或已建立的会话 */
+    val isActive: Boolean get() = active || starting
 
     /**
      * 启动会话。
      *
      * @return false 表示插件不支持、未加载或启动失败；此时界面保持「未连接」
      */
-    suspend fun start(sessionId: String, config: SessionConfig = SessionConfig()): Boolean {
-        if (active) return true
+    suspend fun start(sessionId: String, config: SessionConfig = SessionConfig()): Boolean =
+        lifecycle.withLock {
+            if (active) return@withLock true
+            if (starting) return@withLock false
+            starting = true
+            try {
+                doStart(sessionId, config)
+            } finally {
+                starting = false
+            }
+        }
+
+    private suspend fun doStart(sessionId: String, config: SessionConfig): Boolean {
         val endpoint = endpointProvider() ?: return false
 
         // 先把 active 置位再调插件：插件常在 sessionStart 里同步推送
@@ -142,11 +174,17 @@ class PluginSessionController(
         scope.launch { stop() }
     }
 
-    /** 结束会话；重复调用安全 */
-    suspend fun stop() {
+    /**
+     * 结束会话；重复调用安全。
+     *
+     * 与 [start] 共用同一把锁：并发的「启动中 → 立刻停止」（用户点进详情页
+     * 又马上撤销信任）若不加锁，停机会在握手完成前跑完，之后握手成功又把
+     * `active` 置回 true，留下一个谁也停不掉的会话。
+     */
+    suspend fun stop() = lifecycle.withLock {
         if (!active) {
             endpointProvider()?.setListener(null)
-            return
+            return@withLock
         }
         active = false
         activeSessionId = ""
@@ -192,8 +230,11 @@ class PluginSessionController(
             val action = runCatching {
                 endpoint?.event(SessionEvent(type = "input", payload = content))
             }.getOrElse { error ->
+                // 发送失败不等于会话结束：插件抛一次异常就断掉整条会话，
+                // 用户会以为对方主动挂了。追加一条错误并恢复输入，让他能重试。
                 appendMessage(ChatRole.SYSTEM, "发送失败：${error.message ?: "未知错误"}")
-                SessionAction.Stop("发送失败")
+                _state.update { it.copy(statusText = "已连接", inputEnabled = active) }
+                return@launch
             }
             when (action) {
                 is SessionAction.Stop -> {

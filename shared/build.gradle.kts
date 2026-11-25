@@ -146,12 +146,24 @@ tasks.matching { it.name == "desktopTest" }.configureEach {
         .withPropertyName("jsPluginCtxTypeDeclaration")
         .withPathSensitivity(PathSensitivity.RELATIVE)
 
-    // `MiHealthBundleSmokeTest` 会在真实 QuickJS 里加载这份构建产物。
-    // 同理，产物不在 sourceSet 里，不声明成输入就会「改了产物但测试不重跑」。
-    // 文件可能不存在（还没跑过 npm run build），用 optional 避免配置阶段失败。
+    // 契约类型也参与测试：`DshPluginBundleTest` / `MiHealthBundleSmokeTest`
+    // 断言的是插件产物里的节点结构，而结构由这份声明约束。不声明成输入的话，
+    // 改了契约却不会重跑测试。
+    inputs.file(rootProject.file("js-plugins/types/plugin-contract.d.ts"))
+        .withPropertyName("jsPluginContractTypeDeclaration")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+
+    // 两个插件的构建产物都必须在输入里：它们不在任何 sourceSet 中，
+    // 不显式声明就会出现「改了产物但测试显示 UP-TO-DATE」——绿得没有意义。
     val bundle = rootProject.file("js-plugins/mihealth/main.js")
     inputs.files(files(bundle))
         .withPropertyName("miHealthJsBundle")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+        .optional()
+
+    val dshBundle = rootProject.file("js-plugins/dsh/main.js")
+    inputs.files(files(dshBundle))
+        .withPropertyName("dshJsBundle")
         .withPathSensitivity(PathSensitivity.RELATIVE)
         .optional()
 }

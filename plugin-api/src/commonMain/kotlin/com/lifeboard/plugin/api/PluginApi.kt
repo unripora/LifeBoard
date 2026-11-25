@@ -26,7 +26,8 @@ object PluginApi {
      * 旧插件实现的是单参数 `login`，新宿主调不到它。
      *
      * 3：新增详情页声明式 UI——`SourcePlugin.detailUi` / `SourcePlugin.onAction`
-     * 与 [UiBlock]、[ActionResult]。两个方法都有默认实现，**非破坏性**：
+     * 与 `UiBlock`（已在 5 删除，由 [PluginNode] 取代）、[ActionResult]。
+     * 两个方法都有默认实现，**非破坏性**：
      * 声明 2 的插件可以照常加载，只是详情页里没有它自己的区块。
      *
      * 4：`SourcePlugin.fetch` 的返回类型由 `List<PluginMetric>` 改为 [FetchResult]。
@@ -34,8 +35,19 @@ object PluginApi {
      * 新宿主调的是 `fetch()Lcom/lifeboard/plugin/api/FetchResult;`，会直接
      * `NoSuchMethodError`。所以声明 ≤3 的插件必须拒绝加载并提示升级，
      * 不能像 2→3 那样放行。
+     *
+     * 5：详情页 UI 由「固定区块列表」改为「可组合原语树」。
+     * `detailUi` 返回类型 `List<UiBlock>` → [PluginNode]，[ActionResult.RefreshUi]
+     * 的字段 `blocks` → `root`，旧 `UiBlock` 系列**整体删除**（本轮决策是不留兼容层）。
+     *
+     * 注意这次在**二进制层面并不破坏**：`List<UiBlock>` 与 `PluginNode` 都擦除成
+     * 引用类型，旧插件的方法签名仍是 `detailUi(LPluginContext;)Ljava/util/List;`，
+     * 新宿主调的是 `()Lcom/lifeboard/plugin/api/PluginNode;`——对**编译型**插件是
+     * `NoSuchMethodError`，对 **JS 插件**则完全不受影响（它只返回 JSON）。
+     * 真正的风险在 JS 插件：旧包返回 `type:'conversation'` 之类已删除的类型，
+     * 新解析器认不出，**详情页会静默空白**。
      */
-    const val VERSION: Int = 4
+    const val VERSION: Int = 5
 
     /**
      * 仍然可以加载的最低契约版本。
@@ -46,8 +58,18 @@ object PluginApi {
      * `NoSuchMethodError`，必须让加载器提前拦下并说清原因。
      *
      * 4：`fetch` 返回 `FetchResult`，声明 ≤3 的插件已无法调用。
+     *
+     * 5：详情页 UI 改为原语树。**⚠️ 当前仓内没有任何代码读取本常量**——
+     * 唯一的出现处就是这里的定义与文档说明。也就是说，把它抬到 5 目前**不会
+     * 产生任何拦截效果**：声明 4 的 JS 插件照样会加载，然后在详情页渲染空白。
+     *
+     * 这是本轮已知并接受的取舍（见任务
+     * `docs/tasks/refactor_plugin_ui_primitive_tree/index.md` 决策 5）：
+     * 内置的两个插件会随宿主一起重新打包，`manifest.apiVersion` 同步升到 4，
+     * 用户升级宿主后需要重新安装插件包。若将来要真正拦截，需要在 JS 插件加载
+     * 路径上补判定，而不是仅改这个常量。
      */
-    const val MIN_VERSION: Int = 4
+    const val MIN_VERSION: Int = 5
 }
 
 /**

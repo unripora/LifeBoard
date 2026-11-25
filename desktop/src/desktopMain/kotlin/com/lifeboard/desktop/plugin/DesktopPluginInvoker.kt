@@ -12,7 +12,7 @@ import com.lifeboard.plugin.api.SessionConfig
 import com.lifeboard.plugin.api.SessionEvent
 import com.lifeboard.plugin.api.SessionUiEvent
 import com.lifeboard.plugin.api.SourceRef
-import com.lifeboard.plugin.api.UiBlock
+import com.lifeboard.plugin.api.PluginNode
 import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.shared.platform.CollectOutcome
 import com.lifeboard.shared.platform.PluginInvoker
@@ -116,13 +116,13 @@ class DesktopPluginInvoker(
         }
     }
 
-    /** 插件自己的区块。插件未加载、未信任或抛异常时返回空列表 */
-    override suspend fun detailUi(pluginId: String): List<UiBlock> {
-        val entry = repository.find(pluginId) ?: return emptyList()
-        if (!entry.trusted) return emptyList()
+    /** 插件自己的界面树。插件未加载、未信任或抛异常时返回 null（无自定义内容） */
+    override suspend fun detailUi(pluginId: String): PluginNode? {
+        val entry = repository.find(pluginId) ?: return null
+        if (!entry.trusted) return null
         return withContext(Dispatchers.IO) {
             runCatching { entry.plugin.detailUi(hostContextFactory(pluginId)) }
-                .getOrElse { emptyList() }
+                .getOrElse { null }
         }
     }
 

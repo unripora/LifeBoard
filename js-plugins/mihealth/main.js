@@ -443,7 +443,9 @@ async function fetchCaptcha(session) {
   if (!isJpeg && !isPng) return "";
   return "data:image/jpeg;base64," + b64;
 }
-async function serviceLogin(session) {
+async function serviceLogin(session, account) {
+  const uid = String(account || "");
+  if (uid) session.setCookie("userId", uid, ".account.xiaomi.com");
   const res = await session.send(
     "GET",
     ACCOUNT + "/pass/serviceLogin?sid=miothealth&_json=true",
@@ -482,17 +484,23 @@ async function serviceLoginAuth2(session, account, passwordHash, handshake, capt
     locale: "zh_CN"
   };
   if (captCode) body.captCode = captCode;
-  const res = await session.send("POST", ACCOUNT + "/pass/serviceLoginAuth2", {
-    headers: {
-      Referer: ACCOUNT + "/",
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body: formEncode(body),
-    contentType: "application/x-www-form-urlencoded",
-    // 不能自动跟随：登录结果里的 location 是下一步要走的 STS 回调，
-    // 跟着跳会让 serviceToken 下发在中间跳，插件再也拿不到
-    followRedirects: false
+  Object.keys(body).forEach((k) => {
+    if (body[k] === void 0 || body[k] === null) delete body[k];
   });
+  const res = await session.send(
+    "POST",
+    ACCOUNT + "/pass/serviceLoginAuth2?" + formEncode(body),
+    {
+      headers: {
+        Referer: ACCOUNT + "/",
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      contentType: "application/x-www-form-urlencoded",
+      // 不能自动跟随：登录结果里的 location 是下一步要走的 STS 回调，
+      // 跟着跳会让 serviceToken 下发在中间跳，插件再也拿不到
+      followRedirects: false
+    }
+  );
   return parseMiapi(res.body);
 }
 function isUsableServiceToken(value) {
@@ -1260,7 +1268,7 @@ function needPassword(account) {
 async function startLogin(account, password) {
   const session = createSession(deviceId(), "login");
   log2("i", "\u767B\u5F55\u5F00\u59CB\uFF0Caccount=" + maskAccount(account));
-  const handshake = await serviceLogin(session);
+  const handshake = await serviceLogin(session, account);
   if (!handshake || !handshake._sign) {
     log2("e", "\u63E1\u624B\u5931\u8D25\uFF1A\u672A\u62FF\u5230 _sign\uFF0C\u54CD\u5E94=" + JSON.stringify(handshake || null).slice(0, 200));
     return { type: "failure", message: "\u767B\u5F55\u63E1\u624B\u5931\u8D25\uFF1A\u65E0\u6CD5\u8FDE\u63A5\u5C0F\u7C73\u767B\u5F55\u670D\u52A1\u6216\u672A\u62FF\u5230 _sign" };
@@ -1440,7 +1448,7 @@ async function detailUi() {
       tone = "warn";
       detail = auth.message || "";
     }
-    blocks.push({ type: "statusCard", label: "\u767B\u5F55\u72B6\u6001", value: label, tone, detail: detail || null });
+    blocks.push({ type: "statusCard", label: "\u767B\u5F55\u72B6\u6001", value: label, tone, detail });
     const recentSteps = recentValues(STEPS_KEY);
     const recentSleep = recentValues(SLEEP_KEY);
     if (recentSteps.length > 0) {
@@ -1535,9 +1543,10 @@ async function detailUi() {
     }
     const loggedIn = auth.state === "loggedIn";
     blocks.push({
-      type: "buttonRow",
-      buttons: [
+      type: "row",
+      children: [
         {
+          type: "button",
           label: "\u7ACB\u5373\u540C\u6B65",
           actionId: ACTION_SYNC,
           primary: true,
@@ -1545,6 +1554,7 @@ async function detailUi() {
           enabled: loggedIn
         },
         {
+          type: "button",
           label: "\u56DE\u8865\u8FD1 " + BACKFILL_DAYS + " \u5929",
           actionId: ACTION_BACKFILL,
           // 回补只补原始条目（供查看核对），不改历史聚合值与得分

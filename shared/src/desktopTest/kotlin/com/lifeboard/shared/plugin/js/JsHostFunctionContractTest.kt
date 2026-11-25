@@ -58,6 +58,7 @@ class JsHostFunctionContractTest {
             "LogApi" to "ctx.log",
             "WsApi" to "ctx.ws",
             "StreamApi" to "ctx.stream",
+            "SessionApi" to "ctx.session",
         )
 
         val found = mutableSetOf<String>()
@@ -159,7 +160,8 @@ class JsHostFunctionContractTest {
     @Test
     fun `四个桥接注册的函数合起来就是全集`() {
         val grouped = JsHostFunctions.CONTEXT + JsHostFunctions.HTTP +
-            JsHostFunctions.CRYPTO + JsHostFunctions.WS + JsHostFunctions.STREAM
+            JsHostFunctions.CRYPTO + JsHostFunctions.WS + JsHostFunctions.STREAM +
+            JsHostFunctions.SESSION
 
         assertEquals(
             "分组清单与 ALL 不一致",
