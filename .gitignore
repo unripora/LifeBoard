@@ -45,7 +45,8 @@ mihealth_credential.json
 replay_pid*.log
 
 # 本地运行时数据库与截图，属个人数据
-db.db
-db.db-shm
-db.db-wal
-*.png
+*.db
+*.db-shm
+*.db-wal
+# 仅忽略根目录的临时截图；app/desktop 下的正式资源图片正常入库
+/*.png

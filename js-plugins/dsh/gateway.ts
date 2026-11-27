@@ -166,7 +166,7 @@ export function hostOf(gateway: string): string {
  * cookie 用的主机名：**不含端口**。
  *
  * `Host` 头与 cookie 的 domain 规则不同，不能混用：
- * - `Host` 头本来就要端口，用 [hostOf]（`192.168.124.71:3443`）
+ * - `Host` 头本来就要端口，用 [hostOf]（`192.168.1.10:3443`）
  * - cookie 的 domain 按 RFC 6265 只能是主机名，带端口 OkHttp 直接拒绝
  *   （`unexpected domain`），cookie 静默种不进去，之后每个请求都 401，
  *   表现成「配对成功，一进详情页却说会话已失效」
