@@ -83,15 +83,24 @@ data class ChartPoint(
 /**
  * 一条消息。
  *
- * 只用于 [ListNode] 绑定到会话消息源时由宿主填充，以及插件展示静态历史记录。
+ * 用于 [ChatNode] 的静态历史记录，以及 [ListNode] 绑定到会话消息源时由宿主填充。
  *
  * @property role 决定气泡样式；[ChatRole.SYSTEM] 用于「已连接」「对方正在处理」这类提示
+ * @property text 消息正文（纯文本；富文本不在本轮范围内）
+ * @property id 消息的稳定标识，宿主据此去重与定位。插件不给时宿主按「下标 + 角色 + 正文」
+ *   兜底生成：留空是安全的，但同一段历史在两次 `detailUi` 里顺序变化时，
+ *   兜底 id 也会跟着变，因此**跨刷新要保持同一条消息的视觉稳定就应当自己给 id**
+ * @property turnId 轮次标识：同一轮问答（用户问 + 对方答 + 系统提示）共用一个值。
+ *   宿主用它在轮次之间插入分隔，让用户看出「这一组是一问一答」。
+ *   留空表示不分组，按角色连续合并处理即可
  * @property pending 消息尚未完成（流式输出中或等待回复），宿主会给出进行中的视觉提示
  * @property timeLabel 展示用时间文案，由插件按自己的协议格式化；为空则不显示
  */
 data class ChatMessage(
     val role: ChatRole,
     val text: String,
+    val id: String = "",
+    val turnId: String = "",
     val timeLabel: String? = null,
     val pending: Boolean = false,
 )

@@ -46,6 +46,34 @@ data class JsPluginManifest(
     val homepage: String? = null,
     val defaultTabName: String? = null,
     val tabIcon: String? = null,
+    /**
+     * 插件声明的生命周期策略；缺省 [PluginLifecycle.ON_DEMAND]。
+     *
+     * 这是**声明**，宿主还会按常驻名额、全局预算和回收开关决定实际授予的策略，
+     * 见 [PluginRuntimePolicy]。
+     */
+    val lifecycle: PluginLifecycle = PluginLifecycle.DEFAULT,
+    /**
+     * manifest 是否**显式声明**了 `lifecycle`。
+     *
+     * 必须与 [lifecycle] 分开：缺省值也是 `onDemand`，但"没写"和"写了 onDemand"
+     * 的信任程度完全不同。没写的旧包可能依赖模块级状态活着，自动回收会让它
+     * 凭空丢状态——所以只有显式声明的才允许被自动回收。
+     */
+    val lifecycleDeclared: Boolean = false,
+    /**
+     * 按需释放的空闲阈值（秒），仅 `onDemand` 生效。
+     *
+     * 缺省 300，合法范围 [60, 3600]；越界整数夹取并告警。
+     */
+    val idleTimeoutSec: Int = PluginLifecycle.DEFAULT_IDLE_SECONDS,
+    /**
+     * 插件显式声明的必需宿主能力。
+     *
+     * 空表示不校验（缺省行为）；非空时每一项都必须被宿主满足，否则在执行入口前拒载。
+     * 名称精确匹配，如 `runtime.lifecycle`、`contract.loginIntent`、`ctx.files.write`。
+     */
+    val requires: List<String> = emptyList(),
 ) {
 
     /**
@@ -86,14 +114,25 @@ data class JsPluginManifest(
          * 解析 manifest。
          *
          * @return 成功返回 manifest；任何必需字段缺失或非法返回 null，
-         *   由调用方转成「包损坏」的展示原因
+         *   由调用方转成「包损坏」的展示原因。
+         *   需要具体原因时用 [parseDetailed]。
          */
-        fun parse(json: String): JsPluginManifest? {
-            val o = runCatching { PluginJsonObject(json) }.getOrNull() ?: return null
+        fun parse(json: String): JsPluginManifest? =
+            (parseDetailed(json) as? ParseResult.Success)?.manifest
+
+        /**
+         * 解析 manifest 并给出失败原因。
+         *
+         * 与 [parse] 的区别只有「能不能说清为什么失败」：加载器与安装校验
+         * 需要把原因展示给用户，而 `null` 只能汇成一句笼统的格式错误。
+         */
+        fun parseDetailed(json: String): ParseResult {            val o = runCatching { PluginJsonObject(json) }.getOrNull()
+                ?: return ParseResult.Failure("manifest.json 不是合法 JSON")
 
             val id = o.optString("id").trim()
             // 落库 key 用 `PLUGIN_{id}:{metricKey}`，id 里出现 `:` 会让 key 无法反解
-            if (id.isBlank() || id.contains(':')) return null
+            if (id.isBlank()) return ParseResult.Failure("manifest 缺少 id")
+            if (id.contains(':')) return ParseResult.Failure("manifest id 不能包含 ':'（当前为 \"$id\"）")
 
             val name = o.optString("name").ifBlank { id }
             val version = o.optString("version").ifBlank { "0.0.0" }
@@ -102,36 +141,65 @@ data class JsPluginManifest(
             val entry = o.optString("entry").ifBlank { DEFAULT_ENTRY }
 
             // 入口路径同样不能越出包根目录
-            if (entry.startsWith("/") || entry.contains("..")) return null
+            if (entry.startsWith("/") || entry.contains("..")) {
+                return ParseResult.Failure("入口路径非法：\"$entry\"（不能是绝对路径或含 ..）")
+            }
 
-            return JsPluginManifest(
-                id = id,
-                name = name,
-                version = version,
-                versionCode = versionCode,
-                apiVersion = apiVersion,
-                entry = entry,
-                metrics = JsTypeConverter.toMetricSpecs(o.optJSONArray("metrics")),
-                credentialSpec = JsTypeConverter.toCredentialSpec(o.optJSONArray("credentialSpec")),
-                declaredHash = o.optString("sha256").ifBlank { null },
-                // 只接受规范格式：写错的指纹必须让包加载失败，
-                // 而不是静默退化成「信任系统证书」——那会让插件以为连上了自签服务
-                //
-                // `runtime` 是哨兵值：指纹不在包里写死，由插件在配对时从
-                // 用户粘贴的配对链接（`instance=` 段）取，见 [PINNED_CA_RUNTIME]。
-                // 这是「一个包分发给多个用户」的唯一可行方式——每台电脑的
-                // dsh-mobile 首次启动都会生成自己的 CA，指纹不可能预先知道。
-                pinnedCaSha256 = o.optString("pinnedCaSha256")
-                    .ifBlank { null }
-                    ?.let { raw ->
-                        if (raw.equals(PINNED_CA_RUNTIME, ignoreCase = true)) PINNED_CA_RUNTIME
-                        else PluginTls.normalizeFingerprint(raw) ?: return null
-                    },
-                description = o.optString("description").ifBlank { null },
-                author = o.optString("author").ifBlank { null },
-                homepage = o.optString("homepage").ifBlank { null },
-                defaultTabName = o.optString("defaultTabName").ifBlank { null },
-                tabIcon = o.optString("tabIcon").ifBlank { null },
+            // 生命周期：未知值明确拒载，不静默退化成默认值——
+            // 否则作者写了拼错的 resident 会以为生效了，实际被按需回收
+            val lifecycleRaw = o.optString("lifecycle")
+            val lifecycleDeclared = lifecycleRaw.isNotBlank()
+            val lifecycle = PluginLifecycle.parse(lifecycleRaw)
+                ?: return ParseResult.Failure(
+                    "manifest lifecycle 取值非法：\"${o.optString("lifecycle")}\"，" +
+                        "应为 onDemand / sessionScoped / resident"
+                )
+            val rawIdle = o.optInt("idleTimeoutSec", PluginLifecycle.DEFAULT_IDLE_SECONDS)
+            val idleTimeoutSec = rawIdle.coerceIn(
+                PluginLifecycle.MIN_IDLE_SECONDS,
+                PluginLifecycle.MAX_IDLE_SECONDS,
+            )
+
+            // 指纹只接受规范格式：写错必须让包加载失败，
+            // 而不是静默退化成「信任系统证书」——那会让插件以为连上了自签服务
+            val pinnedCa = o.optString("pinnedCaSha256").ifBlank { null }?.let { raw ->
+                if (raw.equals(PINNED_CA_RUNTIME, ignoreCase = true)) {
+                    PINNED_CA_RUNTIME
+                } else {
+                    PluginTls.normalizeFingerprint(raw)
+                        ?: return ParseResult.Failure("pinnedCaSha256 不是合法的 SHA-256 指纹：\"$raw\"")
+                }
+            }
+
+            return ParseResult.Success(
+                JsPluginManifest(
+                    id = id,
+                    name = name,
+                    version = version,
+                    versionCode = versionCode,
+                    apiVersion = apiVersion,
+                    entry = entry,
+                    metrics = JsTypeConverter.toMetricSpecs(o.optJSONArray("metrics")),
+                    credentialSpec = JsTypeConverter.toCredentialSpec(o.optJSONArray("credentialSpec")),
+                    declaredHash = o.optString("sha256").ifBlank { null },
+                    pinnedCaSha256 = pinnedCa,
+                    description = o.optString("description").ifBlank { null },
+                    author = o.optString("author").ifBlank { null },
+                    homepage = o.optString("homepage").ifBlank { null },
+                    defaultTabName = o.optString("defaultTabName").ifBlank { null },
+                    tabIcon = o.optString("tabIcon").ifBlank { null },
+                    lifecycle = lifecycle,
+                    lifecycleDeclared = lifecycleDeclared,
+                    idleTimeoutSec = idleTimeoutSec,
+                    // 缺省不校验；显式声明才逐项校验。空数组与缺字段等价
+                    requires = o.optJSONArray("requires")
+                        ?.let { arr ->
+                            (0 until arr.length()).mapNotNull { i ->
+                                arr.optStringOrNull(i)?.trim()?.takeIf { it.isNotEmpty() }
+                            }.distinct()
+                        }
+                        .orEmpty(),
+                )
             )
         }
 
@@ -156,6 +224,17 @@ data class JsPluginManifest(
             return digest.digest().joinToString("") { "%02x".format(it) }
         }
     }
+}
+
+/**
+ * [JsPluginManifest.parseDetailed] 的结果。
+ *
+ * 放在顶层而不是 companion 里：嵌套在 companion 内的 sealed 接口
+ * 在 `when` 中不会被当作可穷尽类型，会导致加载器的分支判定报错。
+ */
+sealed interface ParseResult {
+    data class Success(val manifest: JsPluginManifest) : ParseResult
+    data class Failure(val reason: String) : ParseResult
 }
 
 /**

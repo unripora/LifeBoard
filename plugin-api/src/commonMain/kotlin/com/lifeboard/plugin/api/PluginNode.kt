@@ -141,12 +141,17 @@ data class CollapsibleNode(
  *
  * @property body 支持绑定到宿主数据源（如会话状态文案），见 [Bound]
  * @property emphasis 文字层级；宿主持有三级到实际字号/字重的映射
+ * @property card 是否套一层卡片外壳。默认 `true` 保持既有观感；
+ *   想要「一段不带边框的说明文字」时置 `false`——这是修正：
+ *   早先 [ColumnNode.card] 的约定是「整棵树里唯一决定套不套卡片的字段」，
+ *   而本节点无条件套卡片与之矛盾，导致嵌套在卡片里的文字出现两层边框
  */
 data class TextNode(
     val title: String = "",
     val body: Bound<String> = Bound.Static(""),
     val tone: Tone = Tone.NEUTRAL,
     val emphasis: Emphasis = Emphasis.BODY,
+    val card: Boolean = true,
     override val id: String? = null,
     override val locked: Boolean = false,
 ) : NodeContent
@@ -209,10 +214,14 @@ data class ProgressNode(
     override val locked: Boolean = false,
 ) : NodeContent
 
-/** 代码块。等宽字体、横向滚动，背景色由宿主决定 */
+/**
+ * 代码块。等宽字体、横向滚动，背景色由宿主决定。
+ *
+ * 没有 `language` 字段：宿主不做语法高亮，存一个不用的字段比不提供更误导。
+ * 需要标注语言时，用 [TextNode] 的标题行写「示例（Kotlin）」即可。
+ */
 data class CodeNode(
     val code: String,
-    val language: String = "",
     override val id: String? = null,
     override val locked: Boolean = false,
 ) : NodeContent
@@ -253,8 +262,13 @@ data class UnsupportedNode(
  * 若压成一层，列表项的 key 就变成 RowNode 的 id，插件不给 id 时滚动会错位。
  *
  * @property items 静态条目，或绑定到宿主数据源（如会话消息）。**二选一**
- * @property maxHeightDp 超过后内部滚动；0 表示不限制
+ * @property maxHeightDp 超过后内部滚动；0 表示不限制（跟随内容）
  * @property emptyHint 无条目时的提示文案
+ * @property itemActionId 非空时**整行可点**，点击后以 `onAction(itemActionId, 该项的 itemPayload)` 回传。
+ *   列表项没有统一的地方放点击入口：插件想用行内按钮表达「删掉这一项」，
+ *   也需要能表达「选中这一项」。行内有按钮时，按钮点击优先于整行点击
+ * @property itemPayloads 与 [items] 逐项对应的回传值。**长度不匹配时按空串处理**，
+ *   宿主不会因此丢弃整张列表。绑定到数据源时该字段被忽略
  */
 data class ListNode(
     val items: Bound<List<List<PluginNode>>> = Bound.Static(emptyList()),
@@ -262,6 +276,8 @@ data class ListNode(
     val separator: Boolean = true,
     val maxHeightDp: Int = 0,
     val emptyHint: String = "暂无内容",
+    val itemActionId: String? = null,
+    val itemPayloads: List<String> = emptyList(),
     override val id: String? = null,
     override val locked: Boolean = false,
 ) : NodeContent
@@ -281,7 +297,7 @@ data class TableColumn(
     val align: Align = Align.START,
 )
 
-/** 一组键值对（「包名 / 版本 / 签名」这类）。比一堆状态卡更紧凑 */
+/** 键值对组：比一排状态卡更紧凑 */
 data class KeyValueNode(
     val entries: List<KeyValue>,
     override val id: String? = null,
@@ -293,6 +309,11 @@ data class KeyValue(
     val value: String,
     val tone: Tone = Tone.NEUTRAL,
 )
+
+// 对话节点（`ChatNode`）与消息值类型（`ChatMessage`）见 PluginChatNode.kt 与 PluginUi.kt；
+// 清单选择节点（`PickerNode` / `PickerCandidate` / `PickerMode`）见 PluginChatNode.kt。
+// 这两组从本文件拆出去是为了守住「单文件不超过 500 行」的约定，包名不变，
+// 插件的使用方式与导入完全一致。
 
 // ---------------------------------------------------------------------------
 // 交互节点
@@ -347,7 +368,21 @@ data class InputNode(
  * - 多选：`onAction(actionId, JSON 数组文本)`，如 `["a","c"]`。
  *   不用逗号拼接，因为选项 value 本身可能含逗号，拼接后无法无歧义还原
  *
+ * ## 选区为什么由插件给（`selectedValues`）
+ *
+ * 早先选区只能由宿主内部 `remember(actionId)` 持有：节点树每次重建（插件刷新
+ * 一次 `detailUi`）选区就丢，用户看到「我明明选过了」。加上 [selectedValues] 后，
+ * 插件在每次返回的树里写明「现在选中的是哪几项」，选区就由插件的数据决定，
+ * 树重建也不会丢。
+ *
+ * **不给 `selectedValues`（留空）时退回旧语义**：由宿主内部记忆，适合
+ * 「选了立刻提交、不需要回显」的单选场景。
+ *
+ * 选项本身是静态列表；「从数据源里挑一项」请用 [PickerNode]，两者分工：
+ * `select` 表达「在一组固定选项里切」，`picker` 表达「从动态清单里选」。
+ *
  * @property submitLabel 非空时出现确认按钮（多选必需；单选留空=选中即提交）
+ * @property selectedValues 已选中的选项 value；为空表示不受控
  */
 data class SelectNode(
     override val actionId: String?,
@@ -356,14 +391,21 @@ data class SelectNode(
     val multiple: Boolean = false,
     val submitLabel: String = "",
     val enabled: Boolean = true,
+    val selectedValues: List<String> = emptyList(),
     override val id: String? = null,
     override val locked: Boolean = true,
 ) : NodeInteractive
 
-/** @property value 选项的机器可读值，**必填**；为空则该选项被丢弃 */
+/**
+ * @property value 选项的机器可读值，**必填**；为空则该选项被丢弃
+ * @property payload 随提交一并回传的结构化数据（如该项对应的会话 id）。
+ *   单选且整项回传时插件直接拿 `value` 就够；多选回传的是数组，
+ *   想同时拿到「每项的附加信息」就用 `payload` 作为 value 的另一半
+ */
 data class SelectOption(
     val value: String,
     val label: String = "",
+    val payload: String? = null,
 )
 
 /**

@@ -174,23 +174,10 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
         }
     }
 
-    /**
-     * 节点树里出现会话绑定时装配并启动会话。
-     *
-     * 一个插件只起一条会话（首期单会话）：同一插件再次进入详情页时，
-     * 注册表会复用已在运行的控制器，消息不会丢。
-     *
-     * 判定依据是树里有没有 `session:*` 绑定，而不是「有没有某个节点类型」——
-     * 这正是通用绑定相对专用会话节点的好处：插件可以把消息列表放在
-     * 卡片里、折叠块里、甚至拆成两处，宿主都能找得到。
-     */
+    /** 装配树要求的数据源；唯一会话随树切换，多会话并列时保留当前选择。 */
     private fun startBindingIfNeeded(pluginId: String, root: PluginNode?) {
-        val refs = collectBindingRefs(root)
-        val sessionKeys = refs
-            .filter { it.source == SessionBindingSource.SOURCE_NAME }
-            .map { it.key }
-            .toSet()
-        if (sessionKeys.isEmpty()) return
+        val requirements = sessionBindingRequirements(root)
+        if (requirements.sessionKeys.isEmpty() && !requirements.hasSessionList) return
 
         val controller = PluginSessionRegistry.controllerFor(pluginId) {
             PluginInvokerSessionEndpoint(deps.pluginInvoker, pluginId)
@@ -198,18 +185,35 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
         sessionController = controller
         // 注册数据源，渲染层求值时按 source 名查表
         PluginBindingRegistry.attach(pluginId, SessionBindingSource(conversation))
-        if (!controller.isActive) {
-            controller.startAsync(sessionKeys.first(), SessionConfig())
+        PluginBindingRegistry.attach(
+            pluginId,
+            SessionListBindingSource(SessionListRegistry.storeFor(pluginId)),
+        )
+        val isActive = controller.isActive
+        val activeKey = controller.activeSessionKey
+        val selected = requirements.selectKey(activeKey, isActive) ?: return
+        _state.value = _state.value.copy(currentSessionKey = selected)
+        if (!isActive || selected != activeKey) {
+            controller.startAsync(selected, SessionConfig())
         }
     }
 
-    /**
-     * 把输入框的内容投给会话。
-     *
-     * 与 [onAction] 分开：`onAction` 是「一次插件调用」（返回结果、可能重绘界面），
-     * 而这里是把一句话送进常驻会话，由会话控制器异步收发。混在一起会让
-     * `onAction` 承担两种职责，也让「输入框在等回复时该禁用」这类状态无从判断。
-     */
+    /** 切换会话 key，复用连接与控制器中按 key 隔离的消息。 */
+    fun switchSession(sessionKey: String) {
+        val controller = sessionController ?: return
+        if (sessionKey.isBlank() || sessionKey == controller.activeSessionKey) return
+        _state.value = _state.value.copy(currentSessionKey = sessionKey)
+        controller.startAsync(sessionKey, SessionConfig())
+    }
+
+    /** 插件推送会话清单（供 `sessionList:items` 绑定） */
+    fun publishSessionList(candidates: List<com.lifeboard.plugin.api.PickerCandidate>) {
+        val pluginId = _state.value.info?.pluginId ?: currentPluginId
+        if (pluginId.isEmpty()) return
+        SessionListRegistry.storeFor(pluginId).publish(candidates)
+    }
+
+    /** 将输入投给常驻会话异步收发，与一次插件调用的 [onAction] 分开。 */
     fun submitToSession(sessionKey: String, text: String) {
         sessionController?.submit(sessionKey, text)
     }
@@ -372,6 +376,7 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
             // 绑定源必须一起清：否则再进详情页时列表仍指向已停止的控制器，
             // 会一直显示旧消息，而且不会有任何报错
             PluginBindingRegistry.detach(info.pluginId)
+            SessionListRegistry.remove(info.pluginId)
             sessionController = null
         }
     }
@@ -401,6 +406,7 @@ class PluginDetailViewModel(private val deps: PlatformDependencies) {
                 sessionController?.stopAsync()
                 PluginSessionRegistry.remove(info.pluginId)
                 PluginBindingRegistry.detach(info.pluginId)
+                SessionListRegistry.remove(info.pluginId)
                 sessionController = null
             }
         }

@@ -425,6 +425,25 @@ function createSession(deviceId2, name, options) {
         }
       });
       return out;
+    },
+    exportCookies: () => {
+      const out = [];
+      jar.forEach((c) => {
+        out.push({ name: c.name, value: c.value, domain: c.domain, path: c.path });
+      });
+      return out;
+    },
+    importCookies: (items) => {
+      if (!items || items.length === 0) return;
+      items.forEach((c) => {
+        if (!c || !c.name) return;
+        jar.set(jarKey(c.domain, c.path || "/", c.name), {
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path || "/"
+        });
+      });
     }
   };
 }
@@ -642,6 +661,115 @@ var POINT_TIME_FIELDS = ["time", "timestamp", "start_time", "startTime"];
 var SLEEP_START_FIELDS = ["bedtime", "device_bedtime", "start_time", "startTime"];
 var SLEEP_END_FIELDS = ["device_wake_up_time", "wake_up_time", "end_time", "endTime"];
 var pendingLogin = null;
+var SLOT_PENDING_LOGIN = "pending_login";
+var SLOT_LOGIN_GENERATION = "pending_login_generation";
+function loginGeneration() {
+  const saved = ctx.credentials.get(SLOT_LOGIN_GENERATION);
+  if (saved) return saved;
+  const generation = Date.now().toString(36) + "-" + ctx.codec.base64Encode(ctx.crypto.randomBytes(16));
+  ctx.credentials.put(SLOT_LOGIN_GENERATION, generation);
+  return generation;
+}
+function invalidateLogin() {
+  sessionEpoch++;
+  resetPendingLogin();
+  ctx.credentials.remove(SLOT_LOGIN_GENERATION);
+}
+function loginCancelled(epoch) {
+  return epoch !== sessionEpoch;
+}
+function cancelledLogin() {
+  return { type: "failure", message: "\u767B\u5F55\u5DF2\u53D6\u6D88" };
+}
+var PENDING_LOGIN_TTL_MS = 10 * 60 * 1e3;
+function savePendingLoginSnapshot() {
+  const pending = pendingLogin;
+  if (!pending || pending.stage === "password") return;
+  const snapshot = {
+    v: 2,
+    stage: pending.stage,
+    account: pending.account,
+    passwordHash: pending.passwordHash,
+    handshake: pending.handshake,
+    userId: pending.userId,
+    context: pending.context,
+    flag: pending.flag,
+    method: pending.method,
+    hint: pending.hint,
+    auth2Ssecurity: pending.auth2Ssecurity,
+    cookies: pending.session.exportCookies(),
+    expiresAt: Date.now() + PENDING_LOGIN_TTL_MS,
+    generation: loginGeneration()
+  };
+  try {
+    ctx.credentials.put(SLOT_PENDING_LOGIN, JSON.stringify(snapshot));
+    log2("i", "\u5DF2\u4FDD\u5B58\u767B\u5F55\u4E2D\u95F4\u6001\uFF0C\u9636\u6BB5=" + snapshot.stage);
+  } catch (e) {
+    log2("w", "\u4FDD\u5B58\u767B\u5F55\u4E2D\u95F4\u6001\u5931\u8D25\uFF1A" + describeError(e));
+  }
+}
+function clearPendingLoginSnapshot() {
+  try {
+    ctx.credentials.remove(SLOT_PENDING_LOGIN);
+  } catch (e) {
+    log2("w", "\u6E05\u9664\u767B\u5F55\u4E2D\u95F4\u6001\u5931\u8D25\uFF1A" + describeError(e));
+  }
+}
+function resetPendingLogin() {
+  pendingLogin = null;
+  clearPendingLoginSnapshot();
+}
+function restorePendingLogin() {
+  if (pendingLogin) return true;
+  let raw = null;
+  try {
+    raw = ctx.credentials.get(SLOT_PENDING_LOGIN);
+  } catch (e) {
+    log2("w", "\u8BFB\u53D6\u767B\u5F55\u4E2D\u95F4\u6001\u5931\u8D25\uFF1A" + describeError(e));
+    return false;
+  }
+  if (!raw) return false;
+  let snapshot;
+  try {
+    snapshot = JSON.parse(raw);
+  } catch (e) {
+    log2("w", "\u767B\u5F55\u4E2D\u95F4\u6001\u635F\u574F\uFF0C\u5DF2\u4E22\u5F03\uFF1A" + describeError(e));
+    clearPendingLoginSnapshot();
+    return false;
+  }
+  if (!snapshot || snapshot.v !== 1 && snapshot.v !== 2 || !Number.isFinite(snapshot.expiresAt) || snapshot.stage !== "captcha" && snapshot.stage !== "twoFactor" || typeof snapshot.account !== "string" || !/^[A-F0-9]{32}$/.test(snapshot.passwordHash) || !Array.isArray(snapshot.cookies)) {
+    clearPendingLoginSnapshot();
+    return false;
+  }
+  if (Date.now() > snapshot.expiresAt) {
+    log2("i", "\u767B\u5F55\u4E2D\u95F4\u6001\u5DF2\u8FC7\u671F\uFF0C\u4E22\u5F03");
+    clearPendingLoginSnapshot();
+    return false;
+  }
+  if (snapshot.v === 2 && (!snapshot.generation || snapshot.generation !== ctx.credentials.get(SLOT_LOGIN_GENERATION))) {
+    log2("i", "\u767B\u5F55\u4E2D\u95F4\u6001\u5C5E\u4E8E\u5DF2\u4F5C\u5E9F\u7684\u6D41\u7A0B\uFF0C\u4E22\u5F03");
+    clearPendingLoginSnapshot();
+    return false;
+  }
+  const session = createSession(deviceId(), "login", { adoptAsDefault: false });
+  session.importCookies(snapshot.cookies || []);
+  pendingLogin = {
+    stage: snapshot.stage,
+    session,
+    account: snapshot.account,
+    passwordHash: snapshot.passwordHash,
+    handshake: snapshot.handshake,
+    userId: snapshot.userId || "",
+    context: snapshot.context,
+    flag: snapshot.flag,
+    method: snapshot.method,
+    hint: snapshot.hint,
+    auth2Ssecurity: snapshot.auth2Ssecurity
+  };
+  if (snapshot.v === 1) savePendingLoginSnapshot();
+  log2("i", "\u5DF2\u6062\u590D\u767B\u5F55\u4E2D\u95F4\u6001\uFF0C\u9636\u6BB5=" + snapshot.stage);
+  return true;
+}
 var cachedDeviceId = "";
 var DEVICE_ID_FILE = "device_id.txt";
 function deviceId() {
@@ -674,6 +802,30 @@ function deviceId() {
 var currentCreds = null;
 var sessionEpoch = 0;
 var credsRejectedByServer = false;
+var SLOT_CREDS_REJECTED = "creds_rejected";
+function setCredsRejected(rejected) {
+  credsRejectedByServer = rejected;
+  try {
+    if (rejected) {
+      ctx.credentials.put(SLOT_CREDS_REJECTED, "1");
+    } else {
+      ctx.credentials.remove(SLOT_CREDS_REJECTED);
+    }
+  } catch (e) {
+    log2("w", "\u4FDD\u5B58\u51ED\u636E\u5931\u6548\u6807\u5FD7\u5931\u8D25\uFF1A" + describeError(e));
+  }
+}
+function isCredsRejected() {
+  if (credsRejectedByServer) return true;
+  try {
+    if (ctx.credentials.get(SLOT_CREDS_REJECTED) === "1") {
+      credsRejectedByServer = true;
+    }
+  } catch (e) {
+    log2("w", "\u8BFB\u53D6\u51ED\u636E\u5931\u6548\u6807\u5FD7\u5931\u8D25\uFF1A" + describeError(e));
+  }
+  return credsRejectedByServer;
+}
 function log2(level, message) {
   try {
     ctx.log[level]("MiHealth", message);
@@ -711,7 +863,7 @@ function saveCredentials(creds) {
     ctx.credentials.put(SLOT_ACCOUNT, creds.account);
   }
   currentCreds = creds;
-  credsRejectedByServer = false;
+  setCredsRejected(false);
 }
 function captureEpoch() {
   return sessionEpoch;
@@ -1218,10 +1370,35 @@ async function collectDailyGoals(client, date) {
   log2("i", "\u6BCF\u65E5\u76EE\u6807\uFF08" + date + "\uFF09\u89E3\u6790\u5230 " + out.length + " \u9879");
   return out;
 }
-async function login(inputs) {
+async function login(inputs, options) {
   const form = inputs || {};
+  const intent = options && options.intent;
+  const epoch = captureEpoch();
   try {
+    if (intent === "abandon") {
+      invalidateLogin();
+      return { type: "success" };
+    }
+    if (intent === "restart") {
+      invalidateLogin();
+      return needPassword("");
+    }
+    if (intent === "open") {
+      if (!restorePendingLogin()) {
+        return needPassword("");
+      }
+      if (pendingLogin.stage === "captcha") {
+        return await needCaptcha(pendingLogin);
+      }
+      return needOtp(pendingLogin.hint);
+    }
     if (!pendingLogin) {
+      if (restorePendingLogin()) {
+        if (pendingLogin.stage === "captcha") {
+          return await needCaptcha(pendingLogin);
+        }
+        return needOtp(pendingLogin.hint);
+      }
       const account = form[SLOT_ACCOUNT];
       const password = form[SLOT_PASSWORD];
       if (!account || !password) {
@@ -1231,7 +1408,7 @@ async function login(inputs) {
     }
     const wantsRestart = !form[SLOT_ACCOUNT] && !form[SLOT_PASSWORD] && !form[SLOT_CAPTCHA] && !form[SLOT_OTP];
     if (wantsRestart) {
-      pendingLogin = null;
+      invalidateLogin();
       return needPassword("");
     }
     if (pendingLogin.stage === "captcha") {
@@ -1244,13 +1421,17 @@ async function login(inputs) {
       if (!code) return needOtp(pendingLogin.hint);
       return await submit2FA(code);
     }
+    if (!form[SLOT_PASSWORD]) {
+      return needPassword(form[SLOT_ACCOUNT] || pendingLogin.account);
+    }
     return await startLogin(
       form[SLOT_ACCOUNT] || pendingLogin.account,
-      form[SLOT_PASSWORD] || pendingLogin.password
+      form[SLOT_PASSWORD]
     );
   } catch (e) {
     log2("e", "login failed: " + describeError(e));
-    pendingLogin = null;
+    if (loginCancelled(epoch)) return cancelledLogin();
+    resetPendingLogin();
     return { type: "failure", message: "\u767B\u5F55\u5F02\u5E38\uFF1A" + describeError(e) };
   }
 }
@@ -1266,9 +1447,11 @@ function needPassword(account) {
   };
 }
 async function startLogin(account, password) {
+  const epoch = captureEpoch();
   const session = createSession(deviceId(), "login");
   log2("i", "\u767B\u5F55\u5F00\u59CB\uFF0Caccount=" + maskAccount(account));
   const handshake = await serviceLogin(session, account);
+  if (loginCancelled(epoch)) return cancelledLogin();
   if (!handshake || !handshake._sign) {
     log2("e", "\u63E1\u624B\u5931\u8D25\uFF1A\u672A\u62FF\u5230 _sign\uFF0C\u54CD\u5E94=" + JSON.stringify(handshake || null).slice(0, 200));
     return { type: "failure", message: "\u767B\u5F55\u63E1\u624B\u5931\u8D25\uFF1A\u65E0\u6CD5\u8FDE\u63A5\u5C0F\u7C73\u767B\u5F55\u670D\u52A1\u6216\u672A\u62FF\u5230 _sign" };
@@ -1276,6 +1459,7 @@ async function startLogin(account, password) {
   log2("i", "\u63E1\u624B\u6210\u529F\uFF0C\u5DF2\u62FF\u5230 _sign");
   const hash = md5Upper(password);
   const auth2 = await serviceLoginAuth2(session, account, hash, handshake, "");
+  if (loginCancelled(epoch)) return cancelledLogin();
   log2(
     "i",
     "serviceLoginAuth2 \u8FD4\u56DE\uFF1Acode=" + (auth2 && auth2.code) + " \u6709 notificationUrl=" + !!(auth2 && auth2.notificationUrl) + " \u6709 captchaUrl=" + !!(auth2 && auth2.captchaUrl) + " desc=" + (auth2 && auth2.desc || "")
@@ -1284,17 +1468,16 @@ async function startLogin(account, password) {
     stage: "password",
     session,
     account,
-    password,
+    passwordHash: hash,
     handshake,
     userId: ""
   };
-  return await handleAuth2(auth2, account);
+  return await handleAuth2(auth2, account, epoch);
 }
 async function logout() {
-  sessionEpoch++;
-  pendingLogin = null;
+  invalidateLogin();
   currentCreds = null;
-  credsRejectedByServer = false;
+  setCredsRejected(false);
   try {
     ctx.credentials.clear();
   } catch (e) {
@@ -1305,7 +1488,7 @@ async function authState() {
   try {
     const creds = loadCredentials();
     if (!isValidCreds(creds)) return { state: "loggedOut" };
-    if (credsRejectedByServer) {
+    if (isCredsRejected()) {
       return {
         state: "expired",
         message: "\u767B\u5F55\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u5C0F\u7C73\u8D26\u53F7"
@@ -1372,14 +1555,14 @@ async function fetch(date) {
       log2("w", "\u6BCF\u65E5\u76EE\u6807\u91C7\u96C6\u5931\u8D25\uFF08" + date + "\uFF09\uFF1A" + describeError(e));
     }
     if (authFailure) {
-      credsRejectedByServer = true;
+      setCredsRejected(true);
       log2("w", "\u51ED\u636E\u5DF2\u5931\u6548\uFF0C\u672C\u8F6E\u91C7\u96C6\u4E0D\u5B8C\u6574\uFF0C\u9700\u91CD\u65B0\u767B\u5F55\uFF1A" + authFailure);
       return {
         status: "authRequired",
         message: "\u767B\u5F55\u5DF2\u5931\u6548\uFF08\u5C0F\u7C73\u63A5\u53E3\u8FD4\u56DE 401 \u4E14\u65E0\u6CD5\u81EA\u52A8\u7EED\u671F\uFF09\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u5C0F\u7C73\u8D26\u53F7"
       };
     }
-    credsRejectedByServer = false;
+    setCredsRejected(false);
     return out;
   } catch (e) {
     log2("e", "fetch failed: " + describeError(e));
@@ -1410,20 +1593,20 @@ async function health() {
     try {
       const points = await client.getFitnessDataByTime("steps", now - DAY_MILLIS, now, 1);
       if (points && points.length >= 0) {
-        credsRejectedByServer = false;
+        setCredsRejected(false);
         return { status: "healthy" };
       }
     } catch (e) {
       log2("w", "health probe failed: " + describeError(e));
       if (isAuthError(e)) {
-        credsRejectedByServer = true;
+        setCredsRejected(true);
         return { status: "broken", message: "\u767B\u5F55\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u5C0F\u7C73\u8D26\u53F7" };
       }
     }
     if (!isValidCreds(loadCredentials())) {
       return { status: "broken", message: "\u767B\u5F55\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55" };
     }
-    if (credsRejectedByServer) {
+    if (isCredsRejected()) {
       return { status: "broken", message: "\u767B\u5F55\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u5C0F\u7C73\u8D26\u53F7" };
     }
     return { status: "degraded", message: "\u4E91\u7AEF\u63A5\u53E3\u6682\u65F6\u4E0D\u53EF\u7528" };
@@ -1680,10 +1863,10 @@ function hasUsableSsecurity(auth2) {
   const v = auth2 && auth2.ssecurity;
   return typeof v === "string" && v.length > 4;
 }
-async function handleAuth2(auth2, account) {
-  const epoch = captureEpoch();
+async function handleAuth2(auth2, account, epoch) {
+  if (loginCancelled(epoch)) return cancelledLogin();
   if (!auth2) {
-    pendingLogin = null;
+    resetPendingLogin();
     return { type: "failure", message: "\u767B\u5F55\u8BF7\u6C42\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC" };
   }
   const code = typeof auth2.code === "number" ? auth2.code : -1;
@@ -1698,11 +1881,11 @@ async function handleAuth2(auth2, account) {
   const notification = auth2.notificationUrl || "";
   if (notification) {
     log2("i", "\u6CA1\u6709 ssecurity \u4E14\u6709 notificationUrl\uFF0C\u8FDB\u5165 2FA \u6D41\u7A0B");
-    return await start2FA(notification, auth2.ssecurity || "", account);
+    return await start2FA(notification, auth2.ssecurity || "", account, epoch);
   }
   if (code === 0) {
     log2("e", "auth2 code=0 \u4F46\u7F3A\u5C11 ssecurity\uFF0C\u4E14\u65E0 notificationUrl\uFF0C\u65E0\u6CD5\u7EE7\u7EED");
-    pendingLogin = null;
+    resetPendingLogin();
     return {
       type: "failure",
       message: "\u767B\u5F55\u672A\u5B8C\u6210\uFF1A\u670D\u52A1\u7AEF\u8FD4\u56DE\u6210\u529F\u4F46\u6CA1\u6709\u4E0B\u53D1\u4F1A\u8BDD\u5BC6\u94A5\uFF08ssecurity\uFF09\u3002\u8BF7\u786E\u8BA4\u8BE5\u8D26\u53F7\u5DF2\u5728\u5C0F\u7C73\u8FD0\u52A8\u5065\u5EB7\u5B98\u65B9 App \u4E2D\u5B8C\u6210\u8FC7\u9A8C\u8BC1\uFF0C\u7136\u540E\u91CD\u8BD5\u3002"
@@ -1711,15 +1894,20 @@ async function handleAuth2(auth2, account) {
   if (code === 87001 || code === 70016 || auth2.captchaUrl) {
     log2("i", "\u9700\u8981\u56FE\u7247\u9A8C\u8BC1\u7801\uFF0Ccode=" + code);
     pendingLogin.stage = "captcha";
-    const image = await fetchCaptcha(pendingLogin.session);
-    return needCaptcha(pendingLogin, image);
+    savePendingLoginSnapshot();
+    const pending = pendingLogin;
+    const image = await fetchCaptcha(pending.session);
+    if (loginCancelled(epoch)) return cancelledLogin();
+    return needCaptcha(pending, image);
   }
   log2("w", "\u767B\u5F55\u88AB\u62D2\uFF1Acode=" + code + " desc=" + (auth2.desc || ""));
-  pendingLogin = null;
+  resetPendingLogin();
   return { type: "failure", message: friendlyError(code, auth2.desc || "") };
 }
 async function needCaptcha(pending, imageOverride) {
+  const epoch = captureEpoch();
   const image = imageOverride != null ? imageOverride : await fetchCaptcha(pending.session);
+  if (loginCancelled(epoch)) return cancelledLogin();
   return {
     type: "needInput",
     prompt: "\u9700\u8981\u8F93\u5165\u56FE\u7247\u9A8C\u8BC1\u7801",
@@ -1737,26 +1925,29 @@ function needOtp(hint) {
   };
 }
 async function submitCaptcha(code) {
+  const epoch = captureEpoch();
   const pending = pendingLogin;
   log2("i", "\u63D0\u4EA4\u56FE\u7247\u9A8C\u8BC1\u7801");
   const auth2 = await serviceLoginAuth2(
     pending.session,
     pending.account,
-    md5Upper(pending.password),
+    pending.passwordHash,
     pending.handshake,
     code
   );
-  return await handleAuth2(auth2, pending.account);
+  return await handleAuth2(auth2, pending.account, epoch);
 }
 async function completeLogin(auth2, account, epoch) {
+  if (loginCancelled(epoch)) return cancelledLogin();
   const loc = auth2.location || "";
   if (!loc) {
     log2("e", "passport \u8FD4\u56DE\u6210\u529F\u4F46\u6CA1\u6709 location\uFF0C\u65E0\u6CD5\u6362 serviceToken");
-    pendingLogin = null;
+    resetPendingLogin();
     return { type: "failure", message: "\u767B\u5F55\u6210\u529F\u4F46\u7F3A\u5C11 STS \u56DE\u8C03\u5730\u5740" };
   }
   const pending = pendingLogin;
   const token = await fetchServiceToken(pending.session, loc, pending.userId || "");
+  if (loginCancelled(epoch)) return cancelledLogin();
   log2("i", "STS \u56DE\u8C03\u5B8C\u6210\uFF0C\u62FF\u5230 serviceToken=" + !!token);
   if (!token) {
     const fromJar = usableServiceToken(
@@ -1764,7 +1955,7 @@ async function completeLogin(auth2, account, epoch) {
     );
     if (!fromJar) {
       log2("e", "STS \u56DE\u8C03\u672A\u62FF\u5230 serviceToken\uFF0C\u53EF\u80FD\u88AB\u98CE\u63A7\u62E6\u622A");
-      pendingLogin = null;
+      resetPendingLogin();
       return { type: "failure", message: "\u672A\u62FF\u5230 serviceToken\uFF0C\u53EF\u80FD\u88AB\u98CE\u63A7\u62E6\u622A" };
     }
     return finishLogin(auth2, fromJar, account, epoch);
@@ -1788,6 +1979,7 @@ async function probeCredentials(creds) {
   }
 }
 async function finishLogin(auth2, serviceToken, account, epoch) {
+  if (loginCancelled(epoch)) return cancelledLogin();
   const session = pendingLogin && pendingLogin.session;
   const fromJar = (name) => {
     try {
@@ -1806,40 +1998,40 @@ async function finishLogin(auth2, serviceToken, account, epoch) {
   };
   if (!creds.ssecurity) {
     log2("e", "\u7F3A\u5C11 ssecurity\uFF0C\u65E0\u6CD5\u6D3E\u751F sessionKey");
-    pendingLogin = null;
+    resetPendingLogin();
     return { type: "failure", message: "\u767B\u5F55\u5DF2\u901A\u8FC7\u4F46\u7F3A\u5C11 ssecurity\uFF0C\u65E0\u6CD5\u89E3\u5BC6\u6570\u636E\u63A5\u53E3" };
   }
   if (!creds.cUserId) {
     log2("e", "\u7F3A\u5C11 cUserId\uFF1Aauth2 \u4E0E\u4F1A\u8BDD cookie \u90FD\u6CA1\u6709");
-    pendingLogin = null;
+    resetPendingLogin();
     return {
       type: "failure",
       message: "\u767B\u5F55\u5DF2\u901A\u8FC7\u4F46\u6CA1\u6709\u62FF\u5230\u7528\u6237\u6807\u8BC6\uFF08cUserId\uFF09\uFF0C\u65E0\u6CD5\u8BBF\u95EE\u6570\u636E\u63A5\u53E3\u3002\u8BF7\u91CD\u8BD5\u767B\u5F55\u3002"
     };
   }
   if (epoch !== sessionEpoch) {
-    log2("w", "\u767B\u5F55\u671F\u95F4\u7528\u6237\u5DF2\u767B\u51FA\uFF0C\u51ED\u636E\u4E0D\u843D\u76D8");
-    pendingLogin = null;
-    return { type: "failure", message: "\u767B\u5F55\u5DF2\u53D6\u6D88" };
+    log2("w", "\u767B\u5F55\u671F\u95F4\u6D41\u7A0B\u5DF2\u53D6\u6D88\uFF0C\u51ED\u636E\u4E0D\u843D\u76D8");
+    return cancelledLogin();
   }
   log2(
     "i",
     "\u51C6\u5907\u843D\u76D8\uFF1Assecurity=len" + creds.ssecurity.length + " serviceToken=len" + creds.serviceToken.length + " cUserId=len" + creds.cUserId.length + " passToken=len" + creds.passToken.length
   );
   const probeError = await probeCredentials(creds);
+  if (loginCancelled(epoch)) return cancelledLogin();
   if (probeError) {
-    pendingLogin = null;
+    resetPendingLogin();
     return {
       type: "failure",
       message: "\u767B\u5F55\u5DF2\u901A\u8FC7\uFF0C\u4F46\u7528\u8FD9\u5957\u51ED\u636E\u8BBF\u95EE\u5C0F\u7C73\u5065\u5EB7\u6570\u636E\u63A5\u53E3\u88AB\u62D2\u7EDD\uFF08" + probeError + "\uFF09\u3002\u8FD9\u901A\u5E38\u610F\u5473\u7740\u8D26\u53F7\u9700\u8981\u5728\u5C0F\u7C73\u8FD0\u52A8\u5065\u5EB7\u5B98\u65B9 App \u91CC\u91CD\u65B0\u6388\u6743\u4E00\u6B21\uFF0C\u7136\u540E\u56DE\u6765\u91CD\u8BD5\u767B\u5F55\u3002"
     };
   }
   saveCredentials(creds);
-  pendingLogin = null;
+  resetPendingLogin();
   log2("i", "\u767B\u5F55\u6210\u529F\uFF0C\u51ED\u636E\u5DF2\u4FDD\u5B58\uFF0Caccount=" + maskAccount(account));
   return { type: "success" };
 }
-async function start2FA(notificationUrl, auth2Ssecurity, account) {
+async function start2FA(notificationUrl, auth2Ssecurity, account, epoch) {
   const pending = pendingLogin;
   const abs = absoluteUrl(ACCOUNT, notificationUrl);
   const ctxParam = queryParamOf(abs, "context");
@@ -1853,15 +2045,17 @@ async function start2FA(notificationUrl, auth2Ssecurity, account) {
   } catch (e) {
     log2("w", "start2FA: authStart failed: " + describeError(e));
   }
+  if (loginCancelled(epoch)) return cancelledLogin();
   const listUrl = IDENTITY + "/list?sid=" + encodeURIComponent(SID) + "&supportedMask=0&_locale=zh_CN&context=" + encodeURIComponent(ctxParam);
   const listRes = await pending.session.send("GET", listUrl, {
     userAgent: identityUa(deviceId(), identityUserId),
     headers: { Referer: ACCOUNT + "/", "Content-Type": "application/x-www-form-urlencoded" }
   });
+  if (loginCancelled(epoch)) return cancelledLogin();
   const listJson = parseMiapi(listRes.body);
   if (!listJson) {
     log2("e", "2FA \u7684 /list \u8FD4\u56DE\u65E0\u6CD5\u89E3\u6790\uFF1A" + String(listRes.body || "").slice(0, 200));
-    pendingLogin = null;
+    resetPendingLogin();
     return { type: "failure", message: "\u65E0\u6CD5\u83B7\u53D6\u4E8C\u6B21\u9A8C\u8BC1\u65B9\u5F0F" };
   }
   const flag = typeof listJson.flag === "number" ? listJson.flag : 4;
@@ -1879,6 +2073,7 @@ async function start2FA(notificationUrl, auth2Ssecurity, account) {
     "i",
     "verify" + method + " \u72B6\u6001=" + (verifyRes && verifyRes.status) + " body=" + String(verifyRes && verifyRes.body || "").replace(/^&&&START&&&/, "").slice(0, 200)
   );
+  if (loginCancelled(epoch)) return cancelledLogin();
   if (method === "Phone") {
     const sendUrl = IDENTITY + "/auth/sendPhoneTicket";
     const sendRes = await pending.session.send("POST", sendUrl, {
@@ -1893,12 +2088,13 @@ async function start2FA(notificationUrl, auth2Ssecurity, account) {
       "sendPhoneTicket \u72B6\u6001=" + (sendRes && sendRes.status) + " body=" + String(sendRes && sendRes.body || "").replace(/^&&&START&&&/, "").slice(0, 300)
     );
   }
+  if (loginCancelled(epoch)) return cancelledLogin();
   const hint = ["mask", "notification", "email", "phone", "address"].map((k) => listJson[k]).find((v) => typeof v === "string" && v !== "") || "";
   pendingLogin = {
     stage: "twoFactor",
     session: pending.session,
     account: pending.account,
-    password: pending.password,
+    passwordHash: pending.passwordHash,
     handshake: pending.handshake,
     userId: identityUserId,
     context: ctxParam,
@@ -1907,6 +2103,7 @@ async function start2FA(notificationUrl, auth2Ssecurity, account) {
     hint,
     auth2Ssecurity
   };
+  savePendingLoginSnapshot();
   return needOtp(hint);
 }
 async function submit2FA(code) {
@@ -1938,6 +2135,7 @@ async function submit2FA(code) {
   if (!loc) {
     return { type: "failure", message: "\u9A8C\u8BC1\u7801\u901A\u8FC7\u4F46\u672A\u62FF\u5230\u8DF3\u8F6C\u5730\u5740" };
   }
+  if (loginCancelled(epoch)) return cancelledLogin();
   try {
     let current = absoluteUrl(ACCOUNT, loc);
     for (let hop = 0; hop < 10; hop++) {
@@ -1962,6 +2160,7 @@ async function submit2FA(code) {
   } catch (e) {
     log2("w", "submit2FA: visit location failed: " + describeError(e));
   }
+  if (loginCancelled(epoch)) return cancelledLogin();
   log2("i", "2FA \u540E\u4F1A\u8BDD cookie=[" + pending.session.names().join(",") + "]");
   const jar = { value: (n, domain) => pending.session.cookie(n, domain) };
   let cUserId = jar.value("cUserId") || "";
@@ -2021,10 +2220,8 @@ async function submit2FA(code) {
   if (!ssecurity && passToken) {
     const refreshed = await refreshWithPassToken(passToken, cUserId, userId, pending.account);
     if (isValidCreds(refreshed)) {
-      pendingLogin = null;
-      if (epoch !== sessionEpoch) {
-        return { type: "failure", message: "\u767B\u5F55\u5DF2\u53D6\u6D88" };
-      }
+      if (loginCancelled(epoch)) return cancelledLogin();
+      resetPendingLogin();
       const refreshProbeError = await probeCredentials(refreshed);
       if (refreshProbeError) {
         return {
@@ -2032,13 +2229,14 @@ async function submit2FA(code) {
           message: "\u514D\u5BC6\u7EED\u671F\u62FF\u5230\u7684\u51ED\u636E\u65E0\u6CD5\u8BBF\u95EE\u6570\u636E\u63A5\u53E3\uFF08" + refreshProbeError + "\uFF09\uFF0C\u8BF7\u5728\u5C0F\u7C73\u8FD0\u52A8\u5065\u5EB7\u5B98\u65B9 App \u4E2D\u91CD\u65B0\u6388\u6743\u540E\u518D\u8BD5\u3002"
         };
       }
+      if (loginCancelled(epoch)) return cancelledLogin();
       saveCredentials(refreshed);
       log2("i", "\u7ECF passToken \u7EED\u671F\u767B\u5F55\u6210\u529F\uFF0C\u51ED\u636E\u5DF2\u4FDD\u5B58");
       return { type: "success" };
     }
   }
   if (!ssecurity || !serviceToken) {
-    pendingLogin = null;
+    if (!loginCancelled(epoch)) resetPendingLogin();
     log2(
       "e",
       "2FA \u672A\u80FD\u51D1\u9F50\u51ED\u636E\uFF1A\u7F3A" + (ssecurity ? "serviceToken" : "ssecurity") + "\uFF08passToken\u957F\u5EA6=" + passToken.length + " cUserId\u957F\u5EA6=" + cUserId.length + " userId\u957F\u5EA6=" + userId.length + "\uFF09"
@@ -2048,10 +2246,8 @@ async function submit2FA(code) {
       message: "\u4E8C\u6B21\u9A8C\u8BC1\u5DF2\u901A\u8FC7\uFF0C\u4F46\u672A\u80FD\u6362\u5230\u53EF\u7528\u7684\u4F1A\u8BDD\u5BC6\u94A5\uFF08\u7F3A" + (ssecurity ? "serviceToken" : "ssecurity") + "\uFF09\u3002\u8BF7\u786E\u8BA4\u8BE5\u8D26\u53F7\u5DF2\u5728\u5C0F\u7C73\u8FD0\u52A8\u5065\u5EB7\u5B98\u65B9 App \u4E2D\u6B63\u5E38\u767B\u5F55\u8FC7\uFF0C\u7136\u540E\u91CD\u8BD5\u3002"
     };
   }
-  pendingLogin = null;
-  if (epoch !== sessionEpoch) {
-    return { type: "failure", message: "\u767B\u5F55\u5DF2\u53D6\u6D88" };
-  }
+  if (loginCancelled(epoch)) return cancelledLogin();
+  resetPendingLogin();
   const twoFactorCreds = {
     ssecurity,
     serviceToken,
@@ -2067,6 +2263,7 @@ async function submit2FA(code) {
       message: "\u4E8C\u6B21\u9A8C\u8BC1\u5DF2\u901A\u8FC7\uFF0C\u4F46\u8FD9\u5957\u51ED\u636E\u8BBF\u95EE\u6570\u636E\u63A5\u53E3\u88AB\u62D2\u7EDD\uFF08" + twoFactorProbeError + "\uFF09\uFF0C\u8BF7\u5728\u5C0F\u7C73\u8FD0\u52A8\u5065\u5EB7\u5B98\u65B9 App \u4E2D\u91CD\u65B0\u6388\u6743\u540E\u518D\u8BD5\u3002"
     };
   }
+  if (loginCancelled(epoch)) return cancelledLogin();
   saveCredentials(twoFactorCreds);
   log2("i", "2FA \u767B\u5F55\u6210\u529F\uFF0C\u51ED\u636E\u5DF2\u4FDD\u5B58\uFF0Caccount=" + maskAccount(pending.account));
   return { type: "success" };

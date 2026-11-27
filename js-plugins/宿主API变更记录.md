@@ -28,6 +28,35 @@
 
 ## JS 接口版本（`manifest.apiVersion`）
 
+### v5 — 对话节点化 + 清单选择 + 多会话
+
+**这一版是本文件里唯一一次真正的破坏性变更**：删了字段、改了 `session` 的 key 语义。
+宿主**不会**因此拒绝加载旧插件——真正的保护是「旧结构渲染成占位」+ 内置插件已重新打包。
+请务必按本表核对，并按指南改写。
+
+| 变化 | 性质 | 说明 |
+|---|---|---|
+| `chat` 节点 | 新增 | 对话流。宿主负责角色区分、左右对齐、连续消息合并、轮次间隔、流式光标、自动贴底。替代「`list` + 绑定」的旧写法 |
+| `ChatMessage.id` / `ChatMessage.turnId` | 新增 | 稳定标识（去重）与轮次分组（让用户看出「这一组是一问一答」） |
+| `picker` 节点 + `PickerCandidate` / `PickerMode` | 新增 | 从一份会变的清单里弹层选择。解决「弹出选择时选不了」 |
+| `code.language` | **删除** | 宿主不做语法高亮。存一个不用的字段比不提供更误导；要标注语言请写在 `text.title` |
+| `text.card` | 新增 | 是否套卡片，默认 `true`。修「`text` 无条件套卡片」与「`column.card` 是唯一决定卡片字段」这个自相矛盾 |
+| `list.itemActionId` / `list.itemPayloads` | 新增 | 整行可点 |
+| `select.selectedValues` | 新增 | 受控选区。树重建不再丢选中；留空退回旧语义 |
+| `select.options[].payload` | 新增 | 选项可携带结构化数据 |
+| `image.aspectRatio` | 修正 | 以前解析了但不用，现在真正按比例占位，图片出来不再把页面顶下去 |
+| `table.columns[].align` | 修正 | 以前解析了但不用，现在生效 |
+| `list.maxHeightDp` 为 0 时 | 修正 | 不再硬顶 2000dp（超出的内容以前根本看不到） |
+| `session:<key>:*` 的 `<key>` | **语义变更** | 以前宿主忽略它、只认第一条会话；现在按 key 隔离消息表。切换会话 = 换 key |
+| `session` 源新增 `turnState` | 新增 | `idle`/`waiting`/`ended`/`disconnected`，机器可读。别再解析 `status` 文案判状态 |
+| 绑定源 `sessionList` | 新增 | `sessionList::items`（中间段留空，清单源没有实例 key） |
+| `SessionConfig.options.sessionKey` | 新增约定 | 宿主每次 `sessionStart` 都会带这个保留键，值是当前会话的 key。插件据此「只换订阅、不重复认证」 |
+| `chat` / `picker` 的排序标签 | 新增 | `plugin.blockOrder.<id>` 里新增 `chat` / `picker` 两种类型的 key，旧偏好不受影响 |
+
+**旧插件会怎样**：返回旧结构（如 `code` 带 `language`）不会整页崩溃——多余字段被忽略；
+但依赖「只有第一条会话」的多会话插件会看不到后面的会话。`dsh` / `mihealth` 已同批
+重新打包并递增 `versionCode`，**旧插件包需重新安装**。
+
 ### v4 — 详情页改为可组合节点树 + `ctx.report`
 
 **破坏性**：`detailUi` 不再返回 9 种固定区块（`text`/`statusCard`/`buttonRow`/`chart`/

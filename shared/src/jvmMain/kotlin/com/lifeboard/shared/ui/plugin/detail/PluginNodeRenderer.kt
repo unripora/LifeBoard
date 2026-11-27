@@ -10,6 +10,7 @@ import androidx.compose.ui.unit.dp
 import com.lifeboard.plugin.api.AudioNode
 import com.lifeboard.plugin.api.ButtonNode
 import com.lifeboard.plugin.api.ChartNode
+import com.lifeboard.plugin.api.ChatNode
 import com.lifeboard.plugin.api.CodeNode
 import com.lifeboard.plugin.api.CollapsibleNode
 import com.lifeboard.plugin.api.ColumnNode
@@ -18,6 +19,7 @@ import com.lifeboard.plugin.api.ImageNode
 import com.lifeboard.plugin.api.InputNode
 import com.lifeboard.plugin.api.KeyValueNode
 import com.lifeboard.plugin.api.ListNode
+import com.lifeboard.plugin.api.PickerNode
 import com.lifeboard.plugin.api.PluginNode
 import com.lifeboard.plugin.api.ProgressNode
 import com.lifeboard.plugin.api.RowNode
@@ -122,11 +124,15 @@ internal fun RenderNode(node: PluginNode, context: RenderContext) {
         // 集合
         is ListNode -> RenderList(node, context)
 
+        // 对话
+        is ChatNode -> RenderChat(node)
+
         // 交互
         is ButtonNode -> RenderButton(node, context)
         is InputNode -> RenderInput(node, context)
         is SelectNode -> RenderSelect(node, context)
         is ToggleNode -> RenderToggle(node, context)
+        is PickerNode -> RenderPicker(node, context)
 
         // 媒体（本期只降级）
         is AudioNode -> RenderMediaUnsupported("音频")

@@ -32,17 +32,17 @@
  */
 
 /** 字节数组。QuickJS 没有 Buffer / Uint8Array 的完整支持，统一用普通数组。 */
-type Bytes = number[];
+export type Bytes = number[];
 
 /** 键为小写、值为字符串的响应头表。 */
-type HeaderMap = Record<string, string>;
+export type HeaderMap = Record<string, string>;
 
 // ---------------------------------------------------------------------------
 // HTTP
 // ---------------------------------------------------------------------------
 
 /** 单次请求的可选项。 */
-interface HttpOptions {
+export interface HttpOptions {
     /** 额外请求头，会覆盖会话默认头。 */
     headers?: HeaderMap;
 
@@ -81,7 +81,7 @@ interface HttpOptions {
  * **4xx / 5xx 不会 reject**，正常返回并由调用方读 `status` 判断。
  * 只有网络层失败（超时、DNS、证书）才抛异常。
  */
-interface HttpResponse {
+export interface HttpResponse {
     /** HTTP 状态码（数字，可直接与 400 比较）。 */
     status: number;
 
@@ -114,12 +114,12 @@ interface HttpResponse {
 }
 
 /** `ctx.http.lastError()` 的稳定分类。 */
-type HttpErrorKind = 'timeout' | 'connect' | 'dns' | 'tls' | 'other';
+export type HttpErrorKind = 'timeout' | 'connect' | 'dns' | 'tls' | 'other';
 
 /** 表单参数：对象，或 `[[key, value]]` 二元组数组（用于同名参数）。 */
-type FormParams = Record<string, string | number | boolean | null> | Array<[string, string | number | boolean | null]>;
+export type FormParams = Record<string, string | number | boolean | null> | Array<[string, string | number | boolean | null]>;
 
-interface HttpApi {
+export interface HttpApi {
     /** GET 请求。`session` 缺省落到当前默认会话。 */
     get(url: string, options?: HttpOptions, session?: string): Promise<HttpResponse>;
 
@@ -225,7 +225,7 @@ interface HttpApi {
 // ---------------------------------------------------------------------------
 
 /** 建立连接的可选项。 */
-interface WsOptions {
+export interface WsOptions {
     /** 握手请求额外请求头。 */
     headers?: HeaderMap;
 
@@ -242,7 +242,7 @@ interface WsOptions {
 }
 
 /** `ctx.ws.state()` 的返回值。 */
-interface WsState {
+export interface WsState {
     /** `closed` 之后 `recv` 不再返回帧，直接抛错。 */
     state: 'connecting' | 'open' | 'closing' | 'closed';
 
@@ -254,13 +254,13 @@ interface WsState {
 }
 
 /** 文本帧。 */
-interface WsTextFrame {
+export interface WsTextFrame {
     type: 'text';
     data: string;
 }
 
 /** 二进制帧。 */
-interface WsBinaryFrame {
+export interface WsBinaryFrame {
     type: 'binary';
     bytes: Bytes;
 }
@@ -271,7 +271,7 @@ interface WsBinaryFrame {
  * 写法上仍是一条「帧」而不是 reject：对端正常关闭是业务事件，
  * 不应该以异常形式进入插件的 catch，否则控制流会被打乱。
  */
-interface WsCloseFrame {
+export interface WsCloseFrame {
     type: 'close';
     code: number;
     reason: string;
@@ -281,7 +281,7 @@ interface WsCloseFrame {
     error: string | null;
 }
 
-type WsFrame = WsTextFrame | WsBinaryFrame | WsCloseFrame;
+export type WsFrame = WsTextFrame | WsBinaryFrame | WsCloseFrame;
 
 /**
  * 宿主提供的 WebSocket 长连接。
@@ -298,7 +298,7 @@ type WsFrame = WsTextFrame | WsBinaryFrame | WsCloseFrame;
  * }
  * ```
  */
-interface WsApi {
+export interface WsApi {
     /** 建连。握手成功后 resolve 为连接 id；失败时 reject。 */
     connect(url: string, options?: WsOptions): Promise<string>;
 
@@ -361,7 +361,7 @@ interface WsApi {
  * return { type: 'refreshUi', blocks: blocks };
  * ```
  */
-interface StreamApi {
+export interface StreamApi {
     /**
      * 推一段增量文本。
      *
@@ -376,7 +376,7 @@ interface StreamApi {
 // ---------------------------------------------------------------------------
 
 /** 字符串 → 字节数组。插件需自己实现，`ctx.crypto.*` 只收字节。 */
-interface CryptoApi {
+export interface CryptoApi {
     md5Hex(bytes: Bytes): string;
     sha1Base64(bytes: Bytes): string;
     sha256Base64(bytes: Bytes): string;
@@ -393,7 +393,7 @@ interface CryptoApi {
     randomBytes(length: number): Bytes;
 }
 
-interface CodecApi {
+export interface CodecApi {
     /** 标准 Base64（带 `=` 补齐）。 */
     base64Encode(bytes: Bytes): string;
     /** 标准 Base64 解码，返回字节数组，不是字符串。 */
@@ -424,7 +424,7 @@ interface CodecApi {
  *
  * 只能读写相对路径，`..` 会被宿主的规范化检查拦掉。
  */
-interface FilesApi {
+export interface FilesApi {
     /** 读文本；不存在返回 null。 */
     read(path: string): string | null;
 
@@ -448,7 +448,7 @@ interface FilesApi {
 /**
  * 凭据槽位存取。**只有 manifest 的 `credentialSpec` 声明过的槽位能用。**
  */
-interface CredentialsApi {
+export interface CredentialsApi {
     /** 取不到返回 null。 */
     get(slot: string): string | null;
 
@@ -469,7 +469,7 @@ interface CredentialsApi {
  * 只在会话期间有效。事件是**受控 JSON**，不是任意 UI——宿主只认下面几种，
  * 未知 `type` 直接报错（便于开发期发现拼写错误），不会静默丢弃。
  */
-interface SessionApi {
+export interface SessionApi {
     /**
      * 推一条会话事件。
      *
@@ -493,7 +493,7 @@ interface SessionApi {
  * 3. URL 只记路径（签名常在 query 上）；
  * 4. 关键分支都要留一行。
  */
-interface LogApi {
+export interface LogApi {
     d(tag: string, message: string): void;
     i(tag: string, message: string): void;
     w(tag: string, message: string): void;
@@ -501,7 +501,7 @@ interface LogApi {
 }
 
 /** 已落库的历史指标样本。 */
-interface MetricSample {
+export interface MetricSample {
     /** `YYYY-MM-DD` */
     date: string;
     /**
@@ -514,7 +514,7 @@ interface MetricSample {
 }
 
 /** 上报给宿主的原始条目。 */
-interface RawRecord {
+export interface RawRecord {
     timestamp: number;
     value: number;
     detail?: string;
@@ -528,7 +528,7 @@ interface RawRecord {
  * `session` 只在会话期间可用：宿主在调用 `sessionStart` 之前就挂上
  * `ctx.session.emit`，`sessionStop` 之后移除。
  */
-interface PluginCtx {
+export interface PluginCtx {
     credentials: CredentialsApi;
     files: FilesApi;
     session: SessionApi;
@@ -589,3 +589,7 @@ interface PluginCtx {
     /** 本插件 id。 */
     pluginId(): string;
 }
+
+// 见 index.d.ts：这条语句让本文件成为模块，export type { … } from './ctx.js' 才生效。
+// 缺少它时 TS 把本文件当全局脚本，所有 re-export 静默退化成 any。
+export {};

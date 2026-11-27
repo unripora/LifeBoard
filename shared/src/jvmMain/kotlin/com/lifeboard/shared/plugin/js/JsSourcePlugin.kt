@@ -6,6 +6,7 @@ import com.lifeboard.plugin.api.ActionResult
 import com.lifeboard.plugin.api.AuthState
 import com.lifeboard.plugin.api.CredentialSpec
 import com.lifeboard.plugin.api.FetchResult
+import com.lifeboard.plugin.api.LoginOptions
 import com.lifeboard.plugin.api.LoginResult
 import com.lifeboard.plugin.api.MetricSpec
 import com.lifeboard.plugin.api.PluginApi
@@ -182,11 +183,17 @@ class JsSourcePlugin(
     override suspend fun login(
         context: PluginContext,
         inputs: Map<String, String>,
+        options: LoginOptions?,
     ): LoginResult {
         val args = PluginJsonObject().apply {
             inputs.forEach { (k, v) -> put(k, v) }
         }
-        val raw = invoke(context, "login", "[$args]")
+        // 意图作为第二个实参：只有声明 contract.loginIntent 的插件会解读它，
+        // 旧插件 `login(inputs)` 只写一个参数也能正常工作
+        val intentJson = options?.intent
+            ?.let { "{\"intent\":${PluginJson.quote(it.name.lowercase())}}" }
+            ?: "null"
+        val raw = invoke(context, "login", "[$args, $intentJson]")
             ?: return LoginResult.Failure("插件未实现 login")
         return JsTypeConverter.toLoginResult(raw)
     }
@@ -339,8 +346,10 @@ class JsSourcePlugin(
 
         while (true) {
             try {
-                // 必须投到插件专用线程：QuickJS 上下文不能跨线程使用
-                return@withLock runtime.runOnRuntime { rt ->
+                // 必须投到插件专用线程：QuickJS 上下文不能跨线程使用。
+                // 同时施加单段同步预算：纯同步死循环不会产生 Promise 落地，
+                // 只靠「无进展超时」永远判不出来
+                val raw = runtime.runOnRuntimeWithBudget { rt ->
                     rt.callFunction(
                         moduleName = entryModule,
                         functionName = function,
@@ -348,6 +357,15 @@ class JsSourcePlugin(
                         callKey = callKey,
                     )
                 }
+                // 本次调用正常返回 → 清零连续超限计数（历史超时不应永久拖累插件）
+                runtime.clearSyncBudgetFaults()
+                return@withLock raw
+            } catch (e: JsSyncBudgetExceededException) {
+                // 宿主主动打断：丢弃挂起调用，本次结果按失败返回。
+                // 连续超限由上层（故障停用策略）处理，这里只负责不把线程卡死
+                runtime.post { rt -> rt.dropInflightCall(callKey) }
+                AppLogger.error("JS 插件 $id.$function ${e.message}")
+                return@withLock null
             } catch (e: PendingResultException) {
                 // 还没落定。让出线程等回调推进，然后带着同一个键再问一次
                 //

@@ -50,10 +50,54 @@ import {
 } from './sessionWire.js';
 import { RpcError, type RpcOptions } from './rpc.js';
 import { MuxError } from './mux.js';
-import type { UiNode } from '../types/index.js';
+import { Conversation } from './conversation.js';
+// 具名类型从契约声明文件导入（它是模块）；裸 `ctx` 由 `../types/index.d.ts`
+// 的全局声明提供，见该文件的说明。
+import type { UiNode } from '../types/plugin-contract.js';
+import {
+    buildDetailUi,
+    handleDetailAction,
+    type DetailBridge,
+} from './detailView.js';
 
-/** 详情页会话区块固定的 sessionId（首期单会话） */
-const SESSION_ID = 'main';
+/**
+ * 会话 key 的**前缀**：每个 DSH 会话映射成一个独立的数据源 key。
+ *
+ * ## 为什么带前缀
+ *
+ * `session:<key>:*` 里的 `<key>` 由宿主原样交给会话控制器。DSH 的 sessionId
+ * 是 64 位十六进制串，直接当 key 也能用，但界面里（诊断、日志、`detailUi`
+ * 里的 `binding`）就完全看不出「这是哪家的会话」。前缀让 key 自解释，
+ * 也避免了将来接入第二种会话型插件时的撞名风险。
+ *
+ * 一个插件只要用 `session:dsh-<id>:messages` 这种写法，宿主就按 key 隔离
+ * 消息表——这就是「多个历史对话互不串」的实现方式，不需要任何会话专属字段。
+ */
+const SESSION_KEY_PREFIX = 'dsh-';
+
+/**
+ * 旧写法（首期单会话）用的固定 key `main`。
+ *
+ * 那份实现里所有消息都落在 `session:main:*`。现在每个 DSH 会话有自己的 key，
+ * 旧 key 不会再被写入，也不需要对它做迁移——会话消息本来就不落库
+ * （进程退出即清空），重新连接会用新 key 重新推历史。
+ */
+
+/** 构造某个 DSH 会话的数据源 key */
+function sessionKeyOf(sessionId: string): string {
+    return SESSION_KEY_PREFIX + sessionId;
+}
+
+/**
+ * 从数据源 key 反解 DSH 会话 id。
+ *
+ * 认不出时返回空串：调用方据此走「还没选会话」的分支，
+ * 而不是拿一个非法 id 去请求网关。
+ */
+function sessionIdOf(key: string): string {
+    if (key.startsWith(SESSION_KEY_PREFIX)) return key.slice(SESSION_KEY_PREFIX.length);
+    return '';
+}
 
 /** 当前订阅。模块级：跨调用存活 */
 let activeFollow: { close(): void } | null = null;
@@ -64,11 +108,36 @@ let lastFailure: string | null = null;
 /** 登录中间态：配对码与 CA 指纹只在这个变量里过一手，不落库 */
 let pendingPairing: { gateway: string; label: string; code: string; instance: string } | null = null;
 
-/** 已选中的会话 id */
+/** 已选中的会话 id（DSH 自己的 sessionId，不是数据源 key） */
 let selectedSessionId = '';
 
-/** 当前助手这一轮的累积文本，用于把累计值换算成增量 */
-let assistantBuffer = '';
+/**
+ * 最近一次「要切换到哪条会话」。
+ *
+ * ## 为什么不能只用 selectedSessionId
+ *
+ * 宿主的切换语义是：用户在 `picker` 里选了一项 → 宿主把 id 回传给
+ * `onAction` → 插件下次 `detailUi` 里就能写出新的 `binding` key → 宿主看到
+ * 新的 `session:<key>:*` 会再调一次 `sessionStart`（带 `options.sessionKey`）。
+ *
+ * 这条链路里 `sessionStart` 拿到的 key 才是**权威**的「现在该看哪一条」，
+ * 插件自己记的 `selectedSessionId` 只负责渲染选中态。两者不一致时以
+ * `sessionStart` 给的为准，否则用户点了 A 却看到 B 的消息。
+ */
+let pendingSwitchKey = '';
+
+/**
+ * 会话清单缓存：`sessionList:items` 的数据来源。
+ *
+ * 宿主的清单源是**推**模式：插件在 `detailUi` 被调用前把清单推上去，
+ * 选择器才能渲染出候选。缓存住是因为候选要同时用于两处——
+ * 渲染选择器、以及把用户选中的 id 翻译回会话元信息。
+ */
+let cachedSessions: SessionSummary[] = [];
+
+/** 当前订阅的展示账本与运行态；running 初值来自 session/list。 */
+let conversation: Conversation | null = null;
+let running = false;
 
 /**
  * 本次运行时里已恢复过 CA 的网关。
@@ -235,100 +304,64 @@ function hostLabel(gateway: string): string {
 // ---------------------------------------------------------------------------
 // 详情页区块
 // ---------------------------------------------------------------------------
+//
+// 实现在 detailView.ts（界面怎么组织），这里只保留对外导出与会话状态的桥接。
+//
+// ## 为什么要有 bridge 而不是让 detailView 直接 import 状态
+//
+// 会话语义相关的变量（`selectedSessionId` / `pendingSwitchKey` /
+// `cachedSessions` / `lastFailure` / `activeFollow`）都住在本文件——它是
+// 会话的所有者。若让视图层直接读写这些 `let`，依赖方向就变成双向，
+// 谁改了它难以追踪。bridge 把读写收成函数，每个字段因此只有一个写入点。
+
+/** 视图层访问会话状态的实现（见 detailView.ts 的 DetailBridge） */
+const detailBridge: DetailBridge = {
+    hostLabel: () => hostLabel(loadPairingOrEmpty()),
+    isPaired: () => loadPairing() !== null,
+    isConnected: () => activeFollow !== null,
+    lastFailure: () => lastFailure,
+    setLastFailure: (message) => {
+        lastFailure = message;
+    },
+    selectedSessionId: () => selectedSessionId,
+    setSelectedSessionId: (id) => {
+        selectedSessionId = id;
+    },
+    pendingSwitchKey: () => pendingSwitchKey,
+    setPendingSwitchKey: (key) => {
+        pendingSwitchKey = key;
+    },
+    cachedSessions: () => cachedSessions,
+    setCachedSessions: applySessionList,
+    fetchSessions: () => withSession((options) => listSessions(options)),
+    sessionKeyOf,
+    sessionIdOf,
+};
 
 /**
- * 详情页：连接状态 + 对话。
+ * 详情页：连接状态 + 会话选择 + 对话。
  *
- * ## 对话为什么是「自己拼」的
- *
- * 宿主已没有专用的会话区块。对话 = 消息列表 + 输入框，两者用普通原语声明，
- * 消息与可用状态通过 `binding` 交给宿主托管：
- * - `session:main:messages` → 消息列表（会话控制器持续推送）
- * - `session:main:status` → 连接状态文案
- * - `session:main:inputEnabled` → 输入框是否可发
- *
- * 输入框的 `submitTo` 让提交直接投给会话控制器，不经过 `onAction`——
- * 那是一次插件调用，与「往常驻会话里发一句话」是两件事。
+ * 具体结构见 [buildDetailUi]（detailView.ts）：候选来自插件自己拉到的
+ * 会话清单，对话绑定到 `session:<key>:*`，输入框的 `submitTo` 指向当前会话。
  */
 export function detailUi(): UiNode {
-    const pairing = loadPairing();
-
-    if (pairing === null) {
-        return {
-            type: 'column',
-            children: [
-                {
-                    type: 'column',
-                    card: true,
-                    title: '还没有连接电脑',
-                    children: [
-                        {
-                            type: 'text',
-                            body: '请先在插件列表里完成配对（需要电脑端 dsh-mobile 生成的配对链接），再回到这里对话。',
-                        },
-                    ],
-                },
-            ],
-        };
-    }
-
-    const header: UiNode[] = [
-        {
-            type: 'statusCard',
-            id: 'conn',
-            label: hostLabel(pairing.gateway),
-            value: activeFollow !== null ? '已连接' : '未连接',
-            tone: activeFollow !== null ? 'ok' : 'neutral',
-            detail: selectedSessionId.length > 0 ? `会话 ${selectedSessionId.slice(0, 8)}` : '尚未选择会话',
-        },
-    ];
-    if (lastFailure !== null) {
-        header.push({
-            type: 'text',
-            emphasis: 'caption',
-            tone: 'warn',
-            body: `上次连接失败：${lastFailure}`,
-        });
-    }
-
-    return {
-        type: 'column',
-        children: [
-            { type: 'column', card: true, id: 'status', children: header },
-            {
-                type: 'list',
-                id: 'messages',
-                // 固定高度让消息区自己滚，输入框稳定在下方
-                maxHeightDp: 320,
-                emptyHint: '连接后在这里对话',
-                items: { binding: 'session:' + SESSION_ID + ':messages' },
-            },
-            {
-                type: 'text',
-                id: 'sessionStatus',
-                emphasis: 'caption',
-                body: { binding: 'session:' + SESSION_ID + ':status' },
-            },
-            {
-                type: 'input',
-                id: 'send',
-                actionId: 'dsh.send',
-                placeholder: '给电脑发指令…',
-                submitLabel: '发送',
-                submitTo: 'session:' + SESSION_ID,
-                enabled: { binding: 'session:' + SESSION_ID + ':inputEnabled' },
-            },
-        ],
-    };
+    return buildDetailUi(detailBridge);
 }
 
+/**
+ * 详情页上的按钮与选择器回传。
+ *
+ * `dsh.selectSession` 只记「要切到哪一条」，真正的订阅由宿主的
+ * `sessionStart`（带 `options.sessionKey`）驱动——那里才是唯一建立连接的地方。
+ */
 export async function onAction(actionId: string, value?: string): Promise<unknown> {
-    if (actionId === 'dsh.refreshSessions') {
-        const sessions = await withSession((options) => listSessions(options));
-        if (sessions.length === 0) return { type: 'showMessage', text: '电脑上没有可用会话' };
-        return { type: 'showMessage', text: `发现 ${sessions.length} 个会话` };
-    }
-    return { type: 'showMessage', text: value === undefined ? '未知操作' : `已忽略：${actionId}` };
+    return handleDetailAction(detailBridge, actionId, value);
+}
+
+/** 配对网关的显示名；未配对时给空串（此时不会用到） */
+function loadPairingOrEmpty(): string {
+    const pairing = loadPairing();
+    return pairing === null ? '' : pairing.gateway;
 }
 
 export function health(): { state: 'healthy' } | { state: 'degraded'; message: string } {
@@ -448,13 +481,26 @@ function resetCaState(): void {
 // ---------------------------------------------------------------------------
 
 /**
- * 建立到电脑的会话。
+ * 建立到电脑的会话，或**切换到另一条**会话。
  *
- * 首期只订阅**已存在且在线的**会话：没有可用会话时明确报错并提示，
- * 而不是悄悄建一个新的——用户会困惑「为什么突然多了个会话」。
+ * ## 切换 ≠ 重连
+ *
+ * 宿主在「用户选了另一条会话」时也会调这个函数，但**不重新握手**：
+ * 配对凭据、CA 信任、Cookie 会话都沿用。所以这里做的是「断开旧的订阅、
+ * 建立新的订阅」，与首次连接走同一条代码路径，唯一的区别是
+ * `activeFollow !== null` 时先关掉旧的。
+ *
+ * 这正是「认证一次、多个历史对话」：认证属于连接，切换属于订阅。
+ *
+ * ## 目标会话从哪来
+ *
+ * 宿主的约定是 `options.sessionKey`（保留键，见 `SessionConfig` 的 KDoc），
+ * 值是插件自己写进绑定的那个 key（`dsh-<sessionId>`）。拿不到时退回
+ * 「上次选的，否则最近活动的那个」——这样旧宿主（不传 key）也能用。
  */
-export async function sessionStart(): Promise<boolean> {
+export async function sessionStart(options?: { sessionKey?: string }): Promise<boolean> {
     try {
+        // 切会话时先关旧订阅：同一条连接上不能有两条 follow 同时推
         closeSession();
         lastFailure = null;
 
@@ -466,9 +512,13 @@ export async function sessionStart(): Promise<boolean> {
 
         ctx.session.emit(JSON.stringify({ type: 'status', text: '正在连接…', inputEnabled: false }));
 
-        const sessions = await withSession((options) => listSessions(options));
+        const sessions = await withSession((c) => listSessions(c));
+        // 缓存清单：用户下一次进详情页（或刷新）时，选择器要能直接列出来
+        applySessionList(sessions);
+
         const usable = sessions.filter((s) => s.agentAvailable && !s.blank);
-        const target = pickSession(usable);
+        const requestedId = sessionIdOf((options?.sessionKey ?? '').trim());
+        const target = pickSession(usable, requestedId);
         if (target === undefined) {
             lastFailure = usable.length === 0
                 ? '电脑上没有正在运行的会话，请先在电脑上打开一个对话'
@@ -477,41 +527,34 @@ export async function sessionStart(): Promise<boolean> {
             return false;
         }
         selectedSessionId = target.sessionId;
+        pendingSwitchKey = sessionKeyOf(target.sessionId);
 
         const pairing = loadPairing();
         if (pairing === null) return false;
 
+        running = target.running;
+        const display = new Conversation((event) => ctx.session.emit(JSON.stringify(event)));
+        conversation = display;
         activeFollow = await followSession(pairing.gateway, target.sessionId, {
-            onSnapshot(messages, running) {
-                ctx.session.emit(JSON.stringify({ type: 'clear' }));
-                for (const message of messages) emitMessage(message);
-                assistantBuffer = '';
-                ctx.session.emit(JSON.stringify({
-                    type: 'status',
-                    text: running ? '电脑正在回复' : '已连接',
-                    inputEnabled: !running,
-                }));
+            onSnapshot(messages) {
+                display.snapshot(messages);
+                emitRunningStatus();
+            },
+            onTurnStart() {
+                running = true;
+                emitRunningStatus();
+            },
+            onAttemptReset() {
+                display.resetAttempt();
             },
             onMessage(message) {
-                // 助手消息会**先流式展示、后落库**，两条路径都发就会在气泡里
-                // 出现两遍。落库文本与流式累积一致时跳过，只作定稿确认；
-                // 不一致（例如流式丢帧）则照发，用落库的完整文本补全。
-                if (message.role === 'assistant' && assistantBuffer.length > 0) {
-                    const streamed = assistantBuffer.trim();
-                    assistantBuffer = '';
-                    if (message.text.trim() === streamed) return;
-                }
-                emitMessage(message);
+                display.message(message);
             },
             onDelta(text) {
-                // 宿主的 `delta` 是累加语义，所以这里发增量
-                assistantBuffer += text;
-                if (text.length > 0) {
-                    ctx.session.emit(JSON.stringify({ type: 'delta', text }));
-                }
+                display.delta(text);
             },
             onError(message) {
-                assistantBuffer = '';
+                display.resetAttempt();
                 ctx.log.w('dsh', `本轮失败：${message}`);
                 reportTurn('failed');
                 // 错误**落成一条系统消息**而不是一闪而过的状态条：
@@ -524,9 +567,10 @@ export async function sessionStart(): Promise<boolean> {
                 }));
             },
             onTurnEnd() {
-                assistantBuffer = '';
+                display.resetAttempt();
+                running = false;
                 reportTurn('done');
-                ctx.session.emit(JSON.stringify({ type: 'status', text: '已连接', inputEnabled: true }));
+                emitRunningStatus();
             },
             onClosed(reason) {
                 closeSession();
@@ -535,11 +579,7 @@ export async function sessionStart(): Promise<boolean> {
             },
         });
 
-        ctx.session.emit(JSON.stringify({
-            type: 'status',
-            text: `已连接 ${hostLabel(pairing.gateway)}`,
-            inputEnabled: true,
-        }));
+        emitRunningStatus();
         return true;
     } catch (error) {
         const message = describeError(error);
@@ -551,13 +591,49 @@ export async function sessionStart(): Promise<boolean> {
     }
 }
 
-/** 优先用上次选中的会话，否则取最近活动的那个 */
-function pickSession(sessions: SessionSummary[]): SessionSummary | undefined {
+/**
+ * 选出要订阅的会话。
+ *
+ * 优先级：
+ * 1. 宿主给的 `requestedId`（用户在选择器里点了哪一条）
+ * 2. 上次选中的（同一插件跨页面的连续体验）
+ * 3. 最近活动的（`listSessions` 已按活动时间排序）
+ *
+ * 找不到时返回 `undefined`，由调用方给出明确提示——**不自动新建**：
+ * 用户会困惑「为什么突然多了个会话」。
+ */
+function pickSession(
+    sessions: SessionSummary[],
+    requestedId: string,
+): SessionSummary | undefined {
+    if (requestedId.length > 0) {
+        const picked = sessions.find((s) => s.sessionId === requestedId);
+        if (picked !== undefined) return picked;
+        // 明确指了一条但不可用：不静默换成别的，否则用户会以为切换成功了
+        return undefined;
+    }
     if (selectedSessionId.length > 0) {
         const kept = sessions.find((s) => s.sessionId === selectedSessionId);
         if (kept !== undefined) return kept;
     }
     return sessions[0];
+}
+
+function emitRunningStatus(): void {
+    ctx.session.emit(JSON.stringify({
+        type: 'status', text: running ? '电脑正在回复' : '已连接', inputEnabled: !running,
+    }));
+}
+
+/** 仅成功 list 结果可淘汰缓存；目标消失时也撤掉旧绑定与订阅。 */
+function applySessionList(sessions: SessionSummary[]): void {
+    cachedSessions = sessions.filter((s) => s.origin !== 'subagent').sort((a, b) => b.updatedAt - a.updatedAt);
+    const ids = new Set(cachedSessions.map((s) => s.sessionId));
+    if (selectedSessionId.length > 0 && !ids.has(selectedSessionId)) {
+        closeSession();
+        selectedSessionId = '';
+    }
+    if (pendingSwitchKey.length > 0 && !ids.has(sessionIdOf(pendingSwitchKey))) pendingSwitchKey = '';
 }
 
 function emitMessage(message: FollowMessage): void {
@@ -587,21 +663,22 @@ export async function sessionEvent(event: SessionEventInput): Promise<SessionAct
     const text = (event.payload ?? '').trim();
     if (text.length === 0) return { action: 'continue' };
 
-    assistantBuffer = '';
-    // 先把自己发的消息显示出来：等 round-trip 再显示会有明显延迟感
-    emitMessage({ role: 'user', text });
-    ctx.session.emit(JSON.stringify({ type: 'status', text: '正在回复', inputEnabled: false }));
+    const requestId = newRequestId();
+    conversation?.submitted(requestId, text);
+    running = true;
+    emitRunningStatus();
 
     try {
         const sessionId = selectedSessionId;
-        await withSession((options) => promptSession(options, sessionId, text, newRequestId()));
+        await withSession((options) => promptSession(options, sessionId, text, requestId));
         return { action: 'continue' };
     } catch (error) {
         const message = describeError(error);
         ctx.log.e('dsh', `发送失败：${message}`);
         emitMessage({ role: 'system', text: `发送失败：${message}` });
         // 发送失败不该断掉整条会话：恢复输入让用户重试
-        ctx.session.emit(JSON.stringify({ type: 'status', text: '已连接', inputEnabled: true }));
+        running = false;
+        emitRunningStatus();
         return { action: 'continue' };
     }
 }
@@ -615,8 +692,9 @@ function closeSession(): void {
     activeFollow = null;
     // 回复收到一半就被停掉 → 记为「中断」。这条必须在清空缓冲前判断：
     // 缓冲非空意味着这一轮还没结束，用户是主动打断的
-    if (assistantBuffer.length > 0) reportTurn('interrupted');
-    assistantBuffer = '';
+    if ((conversation?.buffer.length ?? 0) > 0) reportTurn('interrupted');
+    conversation = null;
+    running = false;
     if (follow !== null) follow.close();
 }
 

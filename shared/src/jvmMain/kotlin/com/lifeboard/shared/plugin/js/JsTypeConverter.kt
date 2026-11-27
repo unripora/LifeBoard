@@ -1,6 +1,7 @@
 package com.lifeboard.shared.plugin.js
 
 import com.lifeboard.plugin.api.ActionResult
+import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.plugin.api.Align
 import com.lifeboard.plugin.api.AudioNode
 import com.lifeboard.plugin.api.AuthState
@@ -11,6 +12,9 @@ import com.lifeboard.plugin.api.ButtonNode
 import com.lifeboard.plugin.api.ChartNode
 import com.lifeboard.plugin.api.ChartPoint
 import com.lifeboard.plugin.api.ChartSpec
+import com.lifeboard.plugin.api.ChatMessage
+import com.lifeboard.plugin.api.ChatNode
+import com.lifeboard.plugin.api.ChatRole
 import com.lifeboard.plugin.api.CodeNode
 import com.lifeboard.plugin.api.CollapsibleNode
 import com.lifeboard.plugin.api.ColumnNode
@@ -29,9 +33,14 @@ import com.lifeboard.plugin.api.LoginResult
 import com.lifeboard.plugin.api.MetricAggregate
 import com.lifeboard.plugin.api.MetricBucket
 import com.lifeboard.plugin.api.MetricSpec
+import com.lifeboard.plugin.api.PluginError
+import com.lifeboard.plugin.api.PluginErrorCode
 import com.lifeboard.plugin.api.PluginHealth
 import com.lifeboard.plugin.api.PluginMetric
 import com.lifeboard.plugin.api.PluginNode
+import com.lifeboard.plugin.api.PickerCandidate
+import com.lifeboard.plugin.api.PickerMode
+import com.lifeboard.plugin.api.PickerNode
 import com.lifeboard.plugin.api.ProgressNode
 import com.lifeboard.plugin.api.ProgressRingSpec
 import com.lifeboard.plugin.api.RawRecord
@@ -180,18 +189,62 @@ object JsTypeConverter {
                 message = optString("message", "暂时取不到数据"),
                 // 0 与缺省都表示「没给建议」，交给宿主决定退避间隔
                 retryAfterSeconds = optLong("retryAfterSeconds", 0L).takeIf { it > 0 },
+                // 插件给了结构化错误就用它；旧插件不给则保持 null，
+                // 由上层按 UPSTREAM_ERROR 兜底（见 errorOf）
+                error = optError(),
             )
 
         "authRequired" ->
-            FetchResult.AuthenticationRequired(optString("message", "登录已过期，请重新登录"))
+            FetchResult.AuthenticationRequired(
+                message = optString("message", "登录已过期，请重新登录"),
+                error = optError(),
+            )
 
         "failure" ->
-            FetchResult.Failure(optString("message", "采集失败"))
+            FetchResult.Failure(
+                message = optString("message", "采集失败"),
+                error = optError(),
+            )
 
         else -> FetchResult.Failure(
             "fetch 返回了无法识别的 status：\"${optString("status")}\"，" +
                 "应为 success/empty/temporary/authRequired/failure"
         )
+    }
+
+    /**
+     * 解析可选的 `error` 对象。
+     *
+     * 插件没给、或给的不是对象时返回 `null`——调用方据此按旧语义推断错误码，
+     * 不能把「没给错误」当成「没有错误」。
+     */
+    private fun PluginJsonObject.optError(): PluginError? {
+        val o = optJSONObject("error") ?: return null
+        return PluginError(
+            code = PluginErrorCode.fromString(o.optString("code")),
+            message = o.optString("message").ifBlank { optString("message") },
+            retryAfterSec = o.optLong("retryAfterSec", 0L).takeIf { it > 0 },
+            operation = o.optString("operation"),
+            reason = o.optStringOrNull("reason"),
+            limitKind = o.optStringOrNull("limitKind"),
+        )
+    }
+
+    /**
+     * 取一次采集结果对应的结构化错误。
+     *
+     * 旧插件只给 status 时按契约推断：`authRequired` → `AUTH_REQUIRED`、
+     * `temporary` → `UPSTREAM_ERROR`、`failure` → `INTERNAL_ERROR`。
+     * 成功/无数据的调用方不应调用本方法。
+     */
+    fun errorOf(result: FetchResult): PluginError? = when (result) {
+        is FetchResult.Success, is FetchResult.Empty -> null
+        is FetchResult.TemporaryFailure ->
+            result.error ?: PluginError(PluginErrorCode.UPSTREAM_ERROR, result.message, result.retryAfterSeconds)
+        is FetchResult.AuthenticationRequired ->
+            result.error ?: PluginError(PluginErrorCode.AUTH_REQUIRED, result.message)
+        is FetchResult.Failure ->
+            result.error ?: PluginError(PluginErrorCode.INTERNAL_ERROR, result.message)
     }
 
     // ---------- 指标 ----------
@@ -228,425 +281,6 @@ object JsTypeConverter {
             "broken" -> PluginHealth.Broken(obj.optString("message", "插件不可用"))
             else -> PluginHealth.Degraded("未知的健康状态")
         }
-    }
-
-    // ---------- 详情页 UI ----------
-
-    /**
-     * 解析 detailUi 返回值，得到一棵可组合节点树。
-     *
-     * ## 接受三种根形态
-     *
-     * - 单个节点对象：`{"type":"column","children":[...]}`
-     * - 节点数组：`[{...},{...}]` → 自动包成一层 [ColumnNode]
-     * - 空/invalid：返回 [UiTreeParseResult.root] = null
-     *
-     * 数组形态是给「只想平铺几个卡片」的插件留的便利入口。它不构成兼容层——
-     * 数组里的每个元素仍必须是**新节点**，旧 `type:'conversation'` 之类
-     * 会被转成 [UnsupportedNode]，不会静默丢弃。
-     *
-     * ## 为什么返回结果对象而不是裸树
-     *
-     * 解析过程可能因超出安全上限而截断，也可能遇到宿主不认识的 type。
-     * 这两种情况都需要让上层记日志/提示用户，而不是悄悄少画几块。
-     */
-    fun toUiTree(json: String): UiTreeParseResult {
-        val trimmed = json.trim()
-        if (trimmed.isEmpty() || trimmed == "null") return UiTreeParseResult(null)
-
-        val budget = UiParseBudget()
-
-        // 数组根：包一层不套卡片的 column，让插件可以只返回平铺的几块
-        val arr = jsonArrayOrNull(trimmed)
-        if (arr != null) {
-            val children = (0 until arr.length()).mapNotNull { i ->
-                arr.optJSONObject(i)?.let { toNode(it, 1, budget) }
-            }
-            val root = if (children.isEmpty()) {
-                null
-            } else {
-                ColumnNode(children = children, card = false, spacing = Spacing.NORMAL)
-            }
-            return UiTreeParseResult(root, budget, children.size)
-        }
-
-        val obj = jsonObjectOrNull(trimmed) ?: return UiTreeParseResult(null)
-        val root = toNode(obj, 0, budget)
-        return UiTreeParseResult(root, budget, if (root == null) 0 else 1)
-    }
-
-    /**
-     * 递归解析单个节点。
-     *
-     * ## 三层防御
-     *
-     * 1. **节点总数上限**：超过 [MAX_NODES] 后直接返回 null，不再构造。
-     *    传入的 JSON 来自沙箱里的插件，不能假设它有多克制。
-     * 2. **嵌套深度上限**：超过 [MAX_DEPTH] 时把这一支换成
-     *    [UnsupportedNode]（占位）而不是丢弃——兄弟节点不受影响，
-     *    用户还能看到「这里本来有东西」。深度必须在**构造前**判断，
-     *    否则深嵌套 JSON 在 `PluginJsonObject` 构造阶段就吃掉栈了。
-     * 3. **未知 type**：转成 [UnsupportedNode]，不再像旧实现那样静默丢弃。
-     */
-    private fun toNode(o: PluginJsonObject, depth: Int, budget: UiParseBudget): PluginNode? {
-        if (budget.nodeCount >= MAX_NODES) return null
-        if (depth > MAX_DEPTH) return UnsupportedNode(type = "嵌套过深", id = o.optStringOrNull("id"))
-
-        val type = o.optString("type")
-        // 没有 type 的对象不是一个节点：`{}` 这类内容当作「什么都没说」，
-        // 而不是造一个「暂不支持 ?」的占位去占版面
-        if (type.isBlank()) return null
-        val id = o.optStringOrNull("id")
-        val locked = o.optBoolean("locked", false)
-
-        val node = when (type) {
-            // ---- 容器 ----
-            "column" -> ColumnNode(
-                children = o.optNodes("children", depth, budget),
-                spacing = o.optString("spacing").toSpacing(),
-                card = o.optBoolean("card", true),
-                title = o.optString("title"),
-            )
-            "row" -> RowNode(
-                children = o.optNodes("children", depth, budget),
-                spacing = o.optString("spacing").toSpacing(),
-                wrap = o.optBoolean("wrap", true),
-            )
-            "collapsible" -> CollapsibleNode(
-                title = o.optString("title"),
-                children = o.optNodes("children", depth, budget),
-                collapsed = o.optBoolean("collapsed", true),
-                summary = o.optString("summary"),
-            )
-            "spacer" -> SpacerNode(size = o.optString("size").toSpacing())
-            "divider" -> DividerNode()
-
-            // ---- 内容 ----
-            "text" -> TextNode(
-                title = o.optString("title"),
-                body = o.optBoundString("body"),
-                tone = o.optString("tone").toTone(),
-                emphasis = o.optString("emphasis").toEmphasis(),
-            )
-            "statusCard" -> StatusCardNode(
-                label = o.optString("label"),
-                value = o.optBoundString("value"),
-                tone = o.optString("tone").toTone(),
-                detail = o.optString("detail"),
-            )
-            "chart" -> {
-                // 认不出 kind 时保留节点并降级，旧实现是整块丢掉——
-                // 用户至少该知道「这里本来有个图」
-                val spec = o.optJSONObject("chart")?.let { toChartSpec(it) }
-                if (spec == null) {
-                    UnsupportedNode(type = "chart:${o.optJSONObject("chart")?.optString("kind") ?: "?"}", id = id)
-                } else {
-                    ChartNode(chart = spec, title = o.optString("title"))
-                }
-            }
-            "image" -> ImageNode(
-                dataUri = o.optString("dataUri"),
-                aspectRatio = o.optDouble("aspectRatio", 1.6).toFloat(),
-                contentDescription = o.optString("contentDescription"),
-            )
-            "progress" -> ProgressNode(
-                fraction = o.optDouble("fraction", 0.0).toFloat(),
-                label = o.optString("label"),
-                valueText = o.optString("valueText"),
-                tone = o.optString("tone").toTone(),
-            )
-            "code" -> CodeNode(
-                code = o.optString("code"),
-                language = o.optString("language"),
-            )
-
-            // ---- 集合 ----
-            "list" -> ListNode(
-                items = o.optBoundItems(depth, budget),
-                dense = o.optBoolean("dense", false),
-                separator = o.optBoolean("separator", true),
-                maxHeightDp = o.optInt("maxHeightDp", 0),
-                emptyHint = o.optString("emptyHint").ifBlank { "暂无内容" },
-            )
-            "table" -> TableNode(
-                columns = o.optJSONArray("columns").toTableColumns(),
-                rows = o.optJSONArray("rows").toTableRows(),
-            )
-            "keyValue" -> KeyValueNode(entries = o.optJSONArray("entries").toKeyValues())
-
-            // ---- 交互 ----
-            "button" -> ButtonNode(
-                label = o.optString("label"),
-                actionId = o.optStringOrNull("actionId"),
-                primary = o.optBoolean("primary", false),
-                enabled = o.optBoolean("enabled", true),
-                payload = o.optStringOrNull("payload"),
-            )
-            "input" -> o.optString("actionId").takeIf { it.isNotBlank() }?.let { actionId ->
-                InputNode(
-                    actionId = actionId,
-                    placeholder = o.optString("placeholder").ifBlank { "输入内容" },
-                    submitLabel = o.optString("submitLabel").ifBlank { "提交" },
-                    multiline = o.optBoolean("multiline", true),
-                    enabled = o.optBoundBoolean("enabled", true),
-                    submitTo = o.optString("submitTo").takeIf { it.isNotBlank() }?.let { BindingRef.parseTarget(it) },
-                )
-            }
-            "select" -> o.optString("actionId").takeIf { it.isNotBlank() }?.let { actionId ->
-                val options = o.optJSONArray("options").toSelectOptions()
-                // 一个选项都没有的下拉框点了没反应，不如不渲染
-                if (options.isEmpty()) null else SelectNode(
-                    actionId = actionId,
-                    options = options,
-                    label = o.optString("label"),
-                    multiple = o.optBoolean("multiple", false),
-                    submitLabel = o.optString("submitLabel"),
-                    enabled = o.optBoolean("enabled", true),
-                )
-            }
-            "toggle" -> o.optString("actionId").takeIf { it.isNotBlank() }?.let { actionId ->
-                ToggleNode(
-                    actionId = actionId,
-                    label = o.optString("label"),
-                    checked = o.optBoolean("checked", false),
-                    enabled = o.optBoolean("enabled", true),
-                )
-            }
-
-            // ---- 媒体（本期只降级）----
-            "audio" -> o.optMediaSource()?.let { src ->
-                AudioNode(
-                    source = src,
-                    title = o.optString("title"),
-                    subtitle = o.optString("subtitle"),
-                    durationSeconds = o.optInt("durationSeconds", 0),
-                )
-            } ?: UnsupportedNode(type = "audio（地址不安全）", id = id)
-            "video" -> o.optMediaSource()?.let { src ->
-                VideoNode(
-                    source = src,
-                    posterDataUri = o.optString("posterDataUri"),
-                    aspectRatio = o.optDouble("aspectRatio", 1.778).toFloat(),
-                    title = o.optString("title"),
-                    autoplay = o.optBoolean("autoplay", false),
-                )
-            } ?: UnsupportedNode(type = "video（地址不安全）", id = id)
-
-            else -> UnsupportedNode(type = type, id = id)
-        } ?: return null
-
-        return node.withHostFields(id = id, locked = locked).also { budget.nodeCount++ }
-    }
-
-    /**
-     * 把插件声明的 id / locked 写到节点上。
-     *
-     * 旧实现是在 9 个解析分支里各自 `copy(id = ...)`，新增第 10 个分支时
-     * 一定会漏，而漏了的表现是「排序偏好不生效」——离原因很远。
-     * 收在一处后，新增节点时编译器会提示 `when` 不穷尽。
-     */
-    private fun PluginNode.withHostFields(id: String?, locked: Boolean): PluginNode = when (this) {
-        is ColumnNode -> copy(id = id, locked = locked)
-        is RowNode -> copy(id = id, locked = locked)
-        is CollapsibleNode -> copy(id = id, locked = locked)
-        is SpacerNode -> copy(id = id, locked = locked)
-        is DividerNode -> copy(id = id, locked = locked)
-        is TextNode -> copy(id = id, locked = locked)
-        is StatusCardNode -> copy(id = id, locked = locked)
-        is ChartNode -> copy(id = id, locked = locked)
-        is ImageNode -> copy(id = id, locked = locked)
-        is ProgressNode -> copy(id = id, locked = locked)
-        is CodeNode -> copy(id = id, locked = locked)
-        is UnsupportedNode -> copy(id = id, locked = locked)
-        is ListNode -> copy(id = id, locked = locked)
-        is TableNode -> copy(id = id, locked = locked)
-        is KeyValueNode -> copy(id = id, locked = locked)
-        is ButtonNode -> copy(id = id, locked = locked)
-        is InputNode -> copy(id = id, locked = locked)
-        is SelectNode -> copy(id = id, locked = locked)
-        is ToggleNode -> copy(id = id, locked = locked)
-        is AudioNode -> copy(id = id, locked = locked)
-        is VideoNode -> copy(id = id, locked = locked)
-    }
-
-    /** 递归解析 children；单层子节点数超限时截断，避免一个 row 里塞几千个节点 */
-    private fun PluginJsonObject.optNodes(
-        key: String,
-        depth: Int,
-        budget: UiParseBudget,
-    ): List<PluginNode> {
-        val arr = optJSONArray(key) ?: return emptyList()
-        val limit = minOf(arr.length(), MAX_CHILDREN_PER_CONTAINER)
-        return (0 until limit).mapNotNull { i ->
-            arr.optJSONObject(i)?.let { toNode(it, depth + 1, budget) }
-        }
-    }
-
-    // ---- 绑定点解析 ----
-
-    /**
-     * 解析一个可绑定字符串字段。
-     *
-     * 三种形态：缺失 → 静态默认空串；字符串 → 静态值；对象且有 `binding`
-     * → 绑定引用（格式错则退回静态默认值）。
-     *
-     * 绑定的语法在这里校验，**语义**（source 认不认识、字段在不在）留给
-     * 求值阶段——解析层不知道插件声明了什么数据源。
-     */
-    private fun PluginJsonObject.optBoundString(key: String): Bound<String> {
-        val obj = optJSONObject(key)
-        if (obj != null) {
-            val ref = obj.optString("binding").takeIf { it.isNotBlank() }
-            val parsed = ref?.let { BindingRef.parse(it) }
-            return if (parsed == null) Bound.Static("") else Bound.Ref<String>(parsed.canonical())
-        }
-        return Bound.Static(optString(key))
-    }
-
-    /** 解析可绑定布尔字段（输入框 enabled） */
-    private fun PluginJsonObject.optBoundBoolean(key: String, default: Boolean): Bound<Boolean> {
-        val obj = optJSONObject(key)
-        if (obj != null) {
-            val ref = obj.optString("binding").takeIf { it.isNotBlank() }
-            val parsed = ref?.let { BindingRef.parse(it) }
-            return if (parsed == null) Bound.Static(default) else Bound.Ref<Boolean>(parsed.canonical())
-        }
-        return Bound.Static(optBoolean(key, default))
-    }
-
-    /**
-     * 解析可绑定条目列表。
-     *
-     * 静态分支是 `List<List<PluginNode>>`（两层：条目 → 条目内的节点），
-     * 让宿主能给每项插入分隔线与稳定 key。绑定分支指向会话消息源。
-     */
-    private fun PluginJsonObject.optBoundItems(depth: Int, budget: UiParseBudget): Bound<List<List<PluginNode>>> {
-        val obj = optJSONObject("items")
-        if (obj != null) {
-            val ref = obj.optString("binding").takeIf { it.isNotBlank() }
-            val parsed = ref?.let { BindingRef.parse(it) }
-            return if (parsed == null) {
-                Bound.Static(emptyList())
-            } else {
-                Bound.Ref<List<List<PluginNode>>>(parsed.canonical())
-            }
-        }
-        val arr = optJSONArray("items") ?: return Bound.Static(emptyList())
-        val limit = minOf(arr.length(), MAX_LIST_ITEMS)
-        val items = (0 until limit).mapNotNull { i ->
-            val item = arr.optJSONArray(i) ?: return@mapNotNull null
-            val nodes = (0 until minOf(item.length(), MAX_CHILDREN_PER_CONTAINER)).mapNotNull { j ->
-                item.optJSONObject(j)?.let { toNode(it, depth + 1, budget) }
-            }
-            nodes.takeIf { it.isNotEmpty() }
-        }
-        return Bound.Static(items)
-    }
-
-    /**
-     * 媒体地址校验：只允许 `https://` 或 `data:`。
-     *
-     * 必须在这里拦：Android 9+ 默认禁止明文 HTTP，放着不管等于将来实现播放器
-     * 时带着一个已知漏洞上线。返回 null 时上层降级为 [UnsupportedNode]。
-     */
-    private fun PluginJsonObject.optMediaSource(): String? {
-        val src = optString("source").trim()
-        if (src.isEmpty()) return null
-        val lower = src.lowercase()
-        return when {
-            lower.startsWith("https://") -> src
-            lower.startsWith("data:") -> src
-            else -> null
-        }
-    }
-
-    // ---- 小类型解析 ----
-
-    private fun PluginJsonArray?.toTableColumns(): List<TableColumn> {
-        if (this == null) return emptyList()
-        return (0 until length()).mapNotNull { i ->
-            val o = optJSONObject(i) ?: return@mapNotNull null
-            TableColumn(
-                title = o.optString("title"),
-                weight = o.optDouble("weight", 0.0).toFloat(),
-                align = o.optString("align").toAlign(),
-            )
-        }
-    }
-
-    private fun PluginJsonArray?.toTableRows(): List<List<String>> {
-        if (this == null) return emptyList()
-        return (0 until minOf(length(), MAX_TABLE_ROWS)).mapNotNull { i ->
-            val row = optJSONArray(i) ?: return@mapNotNull null
-            (0 until row.length()).map { j -> row.optStringOrNull(j).orEmpty() }
-        }
-    }
-
-    private fun PluginJsonArray?.toKeyValues(): List<KeyValue> {
-        if (this == null) return emptyList()
-        return (0 until length()).mapNotNull { i ->
-            val o = optJSONObject(i) ?: return@mapNotNull null
-            KeyValue(
-                key = o.optString("key"),
-                value = o.optString("value"),
-                tone = o.optString("tone").toTone(),
-            )
-        }
-    }
-
-    private fun PluginJsonArray?.toSelectOptions(): List<SelectOption> {
-        if (this == null) return emptyList()
-        return (0 until length()).mapNotNull { i ->
-            val o = optJSONObject(i) ?: return@mapNotNull null
-            val value = o.optString("value").ifBlank { return@mapNotNull null }
-            SelectOption(value = value, label = o.optString("label"))
-        }
-    }
-
-    /** 解析图表的 kind；认不出返回 null，由调用方降级为 [UnsupportedNode] */
-    private fun toChartSpec(o: PluginJsonObject): ChartSpec? = when (o.optString("kind")) {
-        "line" -> LineChartSpec(
-            points = o.optJSONArray("points").toChartPoints(),
-            unit = o.optString("unit"),
-        )
-        "bar" -> BarChartSpec(
-            bars = o.optJSONArray("bars").toChartPoints(),
-            unit = o.optString("unit"),
-            highlightIndex = o.optInt("highlightIndex", -1),
-        )
-        "progressRing" -> ProgressRingSpec(
-            fraction = o.optDouble("fraction", 0.0).toFloat(),
-            centerText = o.optString("centerText"),
-            subtitle = o.optStringOrNull("subtitle"),
-        )
-        else -> null
-    }
-
-    private fun PluginJsonArray?.toChartPoints(): List<ChartPoint> {
-        if (this == null) return emptyList()
-        return (0 until length()).mapNotNull { i ->
-            val o = optJSONObject(i) ?: return@mapNotNull null
-            ChartPoint(label = o.optString("label"), value = o.optDouble("value", 0.0))
-        }
-    }
-
-    private fun String.toSpacing(): Spacing = when (lowercase()) {
-        "none" -> Spacing.NONE
-        "compact" -> Spacing.COMPACT
-        "loose" -> Spacing.LOOSE
-        else -> Spacing.NORMAL
-    }
-
-    private fun String.toEmphasis(): Emphasis = when (lowercase()) {
-        "heading" -> Emphasis.HEADING
-        "caption" -> Emphasis.CAPTION
-        else -> Emphasis.BODY
-    }
-
-    private fun String.toAlign(): Align = when (lowercase()) {
-        "center" -> Align.CENTER
-        "end" -> Align.END
-        else -> Align.START
     }
 
     // ---------- 会话事件 ----------
@@ -759,29 +393,24 @@ object JsTypeConverter {
     }
 
     // ---------- 工具 ----------
-
-    private fun jsonObjectOrNull(json: String): PluginJsonObject? =
-        runCatching { PluginJsonObject(json) }.getOrNull()
-
-    private fun jsonArrayOrNull(json: String): PluginJsonArray? =
-        runCatching { PluginJsonArray(json) }.getOrNull()
-
-    private fun PluginJsonObject.optStringOrNull(key: String): String? {
-        if (!has(key) || isNull(key)) return null
-        return optString(key).ifBlank { null }
-    }
-
-    private fun String.toTone(): Tone =
-        Tone.entries.firstOrNull { it.name.equals(this, ignoreCase = true) } ?: Tone.NEUTRAL
+    //
+    // jsonObjectOrNull / jsonArrayOrNull / optStringOrNull / toTone / utf8Size /
+    // truncateDisplay / optMachineString 都在 JsUiParseSupport.kt 里（同包
+    // internal），节点树解析与这里共用同一份实现，避免两边悄悄分叉。
 
     private fun String.toBucketOrNull(): MetricBucket? =
         MetricBucket.entries.firstOrNull { it.name.equals(this, ignoreCase = true) }
+
+    // ---------- 详情页 UI ----------
 
     /**
      * 解析一棵节点树时的预算。
      *
      * 单独一个可变对象而不是把计数散在递归参数里：递归返回后父层还要知道
      * 「总共用了多少」，用返回值传来传去会让每个分支都得拼一次。
+     *
+     * 定义留在本对象里、实现搬到 [JsUiNodeParser]：调用方用的仍是
+     * `JsTypeConverter.UiTreeParseResult` 这个既有名字，不必关心拆分。
      */
     class UiParseBudget {
         var nodeCount: Int = 0
@@ -803,6 +432,14 @@ object JsTypeConverter {
         val truncated: Boolean get() = budget.nodeCount >= MAX_NODES
     }
 
+    /**
+     * 解析 `detailUi` 返回值，得到一棵可组合节点树。
+     *
+     * 实现在 [JsUiNodeParser]（节点树解析本身五百多行，与其余转换混在一起会远超
+     * 单文件上限）。这里只留一个转调入口，调用方不需要知道它在哪个文件。
+     */
+    fun toUiTree(json: String): UiTreeParseResult = JsUiNodeParser.parse(json)
+
     // ---------- 解析上限 ----------
     //
     // 这些数字不是拍脑袋：传入的 JSON 来自沙箱里的插件，不能假设它有多克制。
@@ -815,10 +452,43 @@ object JsTypeConverter {
     //   把测量阶段卡死。
     // - MAX_LIST_ITEMS / MAX_TABLE_ROWS 200：长列表应由宿主虚拟化，
     //   而不是让插件一次传几万项。
+    //
+    // 这些常量对 [JsUiNodeParser] 可见（internal），因为上限必须是「一处定义、
+    // 两边同一份」：拆文件时若各写一份，迟早会不一致。
 
-    private const val MAX_DEPTH = 12
-    private const val MAX_NODES = 600
-    private const val MAX_CHILDREN_PER_CONTAINER = 100
-    private const val MAX_LIST_ITEMS = 200
-    private const val MAX_TABLE_ROWS = 200
+    internal const val MAX_DEPTH = 12
+    internal const val MAX_NODES = 600
+    internal const val MAX_CHILDREN_PER_CONTAINER = 100
+    internal const val MAX_LIST_ITEMS = 200
+    internal const val MAX_TABLE_ROWS = 200
+
+    /**
+     * 对话节点一次最多接受的消息条数。
+     *
+     * 与 [MAX_LIST_ITEMS] 分开：对话是本轮的核心场景，200 条对「真实聊天记录」
+     * 太紧（一个会话很容易超过），但也不能无限——渲染层是 LazyColumn，
+     * 1000 条已足够覆盖日常会话，再多应由插件分页而不是一次塞进来。
+     */
+    internal const val MAX_CHAT_MESSAGES = 1000
+
+    /** 字符串数组类字段（selectedValues / selectedIds / itemPayloads）的长度上限 */
+    internal const val MAX_STRING_LIST_SIZE = 500
+
+    // ---------- 单字段限额 ----------
+    //
+    // 机器字段（id / actionId / binding / submitTo）**绝不截断**：截断后的 id
+    // 会指向一个不存在的目标，比丢弃更难排查。超限就丢弃该节点或该交互。
+    // 展示文本则相反：截断只是少显示几个字，语义不坏，配一条告警即可。
+
+    /** 机器字段上限：4 KiB 足够容纳任何正常 id/binding */
+    internal const val MAX_MACHINE_FIELD_BYTES = 4 * 1024
+
+    /** 展示文本上限：64 KiB（一屏文字远小于这个量级） */
+    internal const val MAX_DISPLAY_TEXT_BYTES = 64 * 1024
+
+    /** 代码正文上限：256 KiB */
+    internal const val MAX_CODE_TEXT_BYTES = 256 * 1024
+
+    /** 交互载荷上限：64 KiB；超限丢弃该交互，避免把超长文本当命令发出 */
+    internal const val MAX_INTERACTION_PAYLOAD_BYTES = 64 * 1024
 }

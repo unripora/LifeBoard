@@ -2,6 +2,7 @@ package com.lifeboard.shared.platform
 
 import com.lifeboard.plugin.api.ActionResult
 import com.lifeboard.plugin.api.AuthState
+import com.lifeboard.plugin.api.LoginOptions
 import com.lifeboard.plugin.api.LoginResult
 import com.lifeboard.plugin.api.MetricSeries
 import com.lifeboard.plugin.api.PluginHealth
@@ -48,8 +49,13 @@ interface PluginInvoker {
      * 用用户填的输入尝试登录。
      *
      * @param inputs 键为插件 [com.lifeboard.plugin.api.CredentialSpec] 里声明的字段名
+     * @param options 可选的登录意图（打开/提交/重启/放弃）；缺省沿用旧空表单语义
      */
-    suspend fun login(pluginId: String, inputs: Map<String, String>): LoginResult
+    suspend fun login(
+        pluginId: String,
+        inputs: Map<String, String>,
+        options: LoginOptions? = null,
+    ): LoginResult
 
     /** 登出并清空凭据 */
     suspend fun logout(pluginId: String)
@@ -113,6 +119,18 @@ interface PluginInvoker {
 
     /** 会话的纯文本增量；不支持时返回空流 */
     fun sessionDeltas(pluginId: String): Flow<String> = emptyFlow()
+
+    /**
+     * 会话存续期间的保活句柄。
+     *
+     * 会话要跨越多次调用（输入、消息、切换 key）。若只有「每次调用现申请」
+     * 的短租约，两次输入之间实例是空闲的，按需加载的空闲回收会把监听和订阅
+     * 一起关掉。这里让调用方显式申请、会话结束时显式释放。
+     *
+     * 默认 `null`：非 JS 插件与未开启按需加载的宿主没有「空闲回收」这回事，
+     * 会话本来就常驻，不需要保活。
+     */
+    fun sessionKeepAlive(pluginId: String): SessionKeepAlive? = null
 
     /** 插件自报的健康状态 */
     suspend fun health(pluginId: String): PluginHealth

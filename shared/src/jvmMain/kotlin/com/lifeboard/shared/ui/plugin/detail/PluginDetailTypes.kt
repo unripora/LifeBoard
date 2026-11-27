@@ -50,4 +50,11 @@ data class PluginDetailUiState(
     val message: String? = null,
     /** 危险操作完成后置位，UI 据此关闭详情页回到列表 */
     val closed: Boolean = false,
+    /**
+     * 当前选中的会话 key（`session:<key>:*` 里的 key）。
+     *
+     * 空串表示「还没接上任何会话」或「这个插件没有会话」。插件若用
+     * `picker` 表达了选中态，以插件推上来的值为准；否则取树里出现的第一条。
+     */
+    val currentSessionKey: String = "",
 )

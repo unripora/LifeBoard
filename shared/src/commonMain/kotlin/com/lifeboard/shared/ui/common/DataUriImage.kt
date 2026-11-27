@@ -1,6 +1,7 @@
 package com.lifeboard.shared.ui.common
 
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
@@ -33,6 +34,8 @@ import kotlinx.coroutines.withContext
  *
  * @param contentDescription 无障碍描述；这是插件内容，调用方应给出有意义的文案
  * @param errorText 解码失败时的提示，不同场景说法不同（验证码与图表不该共用一句话）
+ * @param aspectRatio 宽高比，`> 0` 时按它约束高度（宽度铺满 × 高度 = 宽度 / 比例），
+ *   让版面在解码完成前就占好位，避免图片出来时整页往下跳；`<= 0` 时跟随图片自身尺寸
  */
 @Composable
 fun DataUriImage(
@@ -40,6 +43,7 @@ fun DataUriImage(
     contentDescription: String,
     modifier: Modifier = Modifier,
     errorText: String = "图片加载失败",
+    aspectRatio: Float = 0f,
 ) {
     // null 表示还在解码，false 表示解码失败，true 表示解码成功。
     // 只在解码失败时才提示：还在解码时提示会在每次重组时闪一下
@@ -64,8 +68,13 @@ fun DataUriImage(
         Image(
             bitmap = image,
             contentDescription = contentDescription,
-            modifier = modifier.fillMaxWidth().padding(top = 8.dp),
-            contentScale = ContentScale.FillWidth,
+            modifier = modifier
+                .fillMaxWidth()
+                .padding(top = 8.dp)
+                // 比例有效时用 aspectRatio 约束，而不是 Crop：裁剪会把插件给的
+                // 图切掉一部分（图表被切边就是错的数据展示），Fit 则保留全图
+                .let { if (aspectRatio > 0f) it.aspectRatio(aspectRatio) else it },
+            contentScale = if (aspectRatio > 0f) ContentScale.Fit else ContentScale.FillWidth,
         )
     } else if (decoded == false) {
         Text(

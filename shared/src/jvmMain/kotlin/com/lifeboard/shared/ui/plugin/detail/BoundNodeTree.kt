@@ -4,6 +4,8 @@ import com.lifeboard.plugin.api.BindingRef
 import com.lifeboard.plugin.api.Bound
 import com.lifeboard.plugin.api.ButtonNode
 import com.lifeboard.plugin.api.ChartNode
+import com.lifeboard.plugin.api.ChatMessage
+import com.lifeboard.plugin.api.ChatNode
 import com.lifeboard.plugin.api.CodeNode
 import com.lifeboard.plugin.api.CollapsibleNode
 import com.lifeboard.plugin.api.ColumnNode
@@ -12,6 +14,8 @@ import com.lifeboard.plugin.api.ImageNode
 import com.lifeboard.plugin.api.InputNode
 import com.lifeboard.plugin.api.KeyValueNode
 import com.lifeboard.plugin.api.ListNode
+import com.lifeboard.plugin.api.PickerCandidate
+import com.lifeboard.plugin.api.PickerNode
 import com.lifeboard.plugin.api.PluginNode
 import com.lifeboard.plugin.api.ProgressNode
 import com.lifeboard.plugin.api.RowNode
@@ -65,6 +69,8 @@ private fun resolveNode(node: PluginNode, resolve: (BindingRef) -> BoundValue): 
             else -> node.copy(value = Bound.Static(value))
         }
         is ListNode -> node.copy(items = node.items.resolveItems(resolve))
+        is ChatNode -> node.copy(messages = node.messages.resolveMessages(resolve))
+        is PickerNode -> node.copy(candidates = node.candidates.resolveCandidates(resolve))
         is InputNode -> node.copy(
             // 布尔绑定不可用时退回「可用」：禁用输入框会让用户以为连接断了
             enabled = Bound.Static(node.enabled.resolveFlag(resolve) ?: true),
@@ -132,7 +138,7 @@ private fun Bound<List<List<PluginNode>>>.resolveItems(
     resolve: (BindingRef) -> BoundValue,
 ): Bound.Static<List<List<PluginNode>>> =
     when (this) {
-        is Bound.Static -> Bound.Static(value)
+        is Bound.Static -> Bound.Static(value.map { resolveChildren(it, resolve) })
         is Bound.Ref -> when (val v = BindingRef.parse(ref)?.let(resolve)) {
             is BoundValue.Messages -> Bound.Static(
                 v.value.map { message ->
@@ -157,3 +163,40 @@ private fun com.lifeboard.plugin.api.ChatRole.toTone(): com.lifeboard.plugin.api
         com.lifeboard.plugin.api.ChatRole.USER -> com.lifeboard.plugin.api.Tone.OK
         com.lifeboard.plugin.api.ChatRole.ASSISTANT -> com.lifeboard.plugin.api.Tone.NEUTRAL
     }
+
+/**
+ * 对话消息绑定求值。
+ *
+ * 与 [resolveItems] 的关键区别：**消息原样保留为 [ChatMessage]**，不再被
+ * 降级成一堆 `TextNode`。角色、轮次、流式标记、时间全部交给 [ChatNode] 的
+ * 渲染层统一处理——这正是「一堆一样的文字框」的根治手段。
+ *
+ * 绑到非消息源时返回空列表而不是整块消失：对话区仍在，显示「暂无对话」，
+ * 用户能判断「这里本该有对话」，而不是怀疑页面坏了。
+ */
+private fun Bound<List<ChatMessage>>.resolveMessages(
+    resolve: (BindingRef) -> BoundValue,
+): Bound.Static<List<ChatMessage>> = when (this) {
+    is Bound.Static -> Bound.Static(value)
+    is Bound.Ref -> when (val v = BindingRef.parse(ref)?.let(resolve)) {
+        is BoundValue.Messages -> Bound.Static(v.value)
+        else -> Bound.Static(emptyList())
+    }
+}
+
+/**
+ * 候选清单绑定求值。
+ *
+ * 绑定点指向的源必须提供 `BoundValue.Candidates`。指向别的字段（例如把
+ * `session:main:status` 绑到候选清单上）时退回空清单 + 「暂无可选项」，
+ * 与 [resolveItems] 的容错一致：类型不符绝不强转。
+ */
+private fun Bound<List<PickerCandidate>>.resolveCandidates(
+    resolve: (BindingRef) -> BoundValue,
+): Bound.Static<List<PickerCandidate>> = when (this) {
+    is Bound.Static -> Bound.Static(value)
+    is Bound.Ref -> when (val v = BindingRef.parse(ref)?.let(resolve)) {
+        is BoundValue.Candidates -> Bound.Static(v.value)
+        else -> Bound.Static(emptyList())
+    }
+}

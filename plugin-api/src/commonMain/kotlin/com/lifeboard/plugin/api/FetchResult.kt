@@ -28,6 +28,13 @@ package com.lifeboard.plugin.api
  *
  * 插件**仍然不应该抛异常**：异常会被宿主当成 [Failure] 兜住，
  * 但那条路径拿不到结构化原因。要说明情况就返回这里的分支。
+ *
+ * ## 结构化错误（可选）
+ *
+ * 失败分支新增可选的 [PluginError]，用于携带 [PluginErrorCode] 分类与
+ * 「默认处置 + 可重试」信息。**旧插件不填就保持原语义**：
+ * `authRequired` → `AUTH_REQUIRED`，`temporary` → `UPSTREAM_ERROR`，
+ * `failure` → `INTERNAL_ERROR`。
  */
 sealed class FetchResult {
 
@@ -53,6 +60,8 @@ sealed class FetchResult {
     data class TemporaryFailure(
         val message: String,
         val retryAfterSeconds: Long? = null,
+        /** 结构化错误；缺省按 [PluginErrorCode.UPSTREAM_ERROR] 处理 */
+        val error: PluginError? = null,
     ) : FetchResult()
 
     /**
@@ -61,12 +70,20 @@ sealed class FetchResult {
      * 单独一档而不是塞进 [Failure]：这是**唯一**一种用户自己动手就能修好的失败。
      * 混进普通失败里，用户只会看到一句「采集失败」，不知道该点什么。
      */
-    data class AuthenticationRequired(val message: String) : FetchResult()
+    data class AuthenticationRequired(
+        val message: String,
+        /** 结构化错误；缺省按 [PluginErrorCode.AUTH_REQUIRED] 处理 */
+        val error: PluginError? = null,
+    ) : FetchResult()
 
     /**
      * 明确失败：接口改了、脚本报错、数据格式不符。
      *
      * 重试没有意义——同样的输入会得到同样的错误，只会白耗流量与电量。
      */
-    data class Failure(val message: String) : FetchResult()
+    data class Failure(
+        val message: String,
+        /** 结构化错误；缺省按 [PluginErrorCode.INTERNAL_ERROR] 处理 */
+        val error: PluginError? = null,
+    ) : FetchResult()
 }

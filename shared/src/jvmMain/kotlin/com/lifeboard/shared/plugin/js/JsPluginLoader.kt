@@ -1,6 +1,7 @@
 package com.lifeboard.shared.plugin.js
 
 import com.lifeboard.plugin.api.PluginContext
+import com.lifeboard.plugin.api.SourcePlugin
 import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.shared.plugin.PluginIdentity
 import com.lifeboard.shared.plugin.PluginPackageInfo
@@ -44,6 +45,21 @@ import java.util.concurrent.atomic.AtomicLong
 class JsPluginLoader(
     private val fileSystem: PluginFileSystem,
     private val trustStore: PluginTrustStore,
+    /**
+     * 是否启用「扫描只登记元数据、首次业务调用才创建运行时」。
+     *
+     * 默认 **关闭**：关闭时行为与改造前完全一致（扫描即实例化）。这是
+     * 刻意保守的默认——延迟实例化会改变所有调用方对「拿到实例」时序的假设，
+     * 必须在专项测试通过后由各端显式开启。
+     */
+    @Volatile var lazyInstantiation: Boolean = false,
+    /**
+     * 可注入的时钟，仅用于测试空闲判定。
+     *
+     * 生产走 [System.currentTimeMillis]；若不给测试注入能力，验证"到点回收"
+     * 就只能真的等 60 秒——那种测试没人会跑，等于没测。
+     */
+    private val nowMs: () -> Long = { System.currentTimeMillis() },
 ) {
 
     /**
@@ -69,19 +85,644 @@ class JsPluginLoader(
     @Volatile
     private var broken: List<BrokenJsPlugin> = emptyList()
 
+    /**
+     * 延迟实例化时保存的「启动配方」：包已校验通过，但运行时还没建。
+     *
+     * 键是插件 id。首次业务调用时用它在专用线程上创建运行时并执行入口脚本。
+     * 非延迟模式下这个表始终为空。
+     */
+    @Volatile
+    private var pendingLaunches: Map<String, PendingLaunch> = emptyMap()
+
+    /**
+     * 延迟插件对外的委托外壳。
+     *
+     * 列表与调用方拿到的是这些对象，它们在首次业务调用时才真正创建运行时。
+     * 已启动的插件会从这张表移除并进入 [entries]（或管理器）。
+     */
+    @Volatile
+    private var deferredEntries: Map<String, JsLoadedPlugin> = emptyMap()
+
+    /**
+     * 本轮扫描开始时的外壳快照。
+     *
+     * `scan()` 会重建外壳表，但扫描期间仍可能有调用方（详情页刷新、会话端点）
+     * 进来取外壳。没有这份快照，它们拿到的对象会在扫描收尾时被替换，
+     * 手里那个变成孤儿：监听注册在旧对象上，而列表/后续调用走新对象。
+     */
+    @Volatile
+    private var pendingShellCache: Map<String, JsLoadedPlugin> = emptyMap()
+
+    /** 本轮扫描结束时，把权威外壳固定下来，后续 `find()`/`loadPlugins()` 都以它为准 */
+    private fun commitShellCache() {
+        pendingShellCache = deferredEntries
+    }
+
+    /**
+     * 启动配方（manifest + 模块源码 + 内容哈希），**按已安装插件长期保留**。
+     *
+     * 与 [pendingLaunches] 的区别：那个只表示"尚未启动"，启动后即移除；
+     * 而运行时被空闲回收后需要配方来重建，所以配方必须留到插件被卸载/更新为止。
+     */
+    @Volatile
+    private var launchRecipes: Map<String, PendingLaunch> = emptyMap()
+
+    /**
+     * 委托外壳登记的会话监听器，等真实实例出现时补挂。
+     *
+     * 外壳本身不是插件实例，不能把监听挂到自己身上；而卸载钩子期间不允许
+     * 读写上下文，所以这里只保存在加载器里，由 `withStarted` 在拉起后统一转交。
+     */
+    private val pendingSessionListeners =
+        java.util.concurrent.ConcurrentHashMap<String, (com.lifeboard.plugin.api.SessionUiEvent) -> Unit>()
+
+    /** 外壳登记监听（未启动时）；传 null 表示解绑 */
+    fun rememberSessionListener(
+        pluginId: String,
+        listener: ((com.lifeboard.plugin.api.SessionUiEvent) -> Unit)?,
+    ) {
+        if (listener == null) pendingSessionListeners.remove(pluginId)
+        else pendingSessionListeners[pluginId] = listener
+    }
+
+    /** 当前登记的监听器（供外壳在实例重建后补挂） */
+    fun sessionListenerOf(pluginId: String): ((com.lifeboard.plugin.api.SessionUiEvent) -> Unit)? =
+        pendingSessionListeners[pluginId]
+
+    /**
+     * 一次启动配方（内容在扫描期就已校验通过）。
+     *
+     * **刻意不持有模块源码**：配方要按「已安装」长期保留，若把源码一起存着，
+     * 50 个插件会常驻数 MB —— 与「按需加载省内存」的目标自相矛盾。
+     * 重建时按 [archiveName] 重新读一次包（几十毫秒，且只在回收后重新打开时发生）。
+     */
+    private class PendingLaunch(
+        val archiveName: String,
+        val manifest: JsPluginManifest,
+        val contentHash: String,
+    )
+
     @Volatile
     private var pending: List<PendingJsPlugin> = emptyList()
 
-    /** 已成功加载的插件。 */
-    fun loadedPlugins(): List<JsLoadedPlugin> = entries.map { it.plugin }
+    /**
+     * 已安装的全部插件，含「已启动」与「待启动」。
+     *
+     * 待启动项是 [DeferredSourcePlugin]，首次业务调用时才创建运行时。
+     */
+    fun loadedPlugins(): List<JsLoadedPlugin> {
+        val real = entries.map { it.plugin } + lazyRuntimeManager.snapshot().map { it.plugin }
+        val realIds = real.mapTo(mutableSetOf()) { it.plugin.id }
+        // 已安装但当前没有运行时的（从未启动 / 被回收）：回退成委托外壳，
+        // 否则用户会看到"装好的插件突然没了"
+        val shells = launchRecipes.values
+            .filter { it.manifest.id !in realIds }
+            .map { shellFor(it) }
+        return real + shells
+    }
 
     fun brokenPlugins(): List<BrokenJsPlugin> = broken
 
     /** 包已落盘、但还没得到用户信任（或因内容哈希缺失无法建立信任）的插件 */
     fun pendingPlugins(): List<PendingJsPlugin> = pending
 
+    /**
+     * 按 id 取对外句柄。
+     *
+     * **优先返回委托外壳**：外壳每次调用现申请租约，而 [Entry] 里的真实实例
+     * 是没有租约保护的裸引用。若这里把真实实例交出去，调用方（列表、详情页、
+     * 会话端点）就会绕过租约，空闲回收可以在会话进行中把运行时关掉。
+     * 只有内部路径（[realEntry]）才拿真实实例。
+     */
     fun find(pluginId: String): JsLoadedPlugin? =
-        entries.firstOrNull { it.plugin.plugin.id == pluginId }?.plugin
+        deferredEntries[pluginId]
+            ?: launchRecipes[pluginId]?.let { shellFor(it) }
+            ?: entries.firstOrNull { it.plugin.plugin.id == pluginId }?.plugin
+            ?: lazyRuntimeManager.snapshot().firstOrNull { it.plugin.plugin.id == pluginId }?.plugin
+
+    /** 取得（必要时创建）某配方的委托外壳，供列表与查找回退使用 */
+    private fun shellFor(recipe: PendingLaunch): JsLoadedPlugin = stableShell(recipe)
+
+    /**
+     * 复用一个**已存在**的外壳，或按配方新建。
+     *
+     * 外壳是对外的稳定身份：详情页、会话控制器都长期持有它。
+     * 重扫时必须按 id 复用同一个对象，否则「手里的那个」会指向一个
+     * 再也不会被加载流程更新的旧外壳——会话监听、租约都挂在它身上。
+     */
+    private fun stableShell(recipe: PendingLaunch): JsLoadedPlugin {
+        val id = recipe.manifest.id
+        // 权威来源是**扫描开始时固定的那份表**，其次才是当前表。
+        // 扫描过程中会重建 deferredEntries（含「清掉失去信任的」），
+        // 若只看当前表，期间新建的外壳会在收尾时被丢弃，调用方手里那个就成孤儿。
+        val cached = pendingShellCache[id] ?: deferredEntries[id]
+        if (cached != null) {
+            // 始终把权威对象写回当前表，保证 find()/loadPlugins() 与调用方拿到同一个
+            if (deferredEntries[id] !== cached) deferredEntries = deferredEntries + (id to cached)
+            return cached
+        }
+        val shell = JsLoadedPlugin(
+            packageInfo = recipe.manifest.toPackageInfo(recipe.contentHash),
+            archiveName = recipe.archiveName,
+            plugin = DeferredSourcePlugin(
+                id = id,
+                displayName = recipe.manifest.name,
+                credentialSpec = recipe.manifest.credentialSpec,
+                metrics = recipe.manifest.metrics,
+                loader = this,
+            ),
+        )
+        deferredEntries = deferredEntries + (id to shell)
+        pendingShellCache = pendingShellCache + (id to shell)
+        return shell
+    }
+
+    /**
+     * 延迟实例化模式下「已安装、未启动」的插件元数据。
+     *
+     * 这些包已通过信任与内容校验，只差执行入口脚本。界面可以据此列出插件，
+     * 而**不需要**唤醒运行时——这正是按需加载要守住的那条线。
+     */
+    fun deferredPlugins(): List<DeferredPlugin> =
+        launchRecipes.values.filter { realEntry(it.manifest.id) == null }.map {
+            DeferredPlugin(
+                pluginId = it.manifest.id,
+                displayName = it.manifest.name,
+                archiveName = it.archiveName,
+                packageInfo = it.manifest.toPackageInfo(it.contentHash),
+            )
+        }
+
+    /**
+     * 一个已安装但尚未启动的插件。
+     *
+     * 只包含列表展示所需的静态元数据；业务能力（登录、采集、会话）
+     * 必须先通过 [ensureStarted] 获得实例。
+     */
+    data class DeferredPlugin(
+        val pluginId: String,
+        val displayName: String,
+        val archiveName: String,
+        val packageInfo: PluginPackageInfo,
+    )
+
+    /**
+     * 延迟实例化模式：插件是否已安装但运行时尚未创建。
+     *
+     * 界面据此知道「有这个插件，但还没跑起来」，而不必（也不应）触发加载。
+     */
+    fun hasPendingLaunch(pluginId: String): Boolean =
+        launchRecipes.containsKey(pluginId) && realEntry(pluginId) == null
+
+    /**
+     * 按需创建运行时。已实例化时直接返回现有条目。
+     *
+     * 只在 [lazyInstantiation] 打开时有实际作用；关闭时等价于 [find]。
+     * 创建过程可能较慢（解包内容已在扫描期读入，这里主要是 QuickJS 初始化 +
+     * 执行入口脚本），调用方应在 IO 线程上调用。
+     *
+     * @return 成功返回可用的条目；创建失败返回 `null` 并把原因记进日志
+     */
+    fun ensureStarted(pluginId: String): JsLoadedPlugin? {
+        // 只能查真实条目：find() 会返回委托外壳，而外壳的 startProvider 正是
+        // 调用本方法，用它做判断会变成「外壳启动外壳」的自递归
+        realEntry(pluginId)?.let { return it.plugin }
+        if (!lazyInstantiation) return null
+        if (launchRecipes[pluginId] == null) return null
+
+        synchronized(instantiateLock) {
+            realEntry(pluginId)?.let { return it.plugin }
+            // 通过管理器创建：后续调用才能拿到租约、才可能被按需回收
+            return when (val result =
+                lazyRuntimeManager.acquire(
+                        pluginId,
+                        resolvePolicy(pluginId, policyFor(pluginId)),
+                        revocable = revocableFor(pluginId),
+                    )) {
+                is PluginRuntimeManager.AcquireResult.Ready -> {
+                    val entry = result.lease.withRuntime { it as Entry }
+                    // ensureStarted 只负责「让它起来」，租约在这里立即归还；
+                    // 真正的调用期保活由 withStarted 负责
+                    result.lease.release()
+                    // 启动成功**不删外壳**：它是对外的稳定身份，回收/重建后仍要复用。
+                    // 只清「待启动」标记，配方与外壳都保留。
+                    pendingLaunches = pendingLaunches - pluginId
+                    if (entry != null) {
+                        AppLogger.info("JS 插件 $pluginId 已按需启动")
+                        entry.plugin
+                    } else null
+                }
+                is PluginRuntimeManager.AcquireResult.Unavailable -> {
+                    AppLogger.error("JS 插件 $pluginId 按需启动失败：${result.reason}")
+                    null
+                }
+            }
+        }
+    }
+
+    /** 只查已真实启动的条目，不含委托外壳 */
+    private fun realEntry(pluginId: String): Entry? =
+        entries.firstOrNull { it.plugin.plugin.id == pluginId }
+            ?: lazyRuntimeManager.snapshot().firstOrNull { it.plugin.plugin.id == pluginId }
+
+    /**
+     * 只取**真实**插件实例，绝不回退到委托外壳。
+     *
+     * 委托外壳的 `setSessionUiListener` 需要「挂到真实实例上」，
+     * 若这里像 [find] 那样回退成外壳，就会变成「外壳挂外壳」的无限递归。
+     */
+    fun realPlugin(pluginId: String): SourcePlugin? = realEntry(pluginId)?.plugin?.plugin
+
+    /**
+     * 撤销一条启动配方，并清掉对应的外壳与策略。
+     *
+     * 用在「重读发现包变了/失去信任」这类不该继续启动的场景：
+     * 保留配方就等于保留一条绕过信任确认的启动路径。
+     */
+    private fun invalidateRecipe(pluginId: String, archiveName: String, reason: String) {
+        synchronized(instantiateLock) {
+            launchRecipes = launchRecipes - pluginId
+            pendingLaunches = pendingLaunches - pluginId
+            deferredEntries = deferredEntries - pluginId
+            pendingShellCache = pendingShellCache - pluginId
+            pendingSessionListeners.remove(pluginId)
+        }
+        // 包装成坏包提示：用户需要知道「为什么用不了」，而不是静默消失
+        synchronized(instantiateLock) {
+            broken = broken.filterNot { it.archiveName == archiveName } +
+                BrokenJsPlugin(archiveName, reason)
+        }
+        AppLogger.warn("JS 插件 $pluginId 的启动配方已撤销：$reason")
+    }
+
+    /** 保护「检查后创建」的原子性，避免并发申请重复执行入口脚本 */
+    private val instantiateLock = Any()
+
+    /**
+     * 延迟实例化模式的运行时管理器。
+     *
+     * 只在 [lazyInstantiation] 打开时承载已启动的实例：它负责租约、代际与
+     * 空闲回收。**自动回收总开关默认关闭**——先让租约接线跑通，再单独开启。
+     *
+     * eager 模式不使用它，保持与改造前完全一致的行为，降低回归风险。
+     */
+    private val lazyRuntimeManager: PluginRuntimeManager<Entry> = PluginRuntimeManager(
+        create = { key ->
+            // 配方**必须长期保留**：运行时被空闲回收后要能重建。
+            // 早先启动成功就删配方，导致"回收后再调用直接失败"——真实环境验证抓到的 bug
+            val launch = launchRecipes[key]
+                ?: error("插件 $key 没有可用的启动配方")
+            // 重读包：配方只存元数据，源码不常驻内存。
+            // 但磁盘上的包随时可能被替换：必须重算内容哈希并复核信任，
+            // 否则「装好之后再改包」就能绕开信任确认直接执行。
+            val files = runCatching { fileSystem.readArchive(launch.archiveName) }
+                .getOrElse { error("无法读取插件包 ${launch.archiveName}：${it.message}") }
+            val actualHash = JsPluginManifest.computeContentHash(files)
+            if (actualHash != launch.contentHash) {
+                invalidateRecipe(key, launch.archiveName, "包内容在启动前发生了变化，请重新确认信任")
+                error("插件包内容已变化，请重新确认信任")
+            }
+            // manifest 不参与内容哈希（只改描述不该要求重新信任），
+            // 但入口、指标、凭据槽这些运行元数据都来自它：
+            // 启动前必须逐字段比对，否则「换一个 manifest 保留 main.js」就能改掉运行行为。
+            val manifestBytes = files[JsPluginManifest.MANIFEST_NAME]
+                ?: run {
+                    invalidateRecipe(key, launch.archiveName, "插件包缺少 manifest.json")
+                    error("插件包缺少 manifest.json")
+                }
+            val actualManifest = when (
+                val parsed = JsPluginManifest.parseDetailed(manifestBytes.toString(Charsets.UTF_8))
+            ) {
+                is ParseResult.Success -> parsed.manifest
+                is ParseResult.Failure -> {
+                    invalidateRecipe(key, launch.archiveName, "manifest 解析失败：${parsed.reason}")
+                    error("manifest 解析失败：${parsed.reason}")
+                }
+            }
+            if (actualManifest != launch.manifest) {
+                invalidateRecipe(key, launch.archiveName, "manifest 在启动前发生了变化，请重新确认信任")
+                error("插件 manifest 已变化，请重新确认信任")
+            }
+            val verdict = PluginTrust.evaluate(
+                launch.manifest.toPackageInfo(actualHash),
+                trustStore.load(),
+            )
+            if (verdict !is TrustVerdict.Trusted) {
+                invalidateRecipe(key, launch.archiveName, "插件已不再受信任")
+                error("插件已不再受信任")
+            }
+            when (val result = instantiate(
+                archiveName = launch.archiveName,
+                manifest = launch.manifest,
+                files = files,
+                contentHash = launch.contentHash,
+            )) {
+                is LoadResult.Success -> result.entry
+                is LoadResult.Failure -> error(result.broken.reason)
+                else -> error("插件 $key 启动状态异常")
+            }
+        },
+        close = { closeEntry(it) },
+        autoEvictEnabled = false,
+        nowMs = nowMs,
+    ).apply {
+        // 空闲回收允许尽力清理；强制停机（撤权/清除）不执行插件代码
+        idleClose = { closeEntry(it, StopReason.IDLE) }
+    }
+
+    /**
+     * 是否允许被自动回收。
+     *
+     * **只有显式声明了 `lifecycle` 的包才允许**：旧包没声明，说明它可能
+     * 依赖"宿主不会卸载我"这个假设，自动回收会让它凭空丢状态。
+     * 这是设计里"旧包兼容保活"的落点。
+     */
+    private fun revocableFor(pluginId: String): Boolean =
+        launchRecipes[pluginId]?.manifest?.lifecycleDeclared == true
+
+    /** 某插件生效的策略；延迟模式目前都按 manifest 声明，不做常驻名额调整 */
+    private fun policyFor(pluginId: String): PluginRuntimePolicy =
+        policies[pluginId] ?: PluginRuntimePolicy.of(PluginLifecycle.DEFAULT)
+
+    /** 插件 id → 生效策略；扫描时登记，启动后仍要保留（配方会被清掉） */
+    @Volatile
+    private var policies: Map<String, PluginRuntimePolicy> = emptyMap()
+
+    /** 当前占用常驻名额的插件 id（声明 resident 且已获准的） */
+    private val residentGrants = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * 因连续同步预算超限被停用的插件。
+     *
+     * **跨重扫保留**：一个写死循环的插件不应该因为用户切了一次页签就复活，
+     * 必须由用户显式重新启用或安装新版本才重试。
+     */
+    private val disabledPlugins = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** 连续同步预算超限达到此次数即停用 */
+    private val syncFaultLimit = 3
+
+    /** 常驻名额上限；超出时按 LRU 降级空闲者，无候选则拒绝新增 */
+    @Volatile
+    private var residentCapacity: Int = 2
+
+    private val residentLock = Any()
+
+    /**
+     * 计算某插件的生效策略（含常驻准入）。
+     *
+     * 规则：
+     * - 非 resident 声明：直接按声明执行
+     * - resident 且已获准：保持常驻
+     * - resident 且未获准、名额未满：授予
+     * - resident 且名额已满：降级**空闲**的常驻者；全都忙则本次按需运行并给出原因
+     *
+     * **绝不为了腾名额去关一个正在使用的实例**——那正是"LRU 断开活跃会话"的风险。
+     */
+    private fun resolvePolicy(pluginId: String, declared: PluginRuntimePolicy): PluginRuntimePolicy {
+        if (declared.declared != PluginLifecycle.RESIDENT) {
+            residentGrants.remove(pluginId)
+            return declared
+        }
+        synchronized(residentLock) {
+            if (pluginId in residentGrants) {
+                return declared.copy(effective = PluginLifecycle.RESIDENT)
+            }
+            if (residentGrants.size < residentCapacity) {
+                residentGrants += pluginId
+                return declared.copy(effective = PluginLifecycle.RESIDENT)
+            }
+            // 名额已满：优先降级最久未用且空闲的常驻实例
+            val victim = lazyRuntimeManager.residentIdleLru()
+                ?.takeIf { it != pluginId && it in residentGrants }
+
+            if (victim != null) {
+                residentGrants -= victim
+                val degraded = PluginRuntimePolicy.of(
+                    declared = PluginLifecycle.RESIDENT,
+                    effective = PluginLifecycle.ON_DEMAND,
+                    degradeReason = "常驻名额已满，该插件已改为按需加载",
+                )
+                lazyRuntimeManager.updatePolicy(victim, degraded)
+                policies = policies + (victim to degraded)
+                residentGrants += pluginId
+                AppLogger.info("常驻名额已满：$victim 降级为按需，$pluginId 获准常驻")
+                return declared.copy(effective = PluginLifecycle.RESIDENT)
+            }
+
+            // 所有常驻者都在使用：不抢占，本次按需运行并说明原因
+            val reason = "常驻名额已满（$residentCapacity 个均在使用中），本插件暂时按需加载"
+            AppLogger.warn("$pluginId 未获常驻名额：$reason")
+            return declared.copy(effective = PluginLifecycle.ON_DEMAND, degradeReason = reason)
+        }
+    }
+
+    /** 设置常驻名额上限（默认 2）；调小不会立刻关闭实例，只影响后续准入 */
+    fun setResidentCapacity(capacity: Int) {
+        residentCapacity = capacity.coerceAtLeast(0)
+    }
+
+    /**
+     * 启用/停用空闲回收。
+     *
+     * 默认**关闭**：回收会真正关闭运行时，必须在专项测试与真机验证通过后
+     * 由宿主显式开启。启用后会启动周期清扫。
+     */
+    fun setEvictionEnabled(enabled: Boolean) {
+        lazyRuntimeManager.autoEvictEnabled = enabled
+        if (enabled) lazyRuntimeManager.startSweeper() else lazyRuntimeManager.stopSweeper()
+        AppLogger.info("插件空闲回收已${if (enabled) "启用" else "停用"}")
+    }
+
+    /** 立即执行一次清扫；返回实际回收的实例数，供测试与手动诊断 */
+    fun evictIdleNow(): Int = lazyRuntimeManager.evictIdle()
+
+    /**
+     * 当前**真实存活**的运行时数量。
+     *
+     * 必须同时统计两条路径：eager 模式实例化在 [entries]，延迟模式实例化在
+     * 管理器里。只数其中一边会得出"0 个运行时"的假象——这正是本项目的
+     * 资源基线要避免的错误度量。
+     */
+    fun liveRuntimeCount(): Int = entries.size + lazyRuntimeManager.liveCount()
+
+    /**
+     * 在租约保护下执行一次插件调用。
+     *
+     * 这是 4.8 的落点：业务入口不再直接持有插件实例，而是「申请租约 → 执行 →
+     * 归还」。租约期间即使空闲阈值到期也不会被回收，避免调用中被判空闲。
+     *
+     * eager 模式下没有拉起管理器的必要，直接透传；lazy 模式才走租约。
+     *
+     * @return 插件已不可用时返回 `null`，调用方应给出「插件加载失败」而非「没有数据」
+     */
+    /** 一次「在租约保护下调用」的结果，带明确原因 */
+    sealed interface StartedResult<out R> {
+        data class Ok<R>(val value: R) : StartedResult<R>
+        /** 因连续执行超限被停用 */
+        data class Disabled(val reason: String) : StartedResult<Nothing>
+        /** 未能启动：包读取失败、初始化失败或预算拒绝 */
+        data class Unavailable(val reason: String) : StartedResult<Nothing>
+    }
+
+    /**
+     * 在租约保护下执行一次插件调用，并给出**可区分的原因**。
+     *
+     * 与 [withStarted] 的区别只是返回值：那个返回 `null` 时调用方无法区分
+     * 「被停用」「加载失败」「预算拒绝」，界面上只能写一句"不可用"。
+     *
+     * @return [StartedResult.Ok] 或带原因的失败分支
+     */
+    suspend fun <R> withStartedDetailed(
+        pluginId: String,
+        block: suspend (SourcePlugin) -> R,
+    ): StartedResult<R> {
+        // 已停用（连续同步超限）：不再拉起运行时
+        if (pluginId in disabledPlugins) {
+            return StartedResult.Disabled("插件因连续执行超限已停用，请重新安装或显式启用")
+        }
+        if (!lazyInstantiation) {
+            val entry = realEntry(pluginId) ?: return StartedResult.Unavailable("插件未加载")
+            return StartedResult.Ok(block(entry.plugin.plugin).also { checkFaults(pluginId, entry) })
+        }
+        // 已由管理器承载的实例：走租约
+        val result = lazyRuntimeManager.acquire(
+                        pluginId,
+                        resolvePolicy(pluginId, policyFor(pluginId)),
+                        revocable = revocableFor(pluginId),
+                    )
+        return when (result) {
+            is PluginRuntimeManager.AcquireResult.Ready -> {
+                try {
+                    val entry = result.lease.withRuntime { it as Entry }
+                        ?: return StartedResult.Unavailable("运行时已关闭，正在重建")
+                    // 首次经租约拉起（或回收后重建）：外壳保留，仍是对外稳定身份。
+                    // 监听器在**每次**实例就位时都要重新挂上：回收会关掉旧运行时，
+                    // 新实例是干净的，不补挂就等于会话再也收不到任何推送。
+                    pendingSessionListeners[pluginId]
+                        ?.let { listener -> runCatching { entry.plugin.plugin.setSessionUiListener(listener) } }
+                    StartedResult.Ok(block(entry.plugin.plugin).also { checkFaults(pluginId, entry) })
+                } finally {
+                    result.lease.release()
+                }
+            }
+            is PluginRuntimeManager.AcquireResult.Unavailable -> {
+                AppLogger.warn("插件 $pluginId 暂时不可用：${result.reason}")
+                StartedResult.Unavailable(result.reason)
+            }
+        }
+    }
+
+    /**
+     * [withStartedDetailed] 的简化版：只关心成功与否。
+     *
+     * 需要向用户解释"为什么不可用"时请用 detailed 版本。
+     */
+    suspend fun <R> withStarted(pluginId: String, block: suspend (SourcePlugin) -> R): R? =
+        (withStartedDetailed(pluginId, block) as? StartedResult.Ok<R>)?.value
+
+    /**
+     * 取得一条**跨调用持有**的运行时租约，用于「会话存续期间」这类长时间使用。
+     *
+     * 与 [withStarted] 的区别：那个在调用返回时就归还，只保护一次调用；
+     * 会话要跨越多次输入、持续几分钟到几小时，期间若被空闲回收，
+     * 监听注册、订阅和消息缓冲会一起丢掉。所以由调用方显式申请、显式归还。
+     *
+     * eager 模式没有管理器可走，返回 `null`：那里没有自动回收，也不需要保活。
+     */
+    fun acquireSessionLease(pluginId: String): SessionLease? {
+        if (!lazyInstantiation || pluginId in disabledPlugins) return null
+        if (launchRecipes[pluginId] == null) return null
+        return when (val result = lazyRuntimeManager.acquire(
+            pluginId,
+            resolvePolicy(pluginId, policyFor(pluginId)),
+            revocable = revocableFor(pluginId),
+        )) {
+            is PluginRuntimeManager.AcquireResult.Ready -> SessionLease(result.lease, pluginId)
+            is PluginRuntimeManager.AcquireResult.Unavailable -> {
+                AppLogger.warn("插件 $pluginId 无法取得会话租约：${result.reason}")
+                null
+            }
+        }
+    }
+
+    /**
+     * 会话租约。
+     *
+     * 让宿主在会话存续期间贴着真实实例：既能压住空闲回收，也能在实例被
+     * 强制停机（撤权/更新）后立刻察觉（[isAlive] 变 false），而不是继续拿着
+     * 一个已关闭的运行时空转。
+     */
+    class SessionLease internal constructor(
+        private val lease: Lease,
+        val pluginId: String,
+    ) {
+        @Volatile
+        private var released = false
+
+        val isReleased: Boolean get() = released
+
+        /** 租约对应的实例是否仍然存活且与本租约同代际 */
+        fun isAlive(): Boolean =
+            !released && lease.withRuntime { it } != null
+
+        /** 在租约保护下执行；实例已被强制停机时返回 null */
+        fun <R> withPlugin(block: (SourcePlugin) -> R): R? {
+            if (released) return null
+            return lease.withRuntime { entry ->
+                @Suppress("UNCHECKED_CAST")
+                block((entry as Entry).plugin.plugin)
+            }
+        }
+
+        /** 挂起版本：插件调用要等网络往返，必须能让出线程 */
+        suspend fun <R> withPluginSuspend(block: suspend (SourcePlugin) -> R): R? {
+            if (released) return null
+            val plugin = lease.withRuntime { entry ->
+                @Suppress("UNCHECKED_CAST")
+                (entry as Entry).plugin.plugin
+            } ?: return null
+            return block(plugin)
+        }
+
+        fun release() {
+            if (released) return
+            released = true
+            lease.release()
+        }
+    }
+    /** 连续同步超限达到阈值：停用并回收，避免反复打断、反复重建 */
+    private fun checkFaults(pluginId: String, entry: Entry) {
+        if (entry.runtime.syncBudgetExceededCount() < syncFaultLimit) return
+        // 状态改动放进锁：与 scan/ensureStarted 并发时不能丢更新。
+        // 停机（可能较慢）放到锁外，避免长时间持锁
+        val firstFault = synchronized(instantiateLock) {
+            if (!disabledPlugins.add(pluginId)) {
+                false
+            } else {
+                entries = entries.filterNot { it.plugin.plugin.id == pluginId }
+                pendingLaunches = pendingLaunches - pluginId
+                deferredEntries = deferredEntries - pluginId
+                pendingShellCache = pendingShellCache - pluginId
+                true
+            }
+        }
+        if (!firstFault) return
+        AppLogger.error(
+            "插件 $pluginId 连续 $syncFaultLimit 次同步预算超限，已停用；" +
+                "重新安装或显式启用后才会再尝试"
+        )
+        runCatching { lazyRuntimeManager.shutdown(pluginId) }
+    }
+
+    /** 是否因连续故障被停用，供界面提示 */
+    fun isDisabled(pluginId: String): Boolean = pluginId in disabledPlugins
+
+    /** 显式重新启用（用户操作或安装新版本后调用） */
+    fun enablePlugin(pluginId: String) {
+        disabledPlugins.remove(pluginId)
+        AppLogger.info("插件 $pluginId 已重新启用")
+    }
 
     /**
      * 删除一个插件包及其解压目录。
@@ -117,7 +758,16 @@ class JsPluginLoader(
         // 详情页手里那份 JsSourcePlugin 指向的运行时会被下一次重扫关掉，
         // 之后任何调用都落进「运行时已关闭」分支、返回 null，
         // 最终报成「fetch 未实现或执行失败」——一个与真实原因毫无关系的文案。
-        val previous = entries.associateBy { it.plugin.archiveName }
+        //
+        // 延迟模式下已启动的实例住在管理器里，必须一并纳入「可复用」判断，
+        // 否则重扫会把它当成新包重新登记成待启动，列表里出现两份。
+        // 记录本轮之前的配方哈希：用于识别"换了内容"，从而解除故障停用
+        val previousHashes = launchRecipes.mapValues { it.value.contentHash }
+        val managedEntries = lazyRuntimeManager.snapshot()
+        // 扫描期间保留旧外壳，收尾重建时按 id 复用同一对象
+        pendingShellCache = deferredEntries
+        val managedByArchive = managedEntries.associateBy { it.plugin.archiveName }
+        val previous = (entries + managedEntries).associateBy { it.plugin.archiveName }
         val reused = mutableSetOf<String>()
         entries = emptyList()
 
@@ -127,11 +777,17 @@ class JsPluginLoader(
         val ok = mutableListOf<Entry>()
         val bad = mutableListOf<BrokenJsPlugin>()
         val waiting = mutableListOf<PendingJsPlugin>()
+        // 本轮登记的延迟启动配方；扫完整体替换，顺带清掉已删除/已撤销的
+        val deferred = mutableMapOf<String, PendingLaunch>()
 
         // 插件 ID 是全局标识：凭据、私有数据、信任记录、调度注册表全按它索引。
         // 两个包声明同一个 id 时，后来的那个会静默覆盖前者的凭据与数据——
         // 用户会看到「刚登录的账号莫名变成另一个插件的」。这里把它当坏包挡掉。
         val seenIds = mutableSetOf<String>()
+        // 只有**本轮校验通过且仍受信任**的 id 才能继续持有启动配方。
+        // 用 seenIds 会把「待信任/已撤权」的 id 也算进去，
+        // 于是旧配方残留下来，find()/ensureStarted() 还能把它重新拉起来。
+        val trustedIds = mutableSetOf<String>()
 
         for (archiveName in archives) {
             when (val result = loadOne(archiveName, trustState, previous[archiveName])) {
@@ -139,9 +795,7 @@ class JsPluginLoader(
                     val pluginId = result.entry.plugin.plugin.id
                     if (!seenIds.add(pluginId)) {
                         // 后加载的重复项直接释放，不进入 entries
-                        result.entry.httpBridge?.cancelAll()
-                        result.entry.wsBridge?.cancelAll()
-                        result.entry.runtime.close()
+                        closeEntry(result.entry, StopReason.REVOKED)
                         bad += BrokenJsPlugin(
                             result.entry.plugin.archiveName,
                             "插件 id「$pluginId」与其它包重复，已跳过",
@@ -150,11 +804,38 @@ class JsPluginLoader(
                             "JS 插件 id 重复：${result.entry.plugin.archiveName} 的 $pluginId 已被占用"
                         )
                     } else {
-                        // 复用了旧运行时的话，记下来，扫完不要把它关掉
-                        previous[archiveName]?.let { old ->
-                            if (result.entry.runtime === old.runtime) reused += archiveName
+                        trustedIds += pluginId
+                        if (managedByArchive[archiveName] === result.entry) {
+                            // 已在管理器中承载：标记复用即可，不要再加入 entries，
+                            // 否则同一个插件会同时存在于两处、列表出现两份
+                            reused += archiveName
+                        } else {
+                            // 复用了旧运行时的话，记下来，扫完不要把它关掉
+                            previous[archiveName]?.let { old ->
+                                if (result.entry.runtime === old.runtime) reused += archiveName
+                            }
+                            ok += result.entry
                         }
-                        ok += result.entry
+                    }
+                }
+                is LoadResult.Deferred -> {
+                    val pluginId = result.launch.manifest.id
+                    if (!seenIds.add(pluginId)) {
+                        bad += BrokenJsPlugin(
+                            result.launch.archiveName,
+                            "插件 id「$pluginId」与其它包重复，已跳过",
+                        )
+                        AppLogger.warn("JS 插件 id 重复：${result.launch.archiveName} 的 $pluginId 已被占用")
+                    } else {
+                        trustedIds += pluginId
+                        // 包变了/换了身份：管理器里的旧实例必须先停掉，
+                        // 否则同一 id 会在管理器里留下两个代际
+                        managedEntries.firstOrNull { it.plugin.plugin.id == pluginId }?.let {
+                            runCatching { lazyRuntimeManager.shutdown(pluginId) }
+                        }
+                        deferred[pluginId] = result.launch
+                        // 登记配方：延迟模式下运行时还没建，靠它首次启动与回收后重建
+                        launchRecipes = launchRecipes + (pluginId to result.launch)
                     }
                 }
                 is LoadResult.Failure -> bad += result.broken
@@ -176,34 +857,92 @@ class JsPluginLoader(
         entries = ok
         broken = bad
         pending = waiting
+        // 已实例化的插件不再需要配方；未变更的保留，已消失的自然被替换掉
+        val liveIds = ok.map { it.plugin.plugin.id }.toSet()
+        pendingLaunches = deferred.filterKeys { it !in liveIds }
+        // 配方只留给本轮校验通过且受信任的 id：待信任/已撤权的必须立刻丢弃，
+        // 否则 find()/ensureStarted() 仍能顺着旧配方把脚本重新跑起来。
+        launchRecipes = launchRecipes.filterKeys { it in trustedIds }
+        policies = policies.filterKeys { it in trustedIds }
+        // 卸载/撤销的插件不该继续占常驻名额
+        residentGrants.retainAll(trustedIds)
+        // 换了内容（重装新版）说明作者可能已修好：解除停用，给它一次机会；
+        // 被删除的也一并清掉，避免重装后仍带着旧停用标记
+        disabledPlugins.retainAll(trustedIds)
+        previousHashes.forEach { (id, oldHash) ->
+            val newHash = launchRecipes[id]?.contentHash
+            if (newHash != null && newHash != oldHash) disabledPlugins.remove(id)
+        }
+        // 登记生效策略：启动后配方会被清掉，策略要留到运行时回收为止
+        policies = policies + deferred.mapValues { (_, launch) ->
+            PluginRuntimePolicy.of(launch.manifest.lifecycle, launch.manifest.idleTimeoutSec)
+        }
+        // 外壳表只增补、不重建：保留已有对象是「稳定身份」的全部意义。
+        // 详情页与会话控制器长期持有外壳，重建会让它们手里的监听与租约变成孤儿。
+        for ((id, recipe) in launchRecipes) {
+            if (deferredEntries[id] == null) stableShell(recipe)
+        }
+        // 失去信任/已卸载的配方已被清掉，对应外壳也要一并移除
+        deferredEntries = deferredEntries.filterKeys { it in launchRecipes }
+        commitShellCache()
 
         // 释放这一轮没能复用的旧运行时：包被删、被替换、或已失去信任。
         // 复用过的不动——正被详情页持有，关掉就等于把还在用的插件掐死。
+        // 管理器承载的实例要走管理器停机，不能直接 closeEntry（否则管理器仍以为它活着）
         previous.forEach { (archiveName, old) ->
             if (archiveName !in reused) {
-                runCatching { old.httpBridge?.cancelAll() }
-                runCatching { old.wsBridge?.cancelAll() }
-                runCatching { old.runtime.close() }
+                if (managedByArchive[archiveName] === old) {
+                    runCatching { lazyRuntimeManager.shutdown(old.plugin.plugin.id) }
+                } else {
+                    // 包被删除/替换：旧代际按「更新」处理，允许尽力清理
+                    runCatching { closeEntry(old, StopReason.UPDATE) }
+                }
             }
         }
 
         AppLogger.info(
-            "JS 插件扫描完成：成功 ${ok.size}，待信任 ${waiting.size}，失败 ${bad.size}"
+            "JS 插件扫描完成：已启动 ${ok.size + lazyRuntimeManager.liveCount()}，" +
+                "待启动 ${deferredEntries.size}，待信任 ${waiting.size}，失败 ${bad.size}"
         )
         // 失败原因单独打出来：只报数量的话，用户在界面上看到「加载失败」
         // 却拿不到任何线索，排查只能靠猜
         bad.forEach { AppLogger.warn("插件「${it.archiveName}」加载失败：${it.reason}") }
-        return ok.map { it.plugin }
+        // **托管实例必须继续以委托外壳对外**：
+        // 外壳每次调用都现申请租约，而真实实例是没有租约保护的裸引用，
+        // 把它交给调用方（列表、详情页）会让空闲回收在会话进行中把运行时关掉。
+        // 因此「已启动」不等于「直接交出真实实例」——只有内部路径（realEntry）才拿真实实例。
+        val managedIds = lazyRuntimeManager.snapshot().mapTo(mutableSetOf()) { it.plugin.plugin.id }
+        // eager 条目直接对外（它们没有管理器，也就没有回收）；其余一律走外壳。
+        val eager = ok.filter { it.plugin.plugin.id !in managedIds }
+        val eagerIds = eager.mapTo(mutableSetOf()) { it.plugin.plugin.id }
+        // 已在外壳表里的直接复用，保证同一个 id 始终是同一个对象；
+        // 每个 id 只出现一次——托管实例与待启动外壳曾同时被加入，列表里出现两份。
+        val shells = linkedMapOf<String, JsLoadedPlugin>()
+        deferredEntries.values.filter { it.plugin.id !in eagerIds }.forEach { shells[it.plugin.id] = it }
+        managedIds.filter { it !in eagerIds }.forEach { id ->
+            launchRecipes[id]?.let { shells.getOrPut(id) { stableShell(it) } }
+        }
+        // 待启动项（含扫描期间被 find()/ensureStarted() 新建的外壳）也必须出现在列表里，
+        // 否则用户会以为「包没装上」——它们既不在 entries 也不在管理器里。
+        pendingLaunches.keys.filter { it !in eagerIds && it !in shells }.forEach { id ->
+            launchRecipes[id]?.let { shells[id] = stableShell(it) }
+        }
+        return eager.map { it.plugin } + shells.values
     }
 
     /** 释放全部运行时。宿主退出或重新扫描前调用。 */
     fun closeAll() {
-        entries.forEach {
-            it.httpBridge?.cancelAll()
-            it.wsBridge?.cancelAll()
-            it.runtime.close()
-        }
+        entries.forEach { closeEntry(it) }
         entries = emptyList()
+        // 延迟模式启动的实例由管理器承载，一并回收
+        runCatching { lazyRuntimeManager.close() }
+        // 待启动项没有运行时，只需清掉登记
+        pendingLaunches = emptyMap()
+        deferredEntries = emptyMap()
+        pendingShellCache = emptyMap()
+        pendingSessionListeners.clear()
+        launchRecipes = emptyMap()
+        residentGrants.clear()
     }
 
     /**
@@ -238,10 +977,11 @@ class JsPluginLoader(
             val manifestBytes = files[JsPluginManifest.MANIFEST_NAME]
                 ?: return LoadResult.Failure(BrokenJsPlugin(archiveName, "缺少 manifest.json"))
 
-            val manifest = JsPluginManifest.parse(manifestBytes.toString(Charsets.UTF_8))
-                ?: return LoadResult.Failure(
-                    BrokenJsPlugin(archiveName, "manifest.json 格式不合法或缺少必需字段")
-                )
+            val manifest = when (val parsed = JsPluginManifest.parseDetailed(manifestBytes.toString(Charsets.UTF_8))) {
+                is ParseResult.Success -> parsed.manifest
+                is ParseResult.Failure ->
+                    return LoadResult.Failure(BrokenJsPlugin(archiveName, "manifest 解析失败：${parsed.reason}"))
+            }
 
             if (files[manifest.entry] == null) {
                 return LoadResult.Failure(
@@ -265,6 +1005,18 @@ class JsPluginLoader(
                         )
                     }
                 }
+            }
+
+            // 能力协商：显式声明 requires 的插件必须在执行入口前满足全部必需能力。
+            // 缺省不校验——旧包没有这个字段，强制校验会让它们全部被拒。
+            val unmet = HostCapabilities.unmet(manifest.requires)
+            if (unmet.isNotEmpty()) {
+                return LoadResult.Failure(
+                    BrokenJsPlugin(
+                        archiveName,
+                        HostCapabilities.rejectReason(manifest.requires, unmet),
+                    )
+                )
             }
 
             // 内容哈希：既做完整性校验，也当签名指纹用
@@ -317,6 +1069,15 @@ class JsPluginLoader(
             ) {
                 AppLogger.debug("复用已加载的 JS 插件 ${manifest.id}（脚本与 manifest 均未变化）")
                 return LoadResult.Success(reusable)
+            }
+
+            // 延迟实例化：校验全部通过后只登记「启动配方」，不创建运行时。
+            // 这是按需加载的关键一步——列表可以列出插件，但不执行任何脚本。
+            if (lazyInstantiation) {
+                AppLogger.debug("登记待启动插件 ${manifest.id}（延迟实例化）")
+                return LoadResult.Deferred(
+                    PendingLaunch(archiveName, manifest, contentHash)
+                )
             }
 
             instantiate(archiveName, manifest, files, contentHash)
@@ -425,6 +1186,13 @@ class JsPluginLoader(
         )
         streamHolder[0] = plugin
 
+        // 记录配方：进入延迟模式后若运行时被回收，靠它重建
+        launchRecipes = launchRecipes + (manifest.id to PendingLaunch(
+            archiveName = archiveName,
+            manifest = manifest,
+            contentHash = contentHash,
+        ))
+
         return LoadResult.Success(
             Entry(
                 plugin = JsLoadedPlugin(
@@ -439,6 +1207,73 @@ class JsPluginLoader(
                 manifest = manifest,
             )
         )
+    }
+
+    /**
+     * 关闭原因：决定是否给插件一次「尽力清理」的机会。
+     *
+     * **不是所有关闭都该回调插件代码**：撤销信任、清除数据、故障中断时
+     * 继续执行插件逻辑本身就是错的，而且可能把刚清掉的数据写回去。
+     */
+    enum class StopReason(
+        /** 是否调用 onUnload */
+        val callsHook: Boolean,
+    ) {
+        /** 空闲回收 */
+        IDLE(callsHook = true),
+        /** 会话范围插件最后使用者离开 */
+        SESSION_ENDED(callsHook = true),
+        /** 包更新：旧代际被替换 */
+        UPDATE(callsHook = true),
+        /** 进程退出 */
+        SHUTDOWN(callsHook = true),
+        /** 撤销信任 / 卸载：不再执行插件代码 */
+        REVOKED(callsHook = false),
+        /** 清除凭据或数据：禁止旧代际回写 */
+        CLEARED(callsHook = false),
+        /** 看门狗/OOM 等故障：运行时已不可信 */
+        FAULTED(callsHook = false),
+    }
+
+    /**
+     * 把一个已加载条目彻底释放。
+     *
+     * **顺序固定**：先尽力调用 `onUnload`（按原因），再取消 HTTP/WS 与重试定时器，
+     * 最后关运行时。反过来会让已经发出的回调在运行时销毁后仍尝试落地 Promise。
+     *
+     * 按需回收、重扫替换、撤信任、进程退出都走这里，避免各处漏掉某一项。
+     */
+    fun releaseEntry(entry: JsLoadedPlugin, reason: StopReason = StopReason.SHUTDOWN) {
+        val pluginId = entry.plugin.id
+        val internal = entries.firstOrNull { it.plugin === entry }
+        if (internal != null) {
+            closeEntry(internal, reason)
+            // 关闭后必须从列表移除：否则 find() 仍会返回一个已关闭的实例，
+            // 后续调用直接落进"运行时已关闭"分支
+            entries = entries.filterNot { it === internal }
+        }
+        // 延迟模式下条目住在管理器里，entries 查不到——必须单独停机，
+        // 否则撤销信任/卸载时运行时根本不会被关
+        if (lazyRuntimeManager.snapshot().any { it.plugin.plugin.id == pluginId }) {
+            runCatching { lazyRuntimeManager.shutdown(pluginId) }
+        }
+        deferredEntries = deferredEntries - pluginId
+        pendingShellCache = pendingShellCache - pluginId
+    }
+
+    /** 内部释放：桥接先撤，运行时后关 */
+    private fun closeEntry(entry: Entry, reason: StopReason = StopReason.SHUTDOWN) {
+        // 先给插件一次尽力清理的机会（按原因），再撤销外部连接
+        if (reason.callsHook) {
+            runCatching { entry.runtime.callUnloadHook(entry.manifest.entry, UNLOAD_HOOK_TIMEOUT_MS) }
+                .onFailure { AppLogger.debug("插件 ${entry.manifest.id} 的 onUnload 未完成：${it.message}") }
+        }
+        runCatching { entry.httpBridge?.cancelAll() }
+            .onFailure { AppLogger.warn("取消插件 HTTP 请求失败：${entry.manifest.id}（${it.message}）") }
+        runCatching { entry.wsBridge?.cancelAll() }
+            .onFailure { AppLogger.warn("关闭插件 WebSocket 失败：${entry.manifest.id}（${it.message}）") }
+        runCatching { entry.runtime.close() }
+            .onFailure { AppLogger.warn("关闭插件运行时失败：${entry.manifest.id}（${it.message}）") }
     }
 
     /** 加载成功的结果，附带运行时用于卸载时释放。 */
@@ -466,6 +1301,9 @@ class JsPluginLoader(
 
         /** 包本身没问题，只差用户信任，不执行脚本 */
         data class Skipped(val pending: PendingJsPlugin) : LoadResult
+
+        /** 校验通过但延迟实例化：只登记启动配方，不创建运行时 */
+        data class Deferred(val launch: PendingLaunch) : LoadResult
     }
 
     /**
@@ -485,7 +1323,21 @@ class JsPluginLoader(
         }
 
         fun require(): PluginContext =
-            current ?: throw IllegalStateException("插件上下文未注入")
+            current ?: throw IllegalStateException(
+                // 卸载钩子期间上下文未绑定，这里会失败——这是刻意的：
+                // 钩子只允许 log，不允许读写凭据/文件，避免旧代际把已清数据写回
+                "插件上下文未注入（卸载钩子期间仅允许日志）"
+            )
+    }
+
+    private companion object {
+        /**
+         * `onUnload` 的等待上限。
+         *
+         * 与设计一致：2 秒是「宿主停止等待并撤销写权限」的预算，
+         * 不承诺任意阻塞 I/O 一定在 2 秒内结束。超时后请求中断并继续回收。
+         */
+        const val UNLOAD_HOOK_TIMEOUT_MS = 2_000L
     }
 }
 
@@ -495,11 +1347,15 @@ class JsPluginLoader(
  * 刻意不引用各端的 `LoadedPlugin`：那份类型还带着「是否已信任」这类
  * 运行期状态，属于宿主自己的簿记。共享层只交出「包元数据 + 插件实例 +
  * 包文件名」，各端用自己的结构包一层即可，两端不必为了统一而互相迁就。
+ *
+ * [plugin] 声明为 [SourcePlugin] 而不是具体的 [JsSourcePlugin]：延迟实例化下
+ * 它可能是委托外壳，调用方不应假设拿到的一定是已启动的实例。真正需要
+ * JS 专属信息（如 `jsApiVersion`）的地方请显式转换并处理空值。
  */
 class JsLoadedPlugin(
     val packageInfo: PluginPackageInfo,
     val archiveName: String,
-    val plugin: JsSourcePlugin,
+    val plugin: SourcePlugin,
 )
 
 /** 一个加载失败的 JS 插件。 */

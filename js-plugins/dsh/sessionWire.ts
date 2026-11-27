@@ -145,12 +145,18 @@ export async function promptSession(
 export interface FollowMessage {
     role: 'user' | 'assistant' | 'system';
     text: string;
+    /** prompt.requestId 的服务端回执，来源是 message.source.rpcId */
+    rpcId?: string;
 }
 
 /** 跟随流的回调 */
 export interface FollowHandlers {
     /** 打开时的历史消息（snapshot 帧） */
-    onSnapshot(messages: FollowMessage[], running: boolean): void;
+    onSnapshot(messages: FollowMessage[]): void;
+    /** 远端 turn 开始；assistant attempt 的重试不代表新 turn */
+    onTurnStart(): void;
+    /** 新 attempt 或未提交 attempt 结束，撤回临时展示 */
+    onAttemptReset(): void;
     /** 一条新落库的消息 */
     onMessage(message: FollowMessage): void;
     /** 流式增量：助手正在写的片段（**增量**，不是累计） */
@@ -198,7 +204,7 @@ export async function followSession(
         },
     });
     let closed = false;
-    let lastDelta = '';
+    const state: FollowState = { attemptId: null, nextIndex: 0, revision: -1 };
 
     void (async () => {
         try {
@@ -211,7 +217,7 @@ export async function followSession(
             for (;;) {
                 const value = await stream.next();
                 if (closed) return;
-                handleFollowFrame(value, handlers, () => lastDelta, (next) => { lastDelta = next; });
+                handleFollowFrame(value, handlers, state);
             }
         } catch (error) {
             if (closed) return;
@@ -241,11 +247,16 @@ export async function followSession(
  * 一轮对话结束不等于订阅结束。现在由调用方无条件循环，
  * 只有 `close()` 或连接错误才会停。
  */
+interface FollowState {
+    attemptId: string | null;
+    nextIndex: number;
+    revision: number;
+}
+
 function handleFollowFrame(
     value: unknown,
     handlers: FollowHandlers,
-    readDelta: () => string,
-    writeDelta: (next: string) => void,
+    state: FollowState,
 ): void {
     if (typeof value !== 'object' || value === null) return;
     const frame = value as Record<string, unknown>;
@@ -257,7 +268,27 @@ function handleFollowFrame(
             const message = readEventMessage(record);
             if (message !== null) messages.push(message);
         }
-        handlers.onSnapshot(messages, readRunning(frame));
+        handlers.onSnapshot(messages);
+        // snapshot 没有 running；运行态初值由 session/list 提供。
+        const baseline = asRecord(frame.assistantStream);
+        state.revision = typeof baseline?.revision === 'number' ? baseline.revision : -1;
+        const attempt = asRecord(baseline?.activeAttempt);
+        state.attemptId = typeof attempt?.attemptId === 'string' ? attempt.attemptId : null;
+        state.nextIndex = typeof attempt?.nextIndex === 'number' ? attempt.nextIndex : 0;
+        if (state.attemptId !== null) {
+            handlers.onTurnStart();
+            handlers.onAttemptReset();
+            // 重连快照保存的是紧凑流：保留每个 text-chunks 成员的 delta 边界。
+            for (const raw of Array.isArray(attempt?.stream) ? attempt.stream : []) {
+                const record = asRecord(raw);
+                if (record?.type === 'text-chunks' && Array.isArray(record.texts)) {
+                    for (const text of record.texts) if (typeof text === 'string') handlers.onDelta(text);
+                } else if (record?.type === 'chunk') {
+                    const text = readChunkText(record.chunk);
+                    if (text.length > 0) handlers.onDelta(text);
+                }
+            }
+        }
         return;
     }
 
@@ -269,8 +300,12 @@ function handleFollowFrame(
         // 一次 turn 可能经历多次 attempt：provider 报错会自动重试（实测 503
         // 重试 5 次，共 6 次 attempt）。拿 `assistant-stream` 的 `end` 当结束，
         // 会在同一轮里误报 6 次「已完成」，输入框反复闪。
+        if (event.type === 'turn/start') {
+            handlers.onTurnStart();
+            return;
+        }
         if (event.type === 'turn/end') {
-            writeDelta('');
+            state.attemptId = null;
             const failure = readTurnEndError(event);
             if (failure !== null) handlers.onError(failure);
             handlers.onTurnEnd();
@@ -285,31 +320,31 @@ function handleFollowFrame(
         const inner = frame.frame;
         if (typeof inner !== 'object' || inner === null) return;
         const f = inner as Record<string, unknown>;
+        // revision 是连接内单调的展示版本；index 是 attempt 内稠密帧序号。
+        // 重复帧只能按协议身份过滤，绝不能按 text 前缀猜成累计值。
+        if (typeof f.revision !== 'number' || f.revision <= state.revision) return;
+        if (typeof f.attemptId !== 'string') return;
         if (f.type === 'start') {
-            // 新一次 attempt 开始，之前累积的增量作废
-            writeDelta('');
+            state.revision = f.revision;
+            state.attemptId = f.attemptId;
+            state.nextIndex = 0;
+            handlers.onTurnStart();
+            handlers.onAttemptReset();
             return;
         }
+        if (f.attemptId !== state.attemptId || f.index !== state.nextIndex) return;
+        state.revision = f.revision;
         if (f.type === 'chunk') {
+            state.nextIndex += 1;
             const text = readChunkText(f.chunk);
-            if (text.length === 0) return;
-            // 增量发出去，同时累积——服务端偶尔会重发累计值，
-            // 用「已发到哪」比对能避免同一段文字出现两次
-            const sent = readDelta();
-            if (text.startsWith(sent)) {
-                const delta = text.slice(sent.length);
-                writeDelta(text);
-                if (delta.length > 0) handlers.onDelta(delta);
-            } else {
-                handlers.onDelta(text);
-                writeDelta(sent + text);
+            if (text.length > 0) handlers.onDelta(text);
+        } else if (f.type === 'end') {
+            state.attemptId = null;
+            // attempt 结束不解锁输入；只有 turn/end 才结束一轮。
+            const outcome = asRecord(f.outcome);
+            if (outcome?.kind !== 'committed' || outcome.eventType !== 'assistant/message') {
+                handlers.onAttemptReset();
             }
-            return;
-        }
-        if (f.type === 'end') {
-            // 只清缓冲。**不要**在这里报「本轮结束」：这不是 turn 结束，
-            // 只是某一次 attempt 结束（可能后面还有重试）。
-            writeDelta('');
         }
     }
 }
@@ -324,19 +359,9 @@ function readEventObject(raw: unknown): Record<string, unknown> | null {
     return event as Record<string, unknown>;
 }
 
-/**
- * 读 snapshot 的运行态。
- *
- * 实测快照里的运行态不在顶层，取不到就按「不在运行」处理：
- * 后续 `turn/end` 会把输入框放开，误判为「运行中」会一直锁着输入。
- */
-function readRunning(snapshot: Record<string, unknown>): boolean {
-    if (snapshot.running === true) return true;
-    const header = snapshot.header;
-    if (typeof header === 'object' && header !== null) {
-        if ((header as Record<string, unknown>).running === true) return true;
-    }
-    return false;
+function asRecord(value: unknown): Record<string, unknown> | null {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+        ? value as Record<string, unknown> : null;
 }
 
 /**
@@ -389,9 +414,13 @@ function readEventMessage(raw: unknown): FollowMessage | null {
     const data = typeof event.data === 'object' && event.data !== null
         ? event.data as Record<string, unknown>
         : {};
-    const text = readMessageText(data.message);
+    const text = readMessageText(data.message ?? data);
     if (text.length === 0) return null;
-    return { role, text };
+    // user/message 的 data 本身就是 UserMessage；assistant/system 才有 message 包装。
+    const body = asRecord(data.message) ?? data;
+    const source = asRecord(body.source);
+    const rpcId = typeof source?.rpcId === 'string' ? source.rpcId : undefined;
+    return { role, text, rpcId };
 }
 
 /**

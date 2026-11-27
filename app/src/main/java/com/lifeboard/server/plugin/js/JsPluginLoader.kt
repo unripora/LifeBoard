@@ -83,14 +83,26 @@ internal object JsPluginLoader {
     private fun loader(context: Context): SharedJsPluginLoader {
         val app = context.applicationContext
         return loaders.getOrPut(app) {
+            val settings = AndroidSettingsStore(app)
             SharedJsPluginLoader(
                 fileSystem = AndroidPluginFileSystem(app.filesDir),
                 trustStore = com.lifeboard.shared.plugin.PluginTrustStore(
                     AndroidSettingsStore(app, "plugin_trust"),
                 ),
-            )
+            ).apply {
+                // 运行时生命周期开关：**默认关闭**，与改造前行为一致。
+                // 开启需要专项测试与真机验证通过（见任务 P_plan 的 B7/9.2）。
+                lazyInstantiation = settings.getBoolean(KEY_LAZY, false)
+                if (settings.getBoolean(KEY_EVICT, false)) setEvictionEnabled(true)
+            }
         }
     }
+
+    /** 是否启用「扫描不实例化、首次调用才加载」。默认关闭 */
+    private const val KEY_LAZY = "plugin.runtime.lazy"
+
+    /** 是否启用空闲回收。默认关闭，需真机验证后再开 */
+    private const val KEY_EVICT = "plugin.runtime.evict"
 
     /** 插件包与解压目录的根位置 */
     fun pluginsDir(context: Context): File = File(context.filesDir, "js-plugins").apply { mkdirs() }

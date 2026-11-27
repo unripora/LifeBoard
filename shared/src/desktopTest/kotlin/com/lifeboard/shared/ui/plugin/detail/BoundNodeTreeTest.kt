@@ -97,6 +97,36 @@ class BoundNodeTreeTest {
         assertTrue((resolved.items as Bound.Static).value.isEmpty())
     }
 
+    @Test
+    fun staticListRecursivelyResolvesNestedBindingsAndPreservesItemPositions() {
+        val nested = ListNode(items = Bound.Static(listOf(listOf(
+            StatusCardNode("状态", Bound.Ref("session:b:status")),
+            InputNode("send", enabled = Bound.Ref("session:b:inputEnabled")),
+        ))))
+        val root = ListNode(
+            items = Bound.Static(listOf(
+                listOf(TextNode(body = Bound.Ref("session:missing:status"))),
+                listOf(text("保留"), ColumnNode(children = listOf(nested))),
+            )),
+            itemActionId = "pick",
+            itemPayloads = listOf("first", "second"),
+        )
+        val resolved = resolveNodes(root, resolver(
+            "session:b:status" to BoundValue.Text("已连接 B"),
+            "session:b:inputEnabled" to BoundValue.Flag(false),
+        )) as ListNode
+
+        val items = (resolved.items as Bound.Static).value
+        assertEquals(2, items.size, "空行仍须保留位置，不能错配 itemPayloads")
+        assertTrue(items.first().isEmpty())
+        assertEquals(text("保留"), items[1][0])
+        val inner = (items[1][1] as ColumnNode).children.single() as ListNode
+        val children = (inner.items as Bound.Static).value.single()
+        assertEquals(Bound.Static("已连接 B"), (children[0] as StatusCardNode).value)
+        assertEquals(Bound.Static(false), (children[1] as InputNode).enabled)
+        assertEquals(root.itemPayloads, resolved.itemPayloads)
+    }
+
     /**
      * 消息绑定被翻译成「每项一段文本」：列表项复用通用内容节点，
      * 不为「消息」再造一种节点类型。

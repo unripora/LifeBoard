@@ -17,6 +17,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.lifeboard.plugin.api.Bound
 import com.lifeboard.plugin.api.ChartNode
@@ -38,11 +39,18 @@ import com.lifeboard.shared.ui.theme.GlassCard
  *
  * 标题走语义色（`tone`），正文一律次要色：正文染色会让整块看起来像警告，
  * 而插件传 tone 的意图通常是「标题/关键值需要强调」。
+ *
+ * ## 卡片由 `card` 决定
+ *
+ * 早先无条件套 `GlassCard`，与「整棵树里唯一决定套不套卡片的是
+ * `column.card`」这个既有约定矛盾：嵌在卡片里的说明文字会多出一层边框，
+ * 看起来像表格。现在尊重 `node.card`；内容会先组装成一段，再决定
+ * 外面那层是不是卡片——这样两种形态下排版一致，不会因卡片有无而错位。
  */
 @Composable
 internal fun RenderText(node: TextNode) {
     val body = (node.body as? Bound.Static)?.value.orEmpty()
-    GlassCard(modifier = Modifier.fillMaxWidth()) {
+    val content: @Composable () -> Unit = {
         if (node.title.isNotBlank()) {
             Text(
                 node.title,
@@ -58,6 +66,14 @@ internal fun RenderText(node: TextNode) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+    }
+    if (node.card) {
+        GlassCard(modifier = Modifier.fillMaxWidth()) { content() }
+    } else {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) { content() }
     }
 }
 
@@ -122,6 +138,7 @@ internal fun RenderImage(node: ImageNode) {
             dataUri = node.dataUri,
             contentDescription = node.contentDescription.ifBlank { "插件提供的图片" },
             errorText = "图片加载失败",
+            aspectRatio = node.aspectRatio,
         )
     }
 }
@@ -177,33 +194,46 @@ internal fun RenderCode(node: CodeNode) {
     }
 }
 
-/** 表格：列宽按 weight 分配，weight<=0 的列按内容自适应 */
+/**
+ * 表格：列宽按 weight 分配，weight<=0 的列按内容自适应。
+ *
+ * 列对齐尊重 `column.align`：数值列右对齐才看得清位数，而早先解析了
+ * `align` 却完全没用，属于契约与实际不符。
+ */
 @Composable
 internal fun RenderTable(node: TableNode) {
     GlassCard(modifier = Modifier.fillMaxWidth()) {
-        node.rows.forEachIndexed { rowIndex, row ->
+        tableDisplayRows(node).forEach { row ->
             Row(
                 modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 node.columns.forEachIndexed { colIndex, column ->
-                    val cell = row.getOrNull(colIndex).orEmpty()
+                    val cell = row.cells.getOrNull(colIndex).orEmpty()
                     val weight = if (column.weight > 0f) column.weight else 1f
                     Text(
                         cell,
                         modifier = Modifier.weight(weight),
                         style = MaterialTheme.typography.labelSmall,
-                        fontWeight = if (rowIndex == 0) FontWeight.SemiBold else FontWeight.Normal,
-                        color = if (rowIndex == 0) {
+                        fontWeight = if (row.isHeader) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (row.isHeader) {
                             MaterialTheme.colorScheme.onSurface
                         } else {
                             MaterialTheme.colorScheme.onSurfaceVariant
                         },
+                        textAlign = column.align.toTextAlign(),
                     )
                 }
             }
         }
     }
+}
+
+/** 契约里的对齐枚举 → Compose 文本对齐 */
+private fun com.lifeboard.plugin.api.Align.toTextAlign(): TextAlign = when (this) {
+    com.lifeboard.plugin.api.Align.START -> TextAlign.Start
+    com.lifeboard.plugin.api.Align.CENTER -> TextAlign.Center
+    com.lifeboard.plugin.api.Align.END -> TextAlign.End
 }
 
 /** 键值对组：比一排状态卡更紧凑 */

@@ -50,15 +50,33 @@ data class BindingRef(
     /** 字段名，如 `messages` / `status` / `inputEnabled` */
     val field: String,
 ) {
-    /** 规范化形式，供日志与去重使用 */
+    /**
+     * 规范化形式，供日志与去重使用。
+     *
+     * 无 key 的源输出 `source::field`（中间留空）——与 [parse] 的三段式校验一致，
+     * 这样 `canonical()` 的结果能被 [BindingRef.parse] 原样解析回来。
+     * 若写成两段式 `source:field`，往返一次就会被判成格式错。
+     */
     fun canonical(): String = source + ":" + key + ":" + field
 
     companion object {
         /**
          * 解析 `<source>:<key>:<field>`。
          *
-         * 要求恰好三段且都不为空。多冒号少冒号都算格式错——宽松解析会让
+         * 段数必须恰好三段，且 source / field 都不能为空——宽松解析会让
          * `session:main:messages:extra` 这种拼错静默生效，排查时很难看出来。
+         *
+         * ## 两段式为什么**不**在这里放宽
+         *
+         * `session:only-two` 必须被判成格式错：既有契约与测试都依赖这条，
+         * 而且两段形态已经被 `submitTo` 占用（第二段是实例 key，不是字段名）。
+         *
+         * ## 无实例 key 的源怎么表达
+         *
+         * 用 **key 为空的三段式**：`sessionList::items`。硬凑
+         * `sessionList:*:items` 里那个 `*` 只是占位，还会被误读成通配符。
+         * 中间段为空对 [parse] 是合法的——这是 [canonical] 产出的形态，
+         * 求值链路要能原样读回来。
          */
         fun parse(raw: String): BindingRef? {
             val parts = raw.trim().split(':')
@@ -66,9 +84,21 @@ data class BindingRef(
             val source = parts[0].trim()
             val key = parts[1].trim()
             val field = parts[2].trim()
-            if (source.isEmpty() || key.isEmpty() || field.isEmpty()) return null
+            if (source.isEmpty() || field.isEmpty()) return null
             return BindingRef(source, key, field)
         }
+
+        /**
+         * 构造一个「没有实例 key」的绑定引用（如 `sessionList` 的 `items`）。
+         *
+         * 宿主与解析器用它在内部表达「这个源没有实例概念」；插件在 `detailUi`
+         * 里同样写 `{binding:'sessionList::items'}`（中间段留空）。
+         *
+         * 注意 `sessionList:items` 这种两段写法**仍然**是格式错——见 [parse]。
+         * 同一段文本有两种解释，排查时最难判断。
+         */
+        fun keyless(source: String, field: String): BindingRef =
+            BindingRef(source, KEYLESS, field)
 
         /**
          * 解析 `<source>:<key>` 形式的目标（输入框的 `submitTo`）。
@@ -86,7 +116,18 @@ data class BindingRef(
             return BindingRef(source, key, FIELD_SUBMIT)
         }
 
+        /**
+         * 「该源没有实例 key」的标记。
+         *
+         * 用空串而不是 `*`：`*` 看起来像通配符，会让人以为它有匹配语义，
+         * 而这里表达的是「不存在这个概念」，空串最准确。
+         */
+        const val KEYLESS = ""
+
         /** `submitTo` 解析出来的 [field] 占位值。它不对应任何可读字段 */
         const val FIELD_SUBMIT = "submit"
     }
+
+    /** 该绑定是否指向一个没有实例 key 的源（如 `sessionList` 的 `items`） */
+    val isKeyless: Boolean get() = key == KEYLESS
 }

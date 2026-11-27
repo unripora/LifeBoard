@@ -115,24 +115,40 @@ internal actual object JsNativeBridge {
      * native 侧再回调就是野指针（表现为进程直接崩，没有异常栈）。
      * 因此把分配出去的 callback 钉在这个 map 里，runtime 销毁时整批释放。
      */
-    private val hostCallbacks = HashMap<Long, NativeHostCallback>()
+    private val hostCallbacks = java.util.concurrent.ConcurrentHashMap<Long, NativeHostCallback>()
 
     /**
-     * 回调返回值的持有表。
+     * 回调返回值的持有表：**按实例隔离**，销毁只清自己那一份。
      *
-     * native 侧读走字符串后**不会** free 这块内存（它是 JVM 的 `Memory`，
-     * 交给 C 的 `free` 就是堆损坏，Windows 上表现为进程以 0xC0000374 退出）。
-     * 但如果不持强引用，`Memory` 可能在 native 读完之前被 GC 回收，同样崩。
-     * 这里保留最近一次回调的缓冲区，够用到 native 复制完结果即可。
+     * native 侧读走字符串后不会 free（这是 JVM 的 `Memory`，交给 C 的 free 会
+     * 破坏堆）；而若不持强引用，`Memory` 可能在 native 读完前被 GC 回收。
+     *
+     * 早先这里是**全局一个 ArrayList**，销毁任意一个运行时就清空整张表——
+     * 导致「关掉插件 A 把插件 B 尚在使用的缓冲也放了」的跨实例误伤。
+     * 现在按 handle 分桶，并只保留最近几次：native 在回调返回后立刻复制，
+     * 留多了纯属浪费内存。
      */
-    private val returnedBuffers = ArrayList<com.sun.jna.Memory>()
+    private val returnedBuffers =
+        java.util.concurrent.ConcurrentHashMap<Long, java.util.ArrayDeque<com.sun.jna.Memory>>()
+
+    /** 每个实例最多保留的回调缓冲个数 */
+    private const val MAX_RETAINED_BUFFERS = 2
+
+    /** 登记一块回调返回值缓冲，只对当前实例生效 */
+    private fun retainBuffer(handle: Long, mem: com.sun.jna.Memory) {
+        val queue = returnedBuffers.computeIfAbsent(handle) { java.util.ArrayDeque() }
+        synchronized(queue) {
+            queue.addLast(mem)
+            while (queue.size > MAX_RETAINED_BUFFERS) queue.removeFirst()
+        }
+    }
 
     actual fun create(): Long = lib.lb_create()
 
     actual fun destroy(handle: Long) {
         hostCallbacks.remove(handle)
-        // runtime 已销毁，native 不会再读这些缓冲，可以放手让 GC 回收
-        returnedBuffers.clear()
+        // 只释放本实例的缓冲，其它插件的运行时不受影响
+        returnedBuffers.remove(handle)
         lib.lb_destroy(handle)
     }
 
@@ -178,9 +194,8 @@ internal actual object JsNativeBridge {
                         mem.write(0, bytes, 0, bytes.size)
                         mem.setByte(bytes.size.toLong(), 0)
                         // 这块内存是 JVM 托管的 Memory，native 侧**不得** free。
-                        // 为让它活到 native 读完，登记到本次回调的持有表里，
-                        // 由下一次回调或 runtime 销毁时统一丢弃。
-                        returnedBuffers.add(mem)
+                        // 为让它活到 native 读完，登记到**本实例**的持有表里
+                        retainBuffer(handle, mem)
                         Pointer.nativeValue(mem)
                     } catch (t: Throwable) {
                         val nameText = runCatching { name.getString(0, "UTF-8") }.getOrDefault("<未知>")

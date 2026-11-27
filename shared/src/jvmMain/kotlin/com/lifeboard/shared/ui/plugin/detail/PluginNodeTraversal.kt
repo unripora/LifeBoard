@@ -27,6 +27,14 @@ fun collectBindingRefs(root: PluginNode?): Set<BindingRef> {
             is com.lifeboard.plugin.api.ListNode -> {
                 (node.items as? Bound.Ref)?.let { it.ref.toRefOrNull()?.let(refs::add) }
                 (node.items as? Bound.Static)?.value?.forEach { item -> item.forEach(::visit) }
+                // 整行点击的回传标识不参与「要不要装配数据源」的判定，
+                // 所以这里只收绑定，不收 actionId
+            }
+            is com.lifeboard.plugin.api.ChatNode -> {
+                node.messages.addRefTo(refs)
+            }
+            is com.lifeboard.plugin.api.PickerNode -> {
+                node.candidates.addRefTo(refs)
             }
             else -> Unit
         }

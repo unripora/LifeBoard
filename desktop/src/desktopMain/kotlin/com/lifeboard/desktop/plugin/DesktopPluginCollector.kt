@@ -8,6 +8,7 @@ import com.lifeboard.plugin.api.FetchResult
 import com.lifeboard.plugin.api.SourceRef
 import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.shared.plugin.host.HostPluginContext
+import com.lifeboard.shared.plugin.js.JsTypeConverter
 import com.lifeboard.shared.repository.MetricStore
 import com.lifeboard.shared.repository.model.MetricMeta
 import kotlinx.coroutines.CancellationException
@@ -163,21 +164,59 @@ class DesktopPluginCollector(
             }
 
             is FetchResult.TemporaryFailure -> {
-                markHealth(entry, healthy = false, message = "暂时取不到：${result.message}")
+                val error = JsTypeConverter.errorOf(result)
+                markHealth(entry, healthy = false, message = describeFailure(result.message, error))
+                AppLogger.warn("插件 ${entry.pluginId} 暂时取不到：${error.describeOrFallback()}")
                 false
             }
 
             is FetchResult.AuthenticationRequired -> {
-                markHealth(entry, healthy = false, message = "登录已失效，请重新登录")
+                val error = JsTypeConverter.errorOf(result)
+                // 认证三类必须分开：REQUIRED 是首次登录、INVALID 要用户重填、
+                // EXPIRED 可能自愈。混成一句「登录已失效」会让用户做多余操作
+                val message = when (error?.code) {
+                    com.lifeboard.plugin.api.PluginErrorCode.AUTH_INVALID -> "账号或凭据无效，请重新登录"
+                    com.lifeboard.plugin.api.PluginErrorCode.AUTH_EXPIRED -> "登录已过期，可能需要重新登录"
+                    else -> "尚未登录，请先登录"
+                }
+                markHealth(entry, healthy = false, message = message)
+                AppLogger.warn("插件 ${entry.pluginId} 认证问题：${error.describeOrFallback()}")
                 false
             }
 
             is FetchResult.Failure -> {
-                markHealth(entry, healthy = false, message = result.message.ifBlank { "采集失败" })
+                val error = JsTypeConverter.errorOf(result)
+                markHealth(entry, healthy = false, message = describeFailure(result.message, error))
+                AppLogger.warn("插件 ${entry.pluginId} 采集失败：${error.describeOrFallback()}")
                 false
             }
         }
     }
+
+    /** 错误对象可空时给出一句可入日志的描述 */
+    private fun com.lifeboard.plugin.api.PluginError?.describeOrFallback(): String =
+        this?.diagnosticText() ?: "code=INTERNAL_ERROR（旧插件未提供错误码）"
+
+    /**
+     * 把错误码转成面向用户的说明。
+     *
+     * 原则：用户能自己修的说清「他要做什么」，需要等的不催他去登录，
+     * 需要更新插件的明说「更新插件」而不是「稍后再试」。
+     */
+    private fun describeFailure(message: String, error: com.lifeboard.plugin.api.PluginError?): String =
+        when (error?.code) {
+            com.lifeboard.plugin.api.PluginErrorCode.UPSTREAM_CHANGED ->
+                "接口格式可能已变化，请更新插件（${message.ifBlank { "重试无用" }}）"
+            com.lifeboard.plugin.api.PluginErrorCode.RATE_LIMITED ->
+                "请求过于频繁，稍后会自动重试（${message.ifBlank { "已限流" }}）"
+            com.lifeboard.plugin.api.PluginErrorCode.UPSTREAM_ERROR ->
+                "网络或上游暂时不可用：${message.ifBlank { "稍后重试" }}"
+            com.lifeboard.plugin.api.PluginErrorCode.STORAGE_FULL ->
+                "本地存储空间不足：${message.ifBlank { "请清理数据" }}"
+            com.lifeboard.plugin.api.PluginErrorCode.UNSUPPORTED ->
+                "宿主缺少所需能力：${message.ifBlank { "请更新应用或插件" }}"
+            else -> message.ifBlank { "采集失败" }
+        }
 
     /**
      * 把插件声明的指标元数据写进 `metric_meta`。

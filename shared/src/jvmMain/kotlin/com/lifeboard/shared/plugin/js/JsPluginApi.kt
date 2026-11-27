@@ -62,10 +62,32 @@ object JsPluginApi {
      *    （事件型指标的即时累加上报）；`ctx.stream.emit` 的函数保留但**详情页不再
      *    显示它的产物**——旧的「往最后一个消息列表里追加」逻辑随固定区块一起删除。
      *
+     * 5：**节点契约的破坏性修订**（这是 [CAPABILITIES] 里唯一一次真正的破坏，
+     *    见下方「为什么 v5 破例递增」）。
+     *    - 新增节点 `chat`（对话流，宿主负责角色区分/合并/流式光标）与
+     *      `picker`（从动态清单里弹层选择）
+     *    - `text.card`：是否套卡片；`list.itemActionId` / `list.itemPayloads`：
+     *      整行可点；`select.selectedValues`：受控选区；`select.options[].payload`
+     *    - **删除 `code.language`**：宿主不做语法高亮，保留字段等于契约说谎
+     *    - `chatMessage` 新增 `id` / `turnId`，用于去重与轮次分组
+     *    - 新绑定源 `sessionList`（`sessionList:items`）；`session` 源新增
+     *      `turnState` 字段；`session:<key>:*` 的 `<key>` 现在是**真正的会话标识**
+     *      （旧宿主忽略它，只认第一条会话）
+     *
+     * ## 为什么 v5 破例递增（删字段 + 改语义）
+     *
+     * 本类原有规则是「只有破坏性变更才递增」。v5 恰好就是一次破坏性变更：
+     * `code.language` 被删除、`session` 的 key 语义从「忽略」改为「按 key 隔离」。
+     * 但**宿主并不新增 `apiVersion` 的读取点**（见 `refactor_plugin_ui_primitive_tree`
+     * 决策 5），所以这里的 CURRENT 只是契约声明，用于文档与代码内对照；
+     * 真正让旧包暴露问题的机制是「旧包返回旧结构 → 解析器不认 → 渲染成
+     * 「此版本暂不支持」占位」。因此发布时必须同步重新打包内置插件并递增
+     * `versionCode`，并在发布说明里写明「旧插件包需重新安装」。
+     *
      * 注意：[com.lifeboard.plugin.api.PluginApi.VERSION] 与这里的 [CURRENT] 是两套，
      * 不要拿来互相比较——前者描述编译期契约，后者描述宿主注入的函数集。
      */
-    const val CURRENT: Int = 4
+    const val CURRENT: Int = 5
 
     /**
      * 未声明 `apiVersion` 时按这一版处理。
@@ -118,6 +140,15 @@ object JsPluginApi {
                 "audio / video（媒体本期降级为占位）",
             "绑定点 Bound<T>：{binding:'<source>:<key>:<field>'}，本期数据源只有 session",
             "ctx.report",
+        ),
+        5 to listOf(
+            "新节点 chat（对话流）与 picker（从清单里弹层选择）",
+            "text.card",
+            "list.itemActionId / list.itemPayloads",
+            "select.selectedValues / select.options[].payload",
+            "chatMessage.id / chatMessage.turnId",
+            "绑定源 sessionList（sessionList:items）；session 源新增 turnState",
+            "删除 code.language（宿主不做语法高亮，保留字段会误导）",
         ),
     )
 

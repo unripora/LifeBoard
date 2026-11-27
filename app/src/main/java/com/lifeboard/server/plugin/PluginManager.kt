@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import com.lifeboard.plugin.api.ActionResult
 import com.lifeboard.plugin.api.AuthState
+import com.lifeboard.plugin.api.LoginOptions
 import com.lifeboard.plugin.api.LoginResult
 import com.lifeboard.plugin.api.SessionAction
 import com.lifeboard.plugin.api.SessionConfig
@@ -325,12 +326,14 @@ object PluginManager {
      * [JsPluginLoader] 拿到手。UI 不应该知道这两件事。
      *
      * @param inputs 上一轮 [LoginResult.NeedInput] 要用户填的值
+     * @param options 可选的登录意图；缺省沿用旧空表单语义
      * @return 插件本轮结果；插件不存在或未信任时返回可展示的失败
      */
     suspend fun login(
         context: Context,
         pluginId: String,
         inputs: Map<String, String> = emptyMap(),
+        options: LoginOptions? = null,
     ): LoginResult {
         val appContext = context.applicationContext
         val plugin = findPlugin(appContext, pluginId)
@@ -346,7 +349,7 @@ object PluginManager {
         // 直接在调用方线程（通常是主线程）跑会把界面卡到超时。
         return withContext(Dispatchers.IO) {
             runCatching {
-                plugin.plugin.login(HostPluginContext(pluginId, appContext), inputs)
+                plugin.plugin.login(HostPluginContext(pluginId, appContext), inputs, options)
             }.getOrElse { e ->
                 LoginResult.Failure("插件登录时出错：${e.message ?: e::class.simpleName}")
             }

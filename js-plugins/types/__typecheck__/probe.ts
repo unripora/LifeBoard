@@ -10,7 +10,9 @@
 
 /// <reference path="../index.d.ts" />
 
-import type { UiNode } from '../index.js';
+// 具名类型从契约声明文件导入（它是模块）；裸 `ctx` 与其余契约类型由
+// `../index.d.ts` 的全局声明提供——那份文件刻意不是模块，见其说明。
+import type { ChatMessage, PickerCandidate, UiNode } from '../plugin-contract.js';
 
 /** 构造一个详情页状态卡，验证节点联合类型的写法。 */
 export function statusCard(label: string, value: string): UiNode {
@@ -20,7 +22,7 @@ export function statusCard(label: string, value: string): UiNode {
 /**
  * 验证绑定写法能被类型系统接受，且静态值与绑定可以共用同一套节点类型。
  *
- * 会话界面就是这么拼的：消息列表与输入框各是一个普通节点，
+ * 会话界面就是这么拼的：对话流与选择器各是一个普通节点，
  * 数据由 `binding` 指向宿主数据源。
  */
 export function sessionView(): UiNode {
@@ -28,10 +30,12 @@ export function sessionView(): UiNode {
         type: 'column',
         children: [
             {
-                type: 'list',
+                type: 'chat',
+                selfName: '我',
+                peerName: '助手',
                 maxHeightDp: 320,
                 emptyHint: '还没有消息',
-                items: { binding: 'session:main:messages' },
+                messages: { binding: 'session:main:messages' },
             },
             {
                 type: 'input',
@@ -40,9 +44,129 @@ export function sessionView(): UiNode {
                 submitTo: 'session:main',
                 enabled: { binding: 'session:main:inputEnabled' },
             },
-            { type: 'text', emphasis: 'caption', body: { binding: 'session:main:status' } },
+            {
+                type: 'text',
+                emphasis: 'caption',
+                // 嵌在对话下方的状态说明不套卡片，避免两层边框
+                card: false,
+                body: { binding: 'session:main:status' },
+            },
         ],
     };
+}
+
+/**
+ * 验证清单选择器的写法：候选来自宿主数据源，选中态由插件回传。
+ *
+ * 这里同时钉住三件事：
+ * 1. `sessionList::items` 是**中间段留空**的三段式（清单源没有实例 key）；
+ * 2. `selectedIds` 让树重建后选中态不丢；
+ * 3. 单选回传候选 id、多选回传 JSON 数组。
+ */
+export function sessionPickerView(currentSession: string, selected: string[]): UiNode {
+    return {
+        type: 'column',
+        card: false,
+        children: [
+            {
+                type: 'picker',
+                actionId: 'switchSession',
+                title: '选择会话',
+                mode: 'modal',
+                selectedIds: selected,
+                emptyHint: '还没有历史会话',
+                candidates: { binding: 'sessionList::items' },
+            },
+            {
+                type: 'text',
+                emphasis: 'caption',
+                body: `当前会话：${currentSession}`,
+            },
+        ],
+    };
+}
+
+/** 验证对话节点的静态历史记录写法（含轮次与流式标记）。 */
+export function staticChatView(): UiNode {
+    return {
+        type: 'chat',
+        showTime: true,
+        messages: [
+            { role: 'user', text: '你好', id: 'm1', turnId: 't1', timeLabel: '10:00' },
+            { role: 'assistant', text: '在的', id: 'm2', turnId: 't1' },
+            { role: 'assistant', text: '你问的是……', id: 'm3', turnId: 't1', pending: true },
+            { role: 'system', text: '会话已恢复' },
+        ],
+    };
+}
+
+/** 验证列表整行点击与受控选区的新字段能被类型系统接受。 */
+export function listAndSelectView(selectedValues: string[]): UiNode {
+    return {
+        type: 'column',
+        children: [
+            {
+                type: 'list',
+                itemActionId: 'openRecord',
+                itemPayloads: ['2026-11-26#1', '2026-11-26#2'],
+                items: [
+                    [{ type: 'text', card: false, body: '第一条' }],
+                    [{ type: 'text', card: false, body: '第二条' }],
+                ],
+            },
+            {
+                type: 'select',
+                actionId: 'pickTag',
+                label: '标签',
+                multiple: true,
+                submitLabel: '确定',
+                selectedValues,
+                options: [
+                    { value: 'a', label: 'A', payload: '{"id":1}' },
+                    { value: 'b', label: 'B' },
+                ],
+            },
+        ],
+    };
+}
+
+/**
+ * 反向探针：v5 改动的字段写错时必须报错。
+ *
+ * 这些都不是「用法偏好」，而是**契约本身已经变了**：
+ * `code.language` 被删除、`picker` 必须有 `actionId`、候选必须有 `id`。
+ * 没有这些断言，插件作者会照着旧文档写出一个编译通过、运行时静默失效的界面。
+ *
+ * ## 为什么不用 `@ts-expect-error` 挂在对象字面量上
+ *
+ * 对象字面量赋给联合类型时，TS 不做多余属性检查（`language` 这类字段
+ * 会静默通过）。所以这里用**函数签名**做反证：真正能被赋值进契约的类型
+ * 才能通过，多带字段就不行。这比依赖字面量的行为更可靠。
+ */
+export function mustNotCompileNodes(): void {
+    // @ts-expect-error v5 起 code 不再有 language（宿主不做语法高亮）
+    const badCode: Extract<UiNode, { type: 'code' }> = { type: 'code', code: 'x', language: 'kotlin' };
+    void badCode;
+
+    // @ts-expect-error picker 的 actionId 必填：没有它点了也没人认
+    const badPicker: Extract<UiNode, { type: 'picker' }> = { type: 'picker', candidates: [] };
+    void badPicker;
+
+    // @ts-expect-error 候选必须有 id
+    const badCandidate: PickerCandidate = { label: '缺少 id' };
+    void badCandidate;
+
+    // @ts-expect-error 候选只允许语义字段，不能嵌任意节点
+    const badCandidateNode: PickerCandidate = { id: 's1', label: '会话', node: { type: 'text' } };
+    void badCandidateNode;
+
+    // @ts-expect-error mode 只有 modal / inline
+    const badMode: Extract<UiNode, { type: 'picker' }> = { type: 'picker', actionId: 'x', mode: 'popup' };
+    void badMode;
+
+    // @ts-expect-error 消息 role 只有 user / assistant / system
+    const badMessage: ChatMessage = { role: 'robot', text: '?' };
+    void badMessage;
 }
 
 /** 验证 ctx 的能力都在声明里，且参数顺序与宿主一致。 */

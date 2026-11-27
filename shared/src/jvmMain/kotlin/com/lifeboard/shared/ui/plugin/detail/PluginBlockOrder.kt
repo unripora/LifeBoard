@@ -3,6 +3,7 @@ package com.lifeboard.shared.ui.plugin.detail
 import com.lifeboard.plugin.api.AudioNode
 import com.lifeboard.plugin.api.ButtonNode
 import com.lifeboard.plugin.api.ChartNode
+import com.lifeboard.plugin.api.ChatNode
 import com.lifeboard.plugin.api.CodeNode
 import com.lifeboard.plugin.api.CollapsibleNode
 import com.lifeboard.plugin.api.ColumnNode
@@ -12,6 +13,7 @@ import com.lifeboard.plugin.api.InputNode
 import com.lifeboard.plugin.api.KeyValueNode
 import com.lifeboard.plugin.api.ListNode
 import com.lifeboard.plugin.api.PluginNode
+import com.lifeboard.plugin.api.PickerNode
 import com.lifeboard.plugin.api.ProgressNode
 import com.lifeboard.plugin.api.RowNode
 import com.lifeboard.plugin.api.SelectNode
@@ -61,17 +63,21 @@ fun nodeKey(node: PluginNode, index: Int): String =
  * 是否允许拖动。
  *
  * 两条规则：
- * 1. 交互节点（输入、审批式的选择、按钮）的位置跟上下文强绑定——
- *    把「正在等的输入框」单独拖走，用户就找不到它在等什么了。
+ * 1. 交互节点（输入、选择、清单选择器、按钮）的位置跟上下文强绑定——
+ *    把「正在等的输入框」或「当前会话选择器」单独拖走，用户就找不到
+ *    它在等什么 / 在切什么了。
  * 2. 插件可以显式用 `locked` 锁定某个节点（例如紧贴图表的说明文字）。
  *
  * 注意容器（[ColumnNode] / [RowNode] / [CollapsibleNode]）**可以**拖：
  * 整块搬走是合理需求。只有根节点的直接子节点参与排序，容器内部的
  * children 不参与——嵌套排序需要为每个容器维护独立顺序偏好，
  * 设置项会指数膨胀，且插件每次调整结构都会让保存的顺序错位。
+ *
+ * [ChatNode] **可以**拖：它是一块内容，不产生回传，搬走不影响语义。
  */
 fun isReorderableNode(node: PluginNode): Boolean =
-    !node.locked && node !is InputNode && node !is SelectNode && node !is ToggleNode
+    !node.locked && node !is InputNode && node !is SelectNode &&
+        node !is ToggleNode && node !is PickerNode
 
 /** 可拖动节点在根 children 中的下标，按原顺序 */
 fun reorderableIndices(children: List<PluginNode>): List<Int> =
@@ -172,4 +178,8 @@ private fun nodeTypeTag(node: PluginNode): String = when (node) {
     is UnsupportedNode -> "unsupported"
     is AudioNode -> "audio"
     is VideoNode -> "video"
+    // v5 新增：只能追加。`chat` / `picker` 是本轮才有的类型，
+    // 历史上不存在以这两个词为 key 的旧偏好，因此不会与任何历史 key 冲突
+    is ChatNode -> "chat"
+    is PickerNode -> "picker"
 }

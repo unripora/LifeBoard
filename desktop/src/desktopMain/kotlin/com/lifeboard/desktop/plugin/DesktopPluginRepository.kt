@@ -5,6 +5,7 @@ import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.shared.platform.PendingPlugin
 import com.lifeboard.shared.platform.PluginList
 import com.lifeboard.shared.platform.PluginSummary
+import com.lifeboard.shared.platform.SessionKeepAlive
 import com.lifeboard.shared.plugin.PluginIdentity
 import com.lifeboard.shared.plugin.PluginPackageInfo
 import com.lifeboard.shared.plugin.PluginTrust
@@ -69,7 +70,12 @@ class DesktopPluginRepository(
 
     private val trustStore = PluginTrustStore(settings)
 
-    private val loader = JsPluginLoader(fileSystem, trustStore)
+    private val loader = JsPluginLoader(fileSystem, trustStore).apply {
+        // 运行时生命周期开关：**默认关闭**，与改造前行为一致。
+        // 开启需要专项测试与真机验证通过（见任务 P_plan 的 B7/9.2）。
+        lazyInstantiation = settings.getBoolean(KEY_LAZY, false)
+        if (settings.getBoolean(KEY_EVICT, false)) setEvictionEnabled(true)
+    }
 
     /**
      * 卸载/清空数据时用。私有目录的位置是桌面端独一无二的（`~/.lifeboard/plugins/<id>`），
@@ -168,6 +174,23 @@ class DesktopPluginRepository(
     fun plugins(): List<LoadedEntry> {
         if (loaded.isEmpty() && !initialized) refresh()
         return loaded
+    }
+
+    /**
+     * 会话存续期间的保活句柄（供 [com.lifeboard.shared.platform.PluginInvoker] 转发）。
+     *
+     * 未开启按需加载时返回 `null`：那时实例本来就不会被自动回收，
+     * 再挂一个租约只会让「会话结束后实例常驻」这个副作用变长。
+     */
+    fun sessionKeepAlive(pluginId: String): SessionKeepAlive? {
+        if (!loader.lazyInstantiation) return null
+        val lease = loader.acquireSessionLease(pluginId) ?: return null
+        return object : SessionKeepAlive {
+            override suspend fun <R> withPlugin(block: suspend () -> R): R? =
+                lease.withPluginSuspend { block() }
+
+            override fun release() = lease.release()
+        }
     }
 
     fun pendingPlugins(): List<PendingJsPlugin> {
@@ -443,6 +466,14 @@ class DesktopPluginRepository(
 
     /** 上一次安装挂起的覆盖请求 */
     private data class StagedConflict(val file: File, val targetName: String)
+
+    private companion object {
+        /** 是否启用「扫描不实例化、首次调用才加载」。默认关闭 */
+        const val KEY_LAZY = "plugin.runtime.lazy"
+
+        /** 是否启用空闲回收。默认关闭，需真机验证后再开 */
+        const val KEY_EVICT = "plugin.runtime.evict"
+    }
 }
 
 /**

@@ -610,15 +610,13 @@ async function followSession(gateway, sessionId, handlers) {
     }
   });
   let closed = false;
-  let lastDelta = "";
+  const state = { attemptId: null, nextIndex: 0, revision: -1 };
   void (async () => {
     try {
       for (; ; ) {
         const value = await stream.next();
         if (closed) return;
-        handleFollowFrame(value, handlers, () => lastDelta, (next) => {
-          lastDelta = next;
-        });
+        handleFollowFrame(value, handlers, state);
       }
     } catch (error) {
       if (closed) return;
@@ -637,7 +635,7 @@ async function followSession(gateway, sessionId, handlers) {
     }
   };
 }
-function handleFollowFrame(value, handlers, readDelta, writeDelta) {
+function handleFollowFrame(value, handlers, state) {
   if (typeof value !== "object" || value === null) return;
   const frame = value;
   if (frame.type === "snapshot") {
@@ -647,14 +645,36 @@ function handleFollowFrame(value, handlers, readDelta, writeDelta) {
       const message = readEventMessage(record);
       if (message !== null) messages.push(message);
     }
-    handlers.onSnapshot(messages, readRunning(frame));
+    handlers.onSnapshot(messages);
+    const baseline = asRecord(frame.assistantStream);
+    state.revision = typeof baseline?.revision === "number" ? baseline.revision : -1;
+    const attempt = asRecord(baseline?.activeAttempt);
+    state.attemptId = typeof attempt?.attemptId === "string" ? attempt.attemptId : null;
+    state.nextIndex = typeof attempt?.nextIndex === "number" ? attempt.nextIndex : 0;
+    if (state.attemptId !== null) {
+      handlers.onTurnStart();
+      handlers.onAttemptReset();
+      for (const raw of Array.isArray(attempt?.stream) ? attempt.stream : []) {
+        const record = asRecord(raw);
+        if (record?.type === "text-chunks" && Array.isArray(record.texts)) {
+          for (const text of record.texts) if (typeof text === "string") handlers.onDelta(text);
+        } else if (record?.type === "chunk") {
+          const text = readChunkText(record.chunk);
+          if (text.length > 0) handlers.onDelta(text);
+        }
+      }
+    }
     return;
   }
   if (frame.type === "event") {
     const event = readEventObject(frame);
     if (event === null) return;
+    if (event.type === "turn/start") {
+      handlers.onTurnStart();
+      return;
+    }
     if (event.type === "turn/end") {
-      writeDelta("");
+      state.attemptId = null;
       const failure = readTurnEndError(event);
       if (failure !== null) handlers.onError(failure);
       handlers.onTurnEnd();
@@ -668,26 +688,28 @@ function handleFollowFrame(value, handlers, readDelta, writeDelta) {
     const inner = frame.frame;
     if (typeof inner !== "object" || inner === null) return;
     const f = inner;
+    if (typeof f.revision !== "number" || f.revision <= state.revision) return;
+    if (typeof f.attemptId !== "string") return;
     if (f.type === "start") {
-      writeDelta("");
+      state.revision = f.revision;
+      state.attemptId = f.attemptId;
+      state.nextIndex = 0;
+      handlers.onTurnStart();
+      handlers.onAttemptReset();
       return;
     }
+    if (f.attemptId !== state.attemptId || f.index !== state.nextIndex) return;
+    state.revision = f.revision;
     if (f.type === "chunk") {
+      state.nextIndex += 1;
       const text = readChunkText(f.chunk);
-      if (text.length === 0) return;
-      const sent = readDelta();
-      if (text.startsWith(sent)) {
-        const delta = text.slice(sent.length);
-        writeDelta(text);
-        if (delta.length > 0) handlers.onDelta(delta);
-      } else {
-        handlers.onDelta(text);
-        writeDelta(sent + text);
+      if (text.length > 0) handlers.onDelta(text);
+    } else if (f.type === "end") {
+      state.attemptId = null;
+      const outcome = asRecord(f.outcome);
+      if (outcome?.kind !== "committed" || outcome.eventType !== "assistant/message") {
+        handlers.onAttemptReset();
       }
-      return;
-    }
-    if (f.type === "end") {
-      writeDelta("");
     }
   }
 }
@@ -699,13 +721,8 @@ function readEventObject(raw) {
   if (typeof event !== "object" || event === null || Array.isArray(event)) return null;
   return event;
 }
-function readRunning(snapshot) {
-  if (snapshot.running === true) return true;
-  const header = snapshot.header;
-  if (typeof header === "object" && header !== null) {
-    if (header.running === true) return true;
-  }
-  return false;
+function asRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : null;
 }
 function readTurnEndError(event) {
   const data = event.data;
@@ -730,9 +747,12 @@ function readEventMessage(raw) {
   const role = type === "user/message" ? "user" : type === "assistant/message" ? "assistant" : type === "system/message" ? "system" : null;
   if (role === null) return null;
   const data = typeof event.data === "object" && event.data !== null ? event.data : {};
-  const text = readMessageText(data.message);
+  const text = readMessageText(data.message ?? data);
   if (text.length === 0) return null;
-  return { role, text };
+  const body = asRecord(data.message) ?? data;
+  const source = asRecord(body.source);
+  const rpcId = typeof source?.rpcId === "string" ? source.rpcId : void 0;
+  return { role, text, rpcId };
 }
 function readMessageText(raw) {
   if (typeof raw !== "object" || raw === null) return "";
@@ -762,13 +782,249 @@ function readChunkText(raw) {
   return typeof chunk.text === "string" ? chunk.text : "";
 }
 
+// dsh/conversation.ts
+var Conversation = class {
+  constructor(emit) {
+    this.emit = emit;
+    this.messages = [];
+    this.localRequests = /* @__PURE__ */ new Set();
+    this.buffer = "";
+  }
+  snapshot(messages) {
+    this.messages = messages.slice(-500);
+    this.buffer = "";
+    this.replay();
+  }
+  submitted(requestId, text) {
+    this.localRequests.add(requestId);
+    if (this.localRequests.size > 500) {
+      const oldest = this.localRequests.values().next().value;
+      if (oldest !== void 0) this.localRequests.delete(oldest);
+    }
+    this.remember({ role: "user", text });
+  }
+  message(message) {
+    if (message.role === "user" && message.rpcId !== void 0 && this.localRequests.has(message.rpcId)) return;
+    this.remember(message);
+    if (message.role === "assistant" && this.buffer.length > 0) {
+      this.buffer = "";
+      this.replay();
+    } else {
+      this.emit({ type: "message", role: message.role, text: message.text });
+    }
+  }
+  delta(text) {
+    this.buffer += text;
+    if (text.length > 0) this.emit({ type: "delta", text });
+  }
+  resetAttempt() {
+    if (this.buffer.length === 0) return;
+    this.buffer = "";
+    this.replay();
+  }
+  remember(message) {
+    this.messages.push(message);
+    if (this.messages.length > 500) this.messages.shift();
+  }
+  replay() {
+    this.emit({ type: "clear" });
+    for (const message of this.messages) {
+      this.emit({ type: "message", role: message.role, text: message.text });
+    }
+  }
+};
+
+// dsh/detailView.ts
+function buildDetailUi(bridge) {
+  if (!bridge.isPaired()) {
+    return {
+      type: "column",
+      children: [
+        {
+          type: "column",
+          card: true,
+          title: "\u8FD8\u6CA1\u6709\u8FDE\u63A5\u7535\u8111",
+          children: [
+            {
+              type: "text",
+              card: false,
+              body: "\u8BF7\u5148\u5728\u63D2\u4EF6\u5217\u8868\u91CC\u5B8C\u6210\u914D\u5BF9\uFF08\u9700\u8981\u7535\u8111\u7AEF dsh-mobile \u751F\u6210\u7684\u914D\u5BF9\u94FE\u63A5\uFF09\uFF0C\u518D\u56DE\u5230\u8FD9\u91CC\u5BF9\u8BDD\u3002"
+            }
+          ]
+        }
+      ]
+    };
+  }
+  const pendingKey = bridge.pendingSwitchKey();
+  const currentId = pendingKey.length > 0 ? bridge.sessionIdOf(pendingKey) : bridge.selectedSessionId();
+  const currentKey = currentId.length > 0 ? bridge.sessionKeyOf(currentId) : "";
+  const connected = bridge.isConnected();
+  const header = [
+    {
+      type: "statusCard",
+      id: "conn",
+      label: bridge.hostLabel(),
+      value: connected ? "\u5DF2\u8FDE\u63A5" : "\u672A\u8FDE\u63A5",
+      tone: connected ? "ok" : "neutral",
+      detail: currentId.length > 0 ? `\u4F1A\u8BDD ${currentId.slice(0, 8)}` : "\u5C1A\u672A\u9009\u62E9\u4F1A\u8BDD"
+    }
+  ];
+  const failure = bridge.lastFailure();
+  if (failure !== null) {
+    header.push({
+      type: "text",
+      card: false,
+      emphasis: "caption",
+      tone: "warn",
+      body: `\u4E0A\u6B21\u8FDE\u63A5\u5931\u8D25\uFF1A${failure}`
+    });
+  }
+  const sessions = bridge.cachedSessions();
+  const picker = sessions.length > 0 ? [{
+    type: "picker",
+    id: "sessionPicker",
+    actionId: "dsh.selectSession",
+    title: "\u9009\u62E9\u4F1A\u8BDD",
+    mode: "modal",
+    selectedIds: currentId.length > 0 ? [bridge.sessionKeyOf(currentId)] : [],
+    emptyHint: "\u70B9\u300C\u5237\u65B0\u4F1A\u8BDD\u300D\u62C9\u53D6\u7535\u8111\u4E0A\u7684\u5BF9\u8BDD",
+    candidates: sessions.map(toCandidate(bridge))
+  }] : [{
+    type: "text",
+    card: false,
+    emphasis: "caption",
+    body: "\u8FD8\u6CA1\u6709\u4F1A\u8BDD\u6E05\u5355\uFF0C\u70B9\u4E0B\u65B9\u300C\u5237\u65B0\u4F1A\u8BDD\u300D\u3002"
+  }];
+  const conversation2 = currentKey.length > 0 ? [
+    {
+      type: "chat",
+      id: "messages",
+      // 固定高度让对话区自己滚，输入框稳定在下方
+      maxHeightDp: 360,
+      selfName: "\u6211",
+      peerName: "\u7535\u8111",
+      emptyHint: "\u8FDE\u63A5\u540E\u5728\u8FD9\u91CC\u5BF9\u8BDD",
+      messages: { binding: "session:" + currentKey + ":messages" }
+    },
+    {
+      type: "text",
+      id: "sessionStatus",
+      card: false,
+      emphasis: "caption",
+      body: { binding: "session:" + currentKey + ":status" }
+    },
+    {
+      type: "input",
+      id: "send",
+      actionId: "dsh.send",
+      placeholder: "\u7ED9\u7535\u8111\u53D1\u6307\u4EE4\u2026",
+      submitLabel: "\u53D1\u9001",
+      submitTo: "session:" + currentKey,
+      enabled: { binding: "session:" + currentKey + ":inputEnabled" }
+    }
+  ] : [{
+    type: "text",
+    card: false,
+    emphasis: "caption",
+    body: currentId.length > 0 ? "\u6B63\u5728\u8FDE\u63A5\u4F1A\u8BDD\u2026" : "\u5148\u5728\u4E0A\u9762\u9009\u4E00\u4E2A\u4F1A\u8BDD\uFF0C\u6216\u70B9\u300C\u5237\u65B0\u4F1A\u8BDD\u300D\u62C9\u53D6\u6E05\u5355\u3002"
+  }];
+  return {
+    type: "column",
+    children: [
+      { type: "column", card: true, id: "status", children: header },
+      ...picker,
+      ...conversation2,
+      {
+        type: "row",
+        id: "actions",
+        children: [
+          { type: "button", actionId: "dsh.refreshSessions", label: "\u5237\u65B0\u4F1A\u8BDD" }
+        ]
+      }
+    ]
+  };
+}
+async function handleDetailAction(bridge, actionId, value) {
+  if (actionId === "dsh.refreshSessions") {
+    const ok = await refreshSessionList(bridge);
+    if (!ok) {
+      return { type: "showMessage", text: bridge.lastFailure() ?? "\u62C9\u53D6\u4F1A\u8BDD\u6E05\u5355\u5931\u8D25" };
+    }
+    return { type: "refreshUi", root: buildDetailUi(bridge) };
+  }
+  if (actionId === "dsh.selectSession") {
+    const key = (value ?? "").trim();
+    const nextId = bridge.sessionIdOf(key);
+    if (nextId.length === 0) {
+      return { type: "showMessage", text: "\u6CA1\u80FD\u8BC6\u522B\u6240\u9009\u4F1A\u8BDD\uFF0C\u8BF7\u5237\u65B0\u5217\u8868\u540E\u91CD\u8BD5" };
+    }
+    ctx.log.i("dsh", `\u5207\u6362\u5230\u4F1A\u8BDD ${nextId.slice(0, 8)}`);
+    bridge.setPendingSwitchKey(key);
+    bridge.setSelectedSessionId(nextId);
+    return { type: "refreshUi", root: buildDetailUi(bridge) };
+  }
+  return {
+    type: "showMessage",
+    text: value === void 0 ? "\u672A\u77E5\u64CD\u4F5C" : `\u5DF2\u5FFD\u7565\uFF1A${actionId}`
+  };
+}
+async function refreshSessionList(bridge) {
+  try {
+    const sessions = await bridge.fetchSessions();
+    bridge.setCachedSessions(collectVisibleSessions(sessions));
+    bridge.setLastFailure(null);
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    bridge.setLastFailure(message);
+    ctx.log.w("dsh", `\u62C9\u53D6\u4F1A\u8BDD\u6E05\u5355\u5931\u8D25\uFF1A${message}`);
+    return false;
+  }
+}
+function collectVisibleSessions(sessions) {
+  return sessions.filter((s) => s.origin === void 0 || s.origin !== "subagent").sort((a, b) => b.updatedAt - a.updatedAt);
+}
+function toCandidate(bridge) {
+  return (session) => {
+    const flags = [];
+    if (session.running) flags.push("\u8FD0\u884C\u4E2D");
+    if (!session.agentAvailable) flags.push("\u7535\u8111\u672A\u5728\u7EBF");
+    if (session.blank) flags.push("\u7A7A\u4F1A\u8BDD");
+    return {
+      id: bridge.sessionKeyOf(session.sessionId),
+      label: sessionLabel(session),
+      detail: flags.join(" \xB7 "),
+      tone: session.agentAvailable ? "neutral" : "warn",
+      disabled: !session.agentAvailable
+    };
+  };
+}
+function sessionLabel(session) {
+  const short = session.sessionId.slice(0, 8);
+  return session.cwd !== void 0 && session.cwd.length > 0 ? cwdName(session.cwd) + " \xB7 " + short : short;
+}
+function cwdName(cwd) {
+  const parts = cwd.split(/[\\/]+/).filter((p) => p.length > 0);
+  return parts.length > 0 ? parts[parts.length - 1] : cwd;
+}
+
 // dsh/contract.ts
-var SESSION_ID = "main";
+var SESSION_KEY_PREFIX = "dsh-";
+function sessionKeyOf(sessionId) {
+  return SESSION_KEY_PREFIX + sessionId;
+}
+function sessionIdOf(key) {
+  if (key.startsWith(SESSION_KEY_PREFIX)) return key.slice(SESSION_KEY_PREFIX.length);
+  return "";
+}
 var activeFollow = null;
 var lastFailure = null;
 var pendingPairing = null;
 var selectedSessionId = "";
-var assistantBuffer = "";
+var pendingSwitchKey = "";
+var cachedSessions = [];
+var conversation = null;
+var running = false;
 var caReadyFor = null;
 var caRestore = null;
 async function login(inputs) {
@@ -870,81 +1126,37 @@ function authState() {
 function hostLabel(gateway) {
   return gateway.replace(/^https:\/\//, "");
 }
+var detailBridge = {
+  hostLabel: () => hostLabel(loadPairingOrEmpty()),
+  isPaired: () => loadPairing() !== null,
+  isConnected: () => activeFollow !== null,
+  lastFailure: () => lastFailure,
+  setLastFailure: (message) => {
+    lastFailure = message;
+  },
+  selectedSessionId: () => selectedSessionId,
+  setSelectedSessionId: (id) => {
+    selectedSessionId = id;
+  },
+  pendingSwitchKey: () => pendingSwitchKey,
+  setPendingSwitchKey: (key) => {
+    pendingSwitchKey = key;
+  },
+  cachedSessions: () => cachedSessions,
+  setCachedSessions: applySessionList,
+  fetchSessions: () => withSession((options) => listSessions(options)),
+  sessionKeyOf,
+  sessionIdOf
+};
 function detailUi() {
-  const pairing = loadPairing();
-  if (pairing === null) {
-    return {
-      type: "column",
-      children: [
-        {
-          type: "column",
-          card: true,
-          title: "\u8FD8\u6CA1\u6709\u8FDE\u63A5\u7535\u8111",
-          children: [
-            {
-              type: "text",
-              body: "\u8BF7\u5148\u5728\u63D2\u4EF6\u5217\u8868\u91CC\u5B8C\u6210\u914D\u5BF9\uFF08\u9700\u8981\u7535\u8111\u7AEF dsh-mobile \u751F\u6210\u7684\u914D\u5BF9\u94FE\u63A5\uFF09\uFF0C\u518D\u56DE\u5230\u8FD9\u91CC\u5BF9\u8BDD\u3002"
-            }
-          ]
-        }
-      ]
-    };
-  }
-  const header = [
-    {
-      type: "statusCard",
-      id: "conn",
-      label: hostLabel(pairing.gateway),
-      value: activeFollow !== null ? "\u5DF2\u8FDE\u63A5" : "\u672A\u8FDE\u63A5",
-      tone: activeFollow !== null ? "ok" : "neutral",
-      detail: selectedSessionId.length > 0 ? `\u4F1A\u8BDD ${selectedSessionId.slice(0, 8)}` : "\u5C1A\u672A\u9009\u62E9\u4F1A\u8BDD"
-    }
-  ];
-  if (lastFailure !== null) {
-    header.push({
-      type: "text",
-      emphasis: "caption",
-      tone: "warn",
-      body: `\u4E0A\u6B21\u8FDE\u63A5\u5931\u8D25\uFF1A${lastFailure}`
-    });
-  }
-  return {
-    type: "column",
-    children: [
-      { type: "column", card: true, id: "status", children: header },
-      {
-        type: "list",
-        id: "messages",
-        // 固定高度让消息区自己滚，输入框稳定在下方
-        maxHeightDp: 320,
-        emptyHint: "\u8FDE\u63A5\u540E\u5728\u8FD9\u91CC\u5BF9\u8BDD",
-        items: { binding: "session:" + SESSION_ID + ":messages" }
-      },
-      {
-        type: "text",
-        id: "sessionStatus",
-        emphasis: "caption",
-        body: { binding: "session:" + SESSION_ID + ":status" }
-      },
-      {
-        type: "input",
-        id: "send",
-        actionId: "dsh.send",
-        placeholder: "\u7ED9\u7535\u8111\u53D1\u6307\u4EE4\u2026",
-        submitLabel: "\u53D1\u9001",
-        submitTo: "session:" + SESSION_ID,
-        enabled: { binding: "session:" + SESSION_ID + ":inputEnabled" }
-      }
-    ]
-  };
+  return buildDetailUi(detailBridge);
 }
 async function onAction(actionId, value) {
-  if (actionId === "dsh.refreshSessions") {
-    const sessions = await withSession((options) => listSessions(options));
-    if (sessions.length === 0) return { type: "showMessage", text: "\u7535\u8111\u4E0A\u6CA1\u6709\u53EF\u7528\u4F1A\u8BDD" };
-    return { type: "showMessage", text: `\u53D1\u73B0 ${sessions.length} \u4E2A\u4F1A\u8BDD` };
-  }
-  return { type: "showMessage", text: value === void 0 ? "\u672A\u77E5\u64CD\u4F5C" : `\u5DF2\u5FFD\u7565\uFF1A${actionId}` };
+  return handleDetailAction(detailBridge, actionId, value);
+}
+function loadPairingOrEmpty() {
+  const pairing = loadPairing();
+  return pairing === null ? "" : pairing.gateway;
 }
 function health() {
   if (lastFailure !== null) return { state: "degraded", message: lastFailure };
@@ -1014,7 +1226,7 @@ function resetCaState() {
   caReadyFor = null;
   caRestore = null;
 }
-async function sessionStart() {
+async function sessionStart(options) {
   try {
     closeSession();
     lastFailure = null;
@@ -1024,44 +1236,43 @@ async function sessionStart() {
       return false;
     }
     ctx.session.emit(JSON.stringify({ type: "status", text: "\u6B63\u5728\u8FDE\u63A5\u2026", inputEnabled: false }));
-    const sessions = await withSession((options) => listSessions(options));
+    const sessions = await withSession((c) => listSessions(c));
+    applySessionList(sessions);
     const usable = sessions.filter((s) => s.agentAvailable && !s.blank);
-    const target = pickSession(usable);
+    const requestedId = sessionIdOf((options?.sessionKey ?? "").trim());
+    const target = pickSession(usable, requestedId);
     if (target === void 0) {
       lastFailure = usable.length === 0 ? "\u7535\u8111\u4E0A\u6CA1\u6709\u6B63\u5728\u8FD0\u884C\u7684\u4F1A\u8BDD\uFF0C\u8BF7\u5148\u5728\u7535\u8111\u4E0A\u6253\u5F00\u4E00\u4E2A\u5BF9\u8BDD" : "\u8BF7\u5148\u9009\u62E9\u4E00\u4E2A\u4F1A\u8BDD";
       ctx.session.emit(JSON.stringify({ type: "status", text: lastFailure, inputEnabled: false }));
       return false;
     }
     selectedSessionId = target.sessionId;
+    pendingSwitchKey = sessionKeyOf(target.sessionId);
     const pairing = loadPairing();
     if (pairing === null) return false;
+    running = target.running;
+    const display = new Conversation((event) => ctx.session.emit(JSON.stringify(event)));
+    conversation = display;
     activeFollow = await followSession(pairing.gateway, target.sessionId, {
-      onSnapshot(messages, running) {
-        ctx.session.emit(JSON.stringify({ type: "clear" }));
-        for (const message of messages) emitMessage(message);
-        assistantBuffer = "";
-        ctx.session.emit(JSON.stringify({
-          type: "status",
-          text: running ? "\u7535\u8111\u6B63\u5728\u56DE\u590D" : "\u5DF2\u8FDE\u63A5",
-          inputEnabled: !running
-        }));
+      onSnapshot(messages) {
+        display.snapshot(messages);
+        emitRunningStatus();
+      },
+      onTurnStart() {
+        running = true;
+        emitRunningStatus();
+      },
+      onAttemptReset() {
+        display.resetAttempt();
       },
       onMessage(message) {
-        if (message.role === "assistant" && assistantBuffer.length > 0) {
-          const streamed = assistantBuffer.trim();
-          assistantBuffer = "";
-          if (message.text.trim() === streamed) return;
-        }
-        emitMessage(message);
+        display.message(message);
       },
       onDelta(text) {
-        assistantBuffer += text;
-        if (text.length > 0) {
-          ctx.session.emit(JSON.stringify({ type: "delta", text }));
-        }
+        display.delta(text);
       },
       onError(message) {
-        assistantBuffer = "";
+        display.resetAttempt();
         ctx.log.w("dsh", `\u672C\u8F6E\u5931\u8D25\uFF1A${message}`);
         reportTurn("failed");
         ctx.session.emit(JSON.stringify({
@@ -1071,9 +1282,10 @@ async function sessionStart() {
         }));
       },
       onTurnEnd() {
-        assistantBuffer = "";
+        display.resetAttempt();
+        running = false;
         reportTurn("done");
-        ctx.session.emit(JSON.stringify({ type: "status", text: "\u5DF2\u8FDE\u63A5", inputEnabled: true }));
+        emitRunningStatus();
       },
       onClosed(reason) {
         closeSession();
@@ -1081,11 +1293,7 @@ async function sessionStart() {
         ctx.session.emit(JSON.stringify({ type: "closed", reason }));
       }
     });
-    ctx.session.emit(JSON.stringify({
-      type: "status",
-      text: `\u5DF2\u8FDE\u63A5 ${hostLabel(pairing.gateway)}`,
-      inputEnabled: true
-    }));
+    emitRunningStatus();
     return true;
   } catch (error) {
     const message = describeError(error);
@@ -1096,12 +1304,33 @@ async function sessionStart() {
     return false;
   }
 }
-function pickSession(sessions) {
+function pickSession(sessions, requestedId) {
+  if (requestedId.length > 0) {
+    const picked = sessions.find((s) => s.sessionId === requestedId);
+    if (picked !== void 0) return picked;
+    return void 0;
+  }
   if (selectedSessionId.length > 0) {
     const kept = sessions.find((s) => s.sessionId === selectedSessionId);
     if (kept !== void 0) return kept;
   }
   return sessions[0];
+}
+function emitRunningStatus() {
+  ctx.session.emit(JSON.stringify({
+    type: "status",
+    text: running ? "\u7535\u8111\u6B63\u5728\u56DE\u590D" : "\u5DF2\u8FDE\u63A5",
+    inputEnabled: !running
+  }));
+}
+function applySessionList(sessions) {
+  cachedSessions = sessions.filter((s) => s.origin !== "subagent").sort((a, b) => b.updatedAt - a.updatedAt);
+  const ids = new Set(cachedSessions.map((s) => s.sessionId));
+  if (selectedSessionId.length > 0 && !ids.has(selectedSessionId)) {
+    closeSession();
+    selectedSessionId = "";
+  }
+  if (pendingSwitchKey.length > 0 && !ids.has(sessionIdOf(pendingSwitchKey))) pendingSwitchKey = "";
 }
 function emitMessage(message) {
   ctx.session.emit(JSON.stringify({ type: "message", role: message.role, text: message.text }));
@@ -1112,18 +1341,20 @@ async function sessionEvent(event) {
   }
   const text = (event.payload ?? "").trim();
   if (text.length === 0) return { action: "continue" };
-  assistantBuffer = "";
-  emitMessage({ role: "user", text });
-  ctx.session.emit(JSON.stringify({ type: "status", text: "\u6B63\u5728\u56DE\u590D", inputEnabled: false }));
+  const requestId = newRequestId();
+  conversation?.submitted(requestId, text);
+  running = true;
+  emitRunningStatus();
   try {
     const sessionId = selectedSessionId;
-    await withSession((options) => promptSession(options, sessionId, text, newRequestId()));
+    await withSession((options) => promptSession(options, sessionId, text, requestId));
     return { action: "continue" };
   } catch (error) {
     const message = describeError(error);
     ctx.log.e("dsh", `\u53D1\u9001\u5931\u8D25\uFF1A${message}`);
     emitMessage({ role: "system", text: `\u53D1\u9001\u5931\u8D25\uFF1A${message}` });
-    ctx.session.emit(JSON.stringify({ type: "status", text: "\u5DF2\u8FDE\u63A5", inputEnabled: true }));
+    running = false;
+    emitRunningStatus();
     return { action: "continue" };
   }
 }
@@ -1133,8 +1364,9 @@ function sessionStop() {
 function closeSession() {
   const follow = activeFollow;
   activeFollow = null;
-  if (assistantBuffer.length > 0) reportTurn("interrupted");
-  assistantBuffer = "";
+  if ((conversation?.buffer.length ?? 0) > 0) reportTurn("interrupted");
+  conversation = null;
+  running = false;
   if (follow !== null) follow.close();
 }
 function reportTurn(outcome) {

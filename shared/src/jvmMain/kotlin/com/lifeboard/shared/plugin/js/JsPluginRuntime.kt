@@ -58,6 +58,9 @@ class JsPluginRuntime private constructor(
     @Volatile
     private var lastActivityAt: Long = System.currentTimeMillis()
 
+    /** 单段同步预算超限次数；连续超限用于停用插件 */
+    private val syncBudgetExceeded = java.util.concurrent.atomic.AtomicInteger(0)
+
     /** 常驻泵每轮推进前执行的钩子（例如恢复会话上下文绑定）；在专用线程上调用 */
     @Volatile
     private var pumpHook: (() -> Unit)? = null
@@ -208,6 +211,100 @@ class JsPluginRuntime private constructor(
         }
     }
 
+    /**
+     * 在专用线程上执行一段针对运行时的操作，并施加**单段同步执行预算**。
+     *
+     * ## 为什么需要独立预算
+     *
+     * 现有的「60 秒无进展」只覆盖「等宿主回调」：插件只要持续 `await`，
+     * 计时就会被刷新。但 `for(;;){}` 这类**纯同步**死循环根本不会产生
+     * Promise 落地，宿主线程会被永久占住——扫描、卸载、退出全部挂死。
+     *
+     * 这里从进入 JS 到真正返回计一次预算；超时即请求中断，
+     * 让解释器在下一个安全点抛异常退出。
+     *
+     * ## 为什么超时后还要再等一小段
+     *
+     * `requestInterrupt` 是异步的：只置标志，解释器在安全点才检查。
+     * 立即返回会让调用方以为线程空闲，实际仍在跑。短暂等待后无论是否退出
+     * 都向上抛错，由上层决定隔离/重建。
+     */
+    fun <T> runOnRuntimeWithBudget(block: (JsRuntime) -> T): T {
+        val rt = runtimeRef()
+        val future = executor.submit<T> { block(rt) }
+        return try {
+            future.get(SYNC_BUDGET_MS, TimeUnit.MILLISECONDS)
+        } catch (e: java.util.concurrent.TimeoutException) {
+            runCatching { runtime?.requestInterrupt() }
+            // 给解释器一点时间在安全点退出；超时也不阻塞永久
+            runCatching { future.get(INTERRUPT_GRACE_MS, TimeUnit.MILLISECONDS) }
+            syncBudgetExceeded.incrementAndGet()
+            throw JsSyncBudgetExceededException(
+                "插件 $pluginId 单段同步执行超过 ${SYNC_BUDGET_MS}ms，已请求中断"
+            )
+        } catch (e: java.util.concurrent.ExecutionException) {
+            throw e.cause ?: e
+        }
+    }
+
+    /** 单段同步预算超限的累计次数，供故障停用策略使用 */
+    fun syncBudgetExceededCount(): Int = syncBudgetExceeded.get()
+
+    /** 正常完成一次业务调用后清零，避免历史超时影响后续判定 */
+    fun clearSyncBudgetFaults() {
+        syncBudgetExceeded.set(0)
+    }
+
+    /**
+     * 调用插件的 `onUnload` 钩子（尽力、有超时）。
+     *
+     * ## 为什么单独一个入口而不复用 [runOnRuntime]
+     *
+     * 卸载期不允许无限等待：插件可能在钩子里写死循环或阻塞 I/O。
+     * 这里投递到专用线程后**限时等待**，超时即请求中断并返回失败，
+     * 调用方据此继续回收，不会把关闭流程永久挂住。
+     *
+     * ## 不保证一定执行
+     *
+     * 运行时已关闭、中断态、或插件没实现 `onUnload` 时都会快速返回失败。
+     * 因此**关键状态不能只靠这个钩子保存**——这是本任务的硬约束。
+     *
+     * @return 成功执行返回 success；超时、未实现或运行时不可用返回 failure
+     */
+    fun callUnloadHook(entryModule: String, timeoutMillis: Long): Result<Unit> {
+        if (closed) return Result.failure(IllegalStateException("运行时已关闭"))
+        val task = runCatching {
+            executor.submit<Result<Unit>> {
+                runCatching {
+                    val rt = runtime ?: return@submit Result.failure(
+                        IllegalStateException("运行时未初始化")
+                    )
+                    rt.callFunction(
+                        moduleName = entryModule,
+                        functionName = "onUnload",
+                        argsJson = "[]",
+                        callKey = "$pluginId#onUnload",
+                    )
+                    Result.success(Unit)
+                }.getOrElse { Result.failure(it) }
+            }
+        }.getOrElse { return Result.failure(it) }
+
+        return runCatching {
+            task.get(timeoutMillis, TimeUnit.MILLISECONDS)
+        }.getOrElse { error ->
+            // 超时：请求中断，让解释器在下一次安全点退出。不等结果
+            runCatching { runtime?.requestInterrupt() }
+            Result.failure(
+                if (error is java.util.concurrent.TimeoutException) {
+                    IllegalStateException("onUnload 超过 ${timeoutMillis}ms 未完成，已请求中断")
+                } else {
+                    error
+                }
+            )
+        }
+    }
+
     override fun close() {
         if (closed) return
         closed = true
@@ -229,6 +326,12 @@ class JsPluginRuntime private constructor(
 
         /** 常驻泵的推进间隔（毫秒），取值理由见 [startPump] */
         private const val PUMP_INTERVAL_MILLIS = 5L
+
+        /** 单段同步执行预算：超过即视为卡死，请求中断 */
+        const val SYNC_BUDGET_MS = 1_000L
+
+        /** 请求中断后等待解释器退出的宽限 */
+        private const val INTERRUPT_GRACE_MS = 500L
 
         fun create(pluginId: String): JsPluginRuntime = JsPluginRuntime(pluginId)
     }

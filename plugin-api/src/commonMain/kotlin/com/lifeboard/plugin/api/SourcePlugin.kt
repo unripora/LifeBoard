@@ -59,8 +59,37 @@ interface SourcePlugin {
      * 失败要返回 [LoginResult.Failure] 而不是抛异常，`message` 会展示给用户。
      *
      * @param inputs 上一轮 [LoginResult.NeedInput] 要求用户填的值，键是 [InputField.name]
+     * @param options 可选的调用意图。缺省时按旧协议处理（空输入 = 重新开始/首轮询问）；
+     *   声明 `contract.loginIntent` 的插件才使用 [LoginOptions.intent]，
+     *   从而区分「打开并恢复」「提交」「重新开始」「放弃」。
      */
-    suspend fun login(context: PluginContext, inputs: Map<String, String> = emptyMap()): LoginResult
+    suspend fun login(
+        context: PluginContext,
+        inputs: Map<String, String>,
+        options: LoginOptions? = null,
+    ): LoginResult
+
+    /**
+     * 只带上下文的旧式调用：等价于「无输入、无意图」的首轮询问。
+     *
+     * 旧宿主有按单参/双参调用的实现；保留它可以让三种调用形态共存，
+     * 而所有形态最终都收敛到三参版本，不会产生递归。
+     */
+    suspend fun login(context: PluginContext): LoginResult =
+        login(context, emptyMap(), null)
+
+    /**
+     * 旧双参签名：与三参版本等价、不带意图。
+     *
+     * 保留它是为了不打断按旧签名编写的插件；新实现只需重写三参版本，
+     * 这里默认转发即可（不会再触发自身递归）。
+     */
+    @Deprecated(
+        "改用带 LoginOptions 的三参 login",
+        ReplaceWith("login(context, inputs, null)"),
+    )
+    suspend fun login(context: PluginContext, inputs: Map<String, String>): LoginResult =
+        login(context, inputs, null)
 
     /** 登出：清理本插件名下凭据。宿主也会在用户清除凭据时调用 */
     suspend fun logout(context: PluginContext)
@@ -188,6 +217,21 @@ interface SourcePlugin {
  * 刻意用「键值对 + 插件自行解释」而不是宿主定义的字段：会话里要传什么
  * （网关地址、工作区、会话 id）完全取决于插件对接的协议，宿主定义字段
  * 就等于把某一家协议固化进契约。宿主只负责原样转交。
+ *
+ * ## 宿主约定的保留键：`sessionKey`
+ *
+ * 宿主会在每次 [SourcePlugin.onSessionStart] 时写入 `options["sessionKey"]`，
+ * 值是「本次要看哪一条会话」——正好等于插件在绑定里写的那个 key
+ * （`session:<key>:messages` 里的 `<key>`）。
+ *
+ * 这是宿主与插件之间**唯一**的保留键，语义是：
+ * - 首次启动与「切换会话」都会调用 `onSessionStart`，插件据此决定
+ *   「复用现有连接、只换订阅」还是「需要重新拉历史」；
+ * - 一条连接上有多个会话时，插件应当**不再重复认证**——认证属于连接，
+ *   切换属于订阅；
+ * - 插件不用这个键也完全正常：行为与升级前一致（只认一条会话）。
+ *
+ * 因为是保留键，插件不应在 `options` 里自行使用 `sessionKey` 传别的意思。
  */
 data class SessionConfig(val options: Map<String, String> = emptyMap())
 

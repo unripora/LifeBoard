@@ -124,6 +124,20 @@ interface StoredCookie {
     path: string;
 }
 
+/**
+ * 一条可序列化的 cookie。
+ *
+ * 只保留「重建会话所需」的四个字段：name/value 决定认证身份，
+ * domain/path 决定它该发给谁。运行时重建后靠它把会话原样恢复，
+ * 否则新运行时里 jar 是空的，服务端只看到匿名请求。
+ */
+export interface CookieSnapshot {
+    name: string;
+    value: string;
+    domain: string;
+    path: string;
+}
+
 /** 会话对外暴露的能力。 */
 export interface MiSession {
     send(method: string, url: string, options?: SendOptions): Promise<HttpResponse>;
@@ -134,6 +148,20 @@ export interface MiSession {
     sessionName: string;
     /** 当前会话里的 cookie 名（不含值），仅用于日志 */
     names(): string[];
+    /**
+     * 导出 cookie 表（含值）。
+     *
+     * **值是等价的密码**，调用方只能把它写进加密凭据存储，
+     * 绝不能落普通文件或日志。
+     */
+    exportCookies(): CookieSnapshot[];
+    /**
+     * 导入 cookie 表，用于运行时重建后恢复会话。
+     *
+     * 与宿主的 CookieJar 无关：cookie 一直由插件自己管，这里恢复的就是
+     * 本文件里那张 jar。
+     */
+    importCookies(items: CookieSnapshot[]): void;
 }
 
 /**
@@ -421,6 +449,25 @@ export function createSession(
                 }
             });
             return out;
+        },
+        exportCookies: () => {
+            const out: CookieSnapshot[] = [];
+            jar.forEach((c) => {
+                out.push({ name: c.name, value: c.value, domain: c.domain, path: c.path });
+            });
+            return out;
+        },
+        importCookies: (items) => {
+            if (!items || items.length === 0) return;
+            items.forEach((c) => {
+                if (!c || !c.name) return;
+                jar.set(jarKey(c.domain, c.path || '/', c.name), {
+                    name: c.name,
+                    value: c.value,
+                    domain: c.domain,
+                    path: c.path || '/',
+                });
+            });
         },
     };
 }

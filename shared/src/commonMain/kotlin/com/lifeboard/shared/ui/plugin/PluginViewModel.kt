@@ -2,6 +2,8 @@ package com.lifeboard.shared.ui.plugin
 
 import com.lifeboard.plugin.api.AuthState
 import com.lifeboard.plugin.api.InputField
+import com.lifeboard.plugin.api.LoginIntent
+import com.lifeboard.plugin.api.LoginOptions
 import com.lifeboard.plugin.api.LoginResult
 import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.shared.platform.CollectOutcome
@@ -592,14 +594,13 @@ class PluginViewModel(
     // ---- 登录 ----
 
     /**
-     * 开始登录。
+     * 开始登录（首次打开登录入口）。
      *
-     * 宿主不知道这个插件要什么字段，所以先**空手问一轮**：
-     * 插件会返回 [LoginResult.NeedInput] 告诉我们「要填什么」；
-     * 也可能直接成功（凭据还在，只是没同步过）。
+     * 传入 [LoginIntent.OPEN]：插件只读取并展示**可恢复的阶段**，
+     * 不提交、不清空中间态。旧插件忽略该意图，退化为原先的空表单语义。
      */
     fun startLogin(row: PluginRow) {
-        submitLogin(row.pluginId, row.displayName, emptyMap())
+        submitLogin(row.pluginId, row.displayName, emptyMap(), LoginIntent.OPEN)
     }
 
     fun updateLoginValue(name: String, value: String) {
@@ -611,9 +612,15 @@ class PluginViewModel(
 
     fun submitLoginForm() {
         val current = _state.value.login ?: return
-        submitLogin(current.pluginId, current.displayName, current.values)
+        submitLogin(current.pluginId, current.displayName, current.values, LoginIntent.SUBMIT)
     }
 
+    /**
+     * 关闭登录表单。
+     *
+     * 只收起界面，**不清插件中间态**：用户可能只是暂时关掉，稍后还要接着填。
+     * 真正放弃走 [abandonLogin]。
+     */
     fun cancelLogin() {
         _state.value = _state.value.copy(login = null)
     }
@@ -621,24 +628,54 @@ class PluginViewModel(
     /**
      * 退回「重新输入账号」。
      *
-     * 提交一个**完全空的表单**，由插件决定这代表什么——对小米健康来说
-     * 就是丢掉这轮登录的中间状态，重新问账号密码。
+     * 传入 [LoginIntent.RESTART]：插件清理当前中间态并返回首轮。
      * 宿主不自己清插件状态：中间状态在插件那边，宿主碰不到。
      */
     fun restartLogin() {
         val current = _state.value.login ?: return
-        submitLogin(current.pluginId, current.displayName, emptyMap())
+        submitLogin(current.pluginId, current.displayName, emptyMap(), LoginIntent.RESTART)
     }
 
-    private fun submitLogin(pluginId: String, displayName: String, inputs: Map<String, String>) {
+    /**
+     * 显式放弃本轮登录：清理插件中间态并收起表单。
+     *
+     * 传入 [LoginIntent.ABANDON]，其应答只确认清理，**不触发自动采集**。
+     */
+    fun abandonLogin() {
+        val current = _state.value.login ?: return
+        submitLogin(current.pluginId, current.displayName, emptyMap(), LoginIntent.ABANDON)
+    }
+
+    private fun submitLogin(
+        pluginId: String,
+        displayName: String,
+        inputs: Map<String, String>,
+        intent: LoginIntent,
+    ) {
         scope.launch {
             // 已显示表单时先标记 busy：登录要发网络请求，不能让人连点提交
             _state.value.login?.let { current ->
                 _state.value = _state.value.copy(login = current.copy(busy = true, error = null))
             }
 
-            val result = runCatching { deps.pluginInvoker.login(pluginId, inputs) }
-                .getOrElse { LoginResult.Failure(it.message ?: "登录时出错") }
+            val result = runCatching {
+                deps.pluginInvoker.login(pluginId, inputs, LoginOptions(intent))
+            }.getOrElse { LoginResult.Failure(it.message ?: "登录时出错") }
+
+            // 放弃登录的应答只表示「中间态已清理」，不是一次登录结果：
+            // 若按 Success 处理就会收掉表单并触发一次采集，与用户意图相反
+            if (intent == LoginIntent.ABANDON) {
+                _state.value = _state.value.copy(
+                    login = null,
+                    message = if (result is LoginResult.Failure) {
+                        "$displayName 放弃登录时出错：${result.message}"
+                    } else {
+                        "已退出 $displayName 的登录"
+                    },
+                )
+                reloadRows()
+                return@launch
+            }
 
             when (result) {
                 is LoginResult.Success -> {

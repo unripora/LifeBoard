@@ -3,6 +3,7 @@ package com.lifeboard.desktop.plugin
 import com.lifeboard.core.model.SourceHealth
 import com.lifeboard.plugin.api.ActionResult
 import com.lifeboard.plugin.api.AuthState
+import com.lifeboard.plugin.api.LoginOptions
 import com.lifeboard.plugin.api.LoginResult
 import com.lifeboard.plugin.api.MetricSample
 import com.lifeboard.plugin.api.MetricSeries
@@ -16,6 +17,7 @@ import com.lifeboard.plugin.api.PluginNode
 import com.lifeboard.shared.log.AppLogger
 import com.lifeboard.shared.platform.CollectOutcome
 import com.lifeboard.shared.platform.PluginInvoker
+import com.lifeboard.shared.platform.SessionKeepAlive
 import com.lifeboard.shared.platform.StreamingSourcePlugin
 import com.lifeboard.shared.plugin.host.HostPluginContext
 import com.lifeboard.shared.repository.MetricStore
@@ -60,7 +62,11 @@ class DesktopPluginInvoker(
     private val hostContextFactory: (pluginId: String) -> HostPluginContext,
 ) : PluginInvoker {
 
-    override suspend fun login(pluginId: String, inputs: Map<String, String>): LoginResult {
+    override suspend fun login(
+        pluginId: String,
+        inputs: Map<String, String>,
+        options: LoginOptions?,
+    ): LoginResult {
         val entry = repository.find(pluginId)
             ?: return LoginResult.Failure("插件未加载，请重新扫描")
         if (!entry.trusted) return LoginResult.Failure("插件已停止使用，请先信任再登录")
@@ -69,7 +75,7 @@ class DesktopPluginInvoker(
         // 内部是阻塞式等专用线程返回，占着调用方线程会把界面卡到超时
         return withContext(Dispatchers.IO) {
             runCatching {
-                entry.plugin.login(hostContextFactory(pluginId), inputs)
+                entry.plugin.login(hostContextFactory(pluginId), inputs, options)
             }.getOrElse { error ->
                 AppLogger.error("插件登录失败：$pluginId", error)
                 LoginResult.Failure("插件登录时出错：${error.message ?: error::class.simpleName}")
@@ -231,6 +237,15 @@ class DesktopPluginInvoker(
     ) {
         repository.find(pluginId)?.plugin?.setSessionUiListener(listener)
     }
+
+    /**
+     * 会话存续期间的保活句柄。
+     *
+     * 只有「按需加载 + 允许回收」时才真有被空闲关闭的风险；其余情况返回 `null`，
+     * 控制器退回「每次调用独立申请」的旧行为，不会因为多挂一个租约把实例钉住。
+     */
+    override fun sessionKeepAlive(pluginId: String): SessionKeepAlive? =
+        repository.sessionKeepAlive(pluginId)
 
     /**
      * 健康度。

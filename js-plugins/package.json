@@ -11,7 +11,12 @@
     "verify:mihealth": "node scripts/verify-bundle.mjs mihealth/main.js",
     "package:mihealth": "npm run build:mihealth && node scripts/package-plugin.mjs mihealth",
     "build:dsh": "esbuild dsh/main.ts --bundle --format=esm --target=es2020 --inject:dsh/qjs-shim.ts --outfile=dsh/main.js --log-level=warning",
-    "package:dsh": "npm run build:dsh && node scripts/package-plugin.mjs dsh"
+    "package:dsh": "npm run build:dsh && node scripts/package-plugin.mjs dsh",
+    "mock:mihealth": "node _mockhost/smoke.mjs mihealth/main.js",
+    "mock:dsh": "node _mockhost/smoke.mjs dsh/main.js",
+    "test:session": "node _mockhost/session.mjs dsh/main.js",
+    "test:login": "node _mockhost/login.mjs mihealth/main.js",
+    "test:plugins": "npm run test:session && npm run test:login"
   },
   "dependencies": {
     "@lukeburns/clatterjs": "1.0.0",

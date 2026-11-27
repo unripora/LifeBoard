@@ -401,10 +401,24 @@ class JsWebSocketBridge(
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+            if (text.toByteArray(Charsets.UTF_8).size > MAX_MESSAGE_BYTES) {
+                // 超限帧不入队：留在队列里会让插件反复取到同一块超大内容，
+                // 直接把连接判为不健康，由插件层决定是否重连
+                AppLogger.warn("WebSocket 单帧超过 $MAX_MESSAGE_BYTES 字节，已丢弃并关闭连接")
+                runCatching { webSocket.close(CLOSE_NORMAL, "message too large") }
+                    .onFailure { webSocket.cancel() }
+                return
+            }
             deliver(connId, Frame.Text(text))
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            if (bytes.size > MAX_MESSAGE_BYTES) {
+                AppLogger.warn("WebSocket 单帧超过 $MAX_MESSAGE_BYTES 字节，已丢弃并关闭连接")
+                runCatching { webSocket.close(CLOSE_NORMAL, "message too large") }
+                    .onFailure { webSocket.cancel() }
+                return
+            }
             deliver(connId, Frame.Binary(bytes.toByteArray()))
         }
 
@@ -444,6 +458,9 @@ class JsWebSocketBridge(
 
         /** close 帧 reason 的协议上限（UTF-8 字节数）。 */
         private const val MAX_CLOSE_REASON_BYTES = 123
+
+        /** 单帧上限：4 MiB。超限帧丢弃并关连接，避免大帧把宿主内存打爆 */
+        private const val MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 
         private const val CLOSE_NORMAL = 1000
 

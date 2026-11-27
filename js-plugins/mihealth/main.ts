@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿// 小米运动健康 JS 插件 —— 契约实现
+// 小米运动健康 JS 插件 —— 契约实现
 //
 // 这是整个插件唯一的入口。宿主通过 callFunction 调用本模块的导出函数：
 //   login(inputs) / logout() / authState() / fetch(date) / health() / detailUi() / onAction(actionId)
@@ -24,16 +24,18 @@
 
 /// <reference path="../types/index.d.ts" />
 
+// 具名类型从契约声明文件导入（它是模块）；裸 `ctx` 与其余类型由
+// `../types/index.d.ts` 的全局声明提供，见该文件的说明。
 import type {
     ActionResult,
     AuthState,
     FetchResult,
     LoginResult,
-    UiNode,
     PluginHealth,
     PluginMetric,
     Tone,
-} from '../types/index.js';
+    UiNode,
+} from '../types/plugin-contract.js';
 
 import {
     ACCOUNT,
@@ -45,7 +47,7 @@ import {
     signQuery,
     ua,
 } from './crypto.js';
-import type { MiSession } from './client.js';
+import type { CookieSnapshot, MiSession } from './client.js';
 import {
     createSession,
     describeError,
@@ -279,7 +281,14 @@ interface PendingLogin {
     stage: 'password' | 'captcha' | 'twoFactor';
     session: MiSession;
     account: string;
-    password: string;
+    /**
+     * 密码的**单次 MD5 大写**，不是明文。
+     *
+     * 提交验证码/二次验证时服务端要的就是这个值，所以恢复流程只需要它，
+     * 不需要明文密码。存哈希已经降低了泄露面：它本来就会发给服务端，
+     * 而明文密码不会。
+     */
+    passwordHash: string;
     handshake: any;
     userId: string;
     // 仅 twoFactor 阶段使用
@@ -313,6 +322,190 @@ interface CollectClient {
  * 所以必须把 session 整个留在内存里。
  */
 let pendingLogin: PendingLogin | null = null;
+
+// ---------- 登录中间态的持久化 ----------
+//
+// 宿主可能在两次登录调用之间卸载插件（按需加载的空闲回收）。
+// 只在内存里留着 `pendingLogin` 的话，用户填完密码、页面停在验证码，
+// 过几分钟回来就"凭空回到第一轮"——他既没取消也没失败，纯粹是被回收了。
+//
+// 因此把**可恢复的最小集合**写进加密凭据存储：
+// - 阶段、账号、密码哈希（不是明文）、握手、
+// - 会话 cookie（含值，等价于密码，所以必须进凭据存储而非普通文件）
+// - 服务端给的 2FA 参数、过期时间
+//
+// 关键约束：正确性不能依赖 onUnload 钩子。宿主明确"尽力调用、不保证执行"，
+// 所以这里在**阶段变化时**就落盘，而不是等卸载。
+
+/** 存恢复快照的凭据槽位 */
+const SLOT_PENDING_LOGIN = 'pending_login';
+const SLOT_LOGIN_GENERATION = 'pending_login_generation';
+
+/** 持久代数只用于跨运行时恢复；sessionEpoch 只负责当前运行时的在途取消。 */
+function loginGeneration(): string {
+    const saved = ctx.credentials.get(SLOT_LOGIN_GENERATION);
+    if (saved) return saved;
+    const generation = Date.now().toString(36) + '-' + ctx.codec.base64Encode(ctx.crypto.randomBytes(16));
+    ctx.credentials.put(SLOT_LOGIN_GENERATION, generation);
+    return generation;
+}
+
+function invalidateLogin(): void {
+    sessionEpoch++;
+    resetPendingLogin();
+    ctx.credentials.remove(SLOT_LOGIN_GENERATION);
+}
+
+function loginCancelled(epoch: number): boolean {
+    return epoch !== sessionEpoch;
+}
+
+function cancelledLogin(): LoginResult {
+    return { type: 'failure', message: '登录已取消' };
+}
+
+/**
+ * 快照有效期：10 分钟。
+ *
+ * 比服务端的验证码/二次验证有效期更保守——过期后继续用旧会话只会拿到
+ * 一个语焉不详的失败，不如直接重新走登录。
+ */
+const PENDING_LOGIN_TTL_MS = 10 * 60 * 1000;
+
+/** 可恢复的登录快照 */
+interface PendingLoginSnapshot {
+    v: 1 | 2;
+    stage: 'captcha' | 'twoFactor';
+    account: string;
+    /** 密码的单次 MD5 大写；不含明文 */
+    passwordHash: string;
+    handshake: any;
+    userId: string;
+    context?: string;
+    flag?: number;
+    method?: string;
+    hint?: string;
+    auth2Ssecurity?: string;
+    cookies: CookieSnapshot[];
+    expiresAt: number;
+    /** v1 的进程内代数仅作兼容读取，不能与重建后归零的 sessionEpoch 比较。 */
+    epoch?: number;
+    /** v2 的跨运行时稳定身份，保存在独立加密槽位。 */
+    generation?: string;
+}
+
+/** 把当前中间态落盘；密码阶段没有恢复价值，直接跳过 */
+function savePendingLoginSnapshot(): void {
+    const pending = pendingLogin;
+    if (!pending || pending.stage === 'password') return;
+    const snapshot: PendingLoginSnapshot = {
+        v: 2,
+        stage: pending.stage,
+        account: pending.account,
+        passwordHash: pending.passwordHash,
+        handshake: pending.handshake,
+        userId: pending.userId,
+        context: pending.context,
+        flag: pending.flag,
+        method: pending.method,
+        hint: pending.hint,
+        auth2Ssecurity: pending.auth2Ssecurity,
+        cookies: pending.session.exportCookies(),
+        expiresAt: Date.now() + PENDING_LOGIN_TTL_MS,
+        generation: loginGeneration(),
+    };
+    try {
+        ctx.credentials.put(SLOT_PENDING_LOGIN, JSON.stringify(snapshot));
+        log('i', '已保存登录中间态，阶段=' + snapshot.stage);
+    } catch (e) {
+        // 存不下不影响本轮登录，但要留痕：否则用户会困惑"为什么又回到第一轮"
+        log('w', '保存登录中间态失败：' + describeError(e));
+    }
+}
+
+function clearPendingLoginSnapshot(): void {
+    try {
+        ctx.credentials.remove(SLOT_PENDING_LOGIN);
+    } catch (e) {
+        log('w', '清除登录中间态失败：' + describeError(e));
+    }
+}
+
+/**
+ * 结束当前登录轮次：内存与持久化**一起**清掉。
+ *
+ * 只清内存会让"用户已重开"的旧快照在下一次启动时复活；
+ * 只清快照则内存里还留着上一轮的 session，两边都不完整。
+ */
+function resetPendingLogin(): void {
+    pendingLogin = null;
+    clearPendingLoginSnapshot();
+}
+
+/**
+ * 尝试从凭据存储恢复中间态。
+ *
+ * @return 是否恢复出了可继续的流程
+ */
+function restorePendingLogin(): boolean {
+    if (pendingLogin) return true;
+    let raw: string | null = null;
+    try {
+        raw = ctx.credentials.get(SLOT_PENDING_LOGIN);
+    } catch (e) {
+        log('w', '读取登录中间态失败：' + describeError(e));
+        return false;
+    }
+    if (!raw) return false;
+
+    let snapshot: PendingLoginSnapshot;
+    try {
+        snapshot = JSON.parse(raw);
+    } catch (e) {
+        log('w', '登录中间态损坏，已丢弃：' + describeError(e));
+        clearPendingLoginSnapshot();
+        return false;
+    }
+    if (!snapshot || (snapshot.v !== 1 && snapshot.v !== 2) ||
+        !Number.isFinite(snapshot.expiresAt) ||
+        (snapshot.stage !== 'captcha' && snapshot.stage !== 'twoFactor') ||
+        typeof snapshot.account !== 'string' || !/^[A-F0-9]{32}$/.test(snapshot.passwordHash) ||
+        !Array.isArray(snapshot.cookies)) {
+        clearPendingLoginSnapshot();
+        return false;
+    }
+    if (Date.now() > snapshot.expiresAt) {
+        log('i', '登录中间态已过期，丢弃');
+        clearPendingLoginSnapshot();
+        return false;
+    }
+    if (snapshot.v === 2 && (!snapshot.generation ||
+        snapshot.generation !== ctx.credentials.get(SLOT_LOGIN_GENERATION))) {
+        log('i', '登录中间态属于已作废的流程，丢弃');
+        clearPendingLoginSnapshot();
+        return false;
+    }
+
+    const session = createSession(deviceId(), 'login', { adoptAsDefault: false });
+    session.importCookies(snapshot.cookies || []);
+    pendingLogin = {
+        stage: snapshot.stage,
+        session,
+        account: snapshot.account,
+        passwordHash: snapshot.passwordHash,
+        handshake: snapshot.handshake,
+        userId: snapshot.userId || '',
+        context: snapshot.context,
+        flag: snapshot.flag,
+        method: snapshot.method,
+        hint: snapshot.hint,
+        auth2Ssecurity: snapshot.auth2Ssecurity,
+    };
+    // 旧版 epoch 不具有跨进程含义；通过 TTL/结构校验后迁移到稳定代数。
+    if (snapshot.v === 1) savePendingLoginSnapshot();
+    log('i', '已恢复登录中间态，阶段=' + snapshot.stage);
+    return true;
+}
 
 /**
  * deviceId 要跨轮次、跨进程稳定。
@@ -392,6 +585,43 @@ let sessionEpoch = 0;
  */
 let credsRejectedByServer = false;
 
+/**
+ * 失效标志必须**跨运行时重建**保留。
+ *
+ * 它决定 `authState` 报「已登录」还是「已失效」。只放内存的话，插件被卸载
+ * 再拉起后标志归零，用户会看到「已登录」却仍然同步失败——这正是本任务
+ * 要消灭的那种误导状态。
+ *
+ * 存在凭据存储里（加密），值只是一个 '1'，不含任何秘密。
+ */
+const SLOT_CREDS_REJECTED = 'creds_rejected';
+
+function setCredsRejected(rejected: boolean): void {
+    credsRejectedByServer = rejected;
+    try {
+        if (rejected) {
+            ctx.credentials.put(SLOT_CREDS_REJECTED, '1');
+        } else {
+            ctx.credentials.remove(SLOT_CREDS_REJECTED);
+        }
+    } catch (e) {
+        log('w', '保存凭据失效标志失败：' + describeError(e));
+    }
+}
+
+/** 读一次持久化标志并合并到内存（惰性、只读一槽位） */
+function isCredsRejected(): boolean {
+    if (credsRejectedByServer) return true;
+    try {
+        if (ctx.credentials.get(SLOT_CREDS_REJECTED) === '1') {
+            credsRejectedByServer = true;
+        }
+    } catch (e) {
+        log('w', '读取凭据失效标志失败：' + describeError(e));
+    }
+    return credsRejectedByServer;
+}
+
 function log(level: 'd' | 'i' | 'w' | 'e', message: string): void {
     try {
         ctx.log[level]('MiHealth', message);
@@ -449,7 +679,7 @@ function saveCredentials(creds: Creds): void {
     currentCreds = creds;
     // 新凭据已落盘，之前记录的「服务端拒绝」必然针对旧凭据，必须清掉，
     // 否则用户刚登录成功，authState 还在报「登录已失效」
-    credsRejectedByServer = false;
+    setCredsRejected(false);
 }
 
 /**
@@ -1310,12 +1540,50 @@ async function collectDailyGoals(
  * 验证码过了才知道要不要二次验证。所以用「轮到哪一步」决定读哪些输入，
  * 而不是一开始就要齐所有字段。
  */
-export async function login(inputs?: Record<string, string>): Promise<LoginResult> {
+export async function login(
+    inputs?: Record<string, string>,
+    options?: LoginOptions,
+): Promise<LoginResult> {
     const form = inputs || {};
+    const intent = options && options.intent;
+    const epoch = captureEpoch();
     try {
+        // ---------- 意图优先 ----------
+        // 宿主传空表单时不再靠"猜"：OPEN / RESTART / ABANDON 各有明确语义。
+        // 旧宿主不传 options，intent 为 undefined，下面的逻辑完全保持原样。
+        if (intent === 'abandon') {
+            // 放弃：清理中间态即可。宿主对 ABANDON 只确认清理，不会当成登录成功
+            invalidateLogin();
+            return { type: 'success' };
+        }
+        if (intent === 'restart') {
+            invalidateLogin();
+            return needPassword('');
+        }
+        if (intent === 'open') {
+            // 只读：能恢复就展示恢复后的阶段，不能恢复就问账号密码。
+            // **不提交、不清空**——用户可能只是重新打开了页面
+            if (!restorePendingLogin()) {
+                return needPassword('');
+            }
+            if (pendingLogin!.stage === 'captcha') {
+                return await needCaptcha(pendingLogin!);
+            }
+            return needOtp(pendingLogin!.hint);
+        }
+
         if (!pendingLogin) {
             // 第一轮：要账号密码。调用方第一次调用通常不带 inputs，
-            // 这时先问，不该把空账号密码拿去请求
+            // 这时先问，不该把空账号密码拿去请求。
+            //
+            // 但先给恢复一次机会：插件可能刚被宿主卸载又拉起，
+            // 用户其实已经走到验证码那一步了
+            if (restorePendingLogin()) {
+                if (pendingLogin!.stage === 'captcha') {
+                    return await needCaptcha(pendingLogin!);
+                }
+                return needOtp(pendingLogin!.hint);
+            }
             const account = form[SLOT_ACCOUNT];
             const password = form[SLOT_PASSWORD];
             if (!account || !password) {
@@ -1334,7 +1602,7 @@ export async function login(inputs?: Record<string, string>): Promise<LoginResul
             !form[SLOT_ACCOUNT] && !form[SLOT_PASSWORD] &&
             !form[SLOT_CAPTCHA] && !form[SLOT_OTP];
         if (wantsRestart) {
-            pendingLogin = null;
+            invalidateLogin();
             return needPassword('');
         }
 
@@ -1350,15 +1618,21 @@ export async function login(inputs?: Record<string, string>): Promise<LoginResul
             return await submit2FA(code);
         }
 
-        // stage === 'password'：重新走一遍密码登录
+        // stage === 'password'：重新走一遍密码登录。
+        // 这里不再复用中间态里的密码——它已经只存哈希，存不了明文。
+        // 用户没填密码就再问一次，比"用哈希当密码"更诚实。
+        if (!form[SLOT_PASSWORD]) {
+            return needPassword(form[SLOT_ACCOUNT] || pendingLogin.account);
+        }
         return await startLogin(
             form[SLOT_ACCOUNT] || pendingLogin.account,
-            form[SLOT_PASSWORD] || pendingLogin.password,
+            form[SLOT_PASSWORD],
         );
     } catch (e) {
         log('e', 'login failed: ' + describeError(e));
-        // 失败要清掉中间态，否则用户重试时会直接跳到验证码步骤、拿不到新会话
-        pendingLogin = null;
+        // 旧调用迟到失败时，不得清除用户刚重开的新流程。
+        if (loginCancelled(epoch)) return cancelledLogin();
+        resetPendingLogin();
         return { type: 'failure', message: '登录异常：' + describeError(e) };
     }
 }
@@ -1377,6 +1651,7 @@ function needPassword(account: string): LoginResult {
 
 /** 第一轮：拿账号密码去小米 passport 换结果 */
 async function startLogin(account: string, password: string): Promise<LoginResult> {
+    const epoch = captureEpoch();
     const session = createSession(deviceId(), 'login');
     log('i', '登录开始，account=' + maskAccount(account));
 
@@ -1387,6 +1662,7 @@ async function startLogin(account: string, password: string): Promise<LoginResul
     // 缺了它不下发 _sign（回一个 code:0 + psecurity 的「已登录」型响应），
     // 表现为「未拿到 _sign」，换任何密码都无效。
     const handshake = await serviceLogin(session, account);
+    if (loginCancelled(epoch)) return cancelledLogin();
     if (!handshake || !handshake._sign) {
         log('e', '握手失败：未拿到 _sign，响应=' + JSON.stringify(handshake || null).slice(0, 200));
         return { type: 'failure', message: '登录握手失败：无法连接小米登录服务或未拿到 _sign' };
@@ -1396,6 +1672,7 @@ async function startLogin(account: string, password: string): Promise<LoginResul
     // 双重 MD5 会稳定返回 70016，且错误信息看起来像风控
     const hash = md5Upper(password);
     const auth2 = await serviceLoginAuth2(session, account, hash, handshake, '');
+    if (loginCancelled(epoch)) return cancelledLogin();
     log(
         'i',
         'serviceLoginAuth2 返回：code=' + (auth2 && auth2.code) +
@@ -1408,12 +1685,12 @@ async function startLogin(account: string, password: string): Promise<LoginResul
         stage: 'password',
         session,
         account,
-        password,
+        passwordHash: hash,
         handshake,
         userId: '',
     };
 
-    return await handleAuth2(auth2, account);
+    return await handleAuth2(auth2, account, epoch);
 }
 
 // ---------- 契约：登出 / 登录态 ----------
@@ -1421,10 +1698,9 @@ async function startLogin(account: string, password: string): Promise<LoginResul
 export async function logout(): Promise<void> {
     // 不排队：登出是用户点了就要立刻生效的动作。
     // 代数递增让所有在途的异步流程作废——它们回来时会发现代数变了，不再写凭据
-    sessionEpoch++;
-    pendingLogin = null;
+    invalidateLogin();
     currentCreds = null;
-    credsRejectedByServer = false;
+    setCredsRejected(false);
     try {
         ctx.credentials.clear();
     } catch (e) {
@@ -1440,7 +1716,7 @@ export async function authState(): Promise<AuthState> {
         // 上一次采集已被服务端判为凭据失效（401 且续期失败）。
         // 必须先于「有 passToken 就算已登录」判断，否则用户永远看到「已登录」，
         // 而实际每次同步都是 0 条——这正是最误导的状态。
-        if (credsRejectedByServer) {
+        if (isCredsRejected()) {
             return {
                 state: 'expired',
                 message: '登录已失效，请重新登录小米账号',
@@ -1542,7 +1818,7 @@ export async function fetch(date: string): Promise<FetchResult> {
         // 此时已取到的数据仍然带回去（部分成功总比全丢好），
         // 但必须让用户知道需要重新登录，否则 0 条数据无从解释。
         if (authFailure) {
-            credsRejectedByServer = true;
+            setCredsRejected(true);
             log('w', '凭据已失效，本轮采集不完整，需重新登录：' + authFailure);
             return {
                 status: 'authRequired',
@@ -1551,7 +1827,7 @@ export async function fetch(date: string): Promise<FetchResult> {
         }
 
         // 整轮都成功：服务端认可这套凭据，清掉之前记录的失效标记
-        credsRejectedByServer = false;
+        setCredsRejected(false);
         return out;
     } catch (e) {
         // 兜底：fetch 抛异常会被宿主当成「插件未实现」，宁可返回结构化失败
@@ -1593,7 +1869,7 @@ export async function health(): Promise<PluginHealth> {
         try {
             const points = await client.getFitnessDataByTime('steps', now - DAY_MILLIS, now, 1);
             if (points && points.length >= 0) {
-                credsRejectedByServer = false;
+                setCredsRejected(false);
                 return { status: 'healthy' };
             }
         } catch (e) {
@@ -1601,7 +1877,7 @@ export async function health(): Promise<PluginHealth> {
             // 探活本身就是一次真实请求：它得到的 401 比「本地还有 passToken」
             // 更能说明凭据状态，直接据此给出「需要重新登录」
             if (isAuthError(e)) {
-                credsRejectedByServer = true;
+                setCredsRejected(true);
                 return { status: 'broken', message: '登录已失效，请重新登录小米账号' };
             }
         }
@@ -1610,7 +1886,7 @@ export async function health(): Promise<PluginHealth> {
         if (!isValidCreds(loadCredentials())) {
             return { status: 'broken', message: '登录已失效，请重新登录' };
         }
-        if (credsRejectedByServer) {
+        if (isCredsRejected()) {
             return { status: 'broken', message: '登录已失效，请重新登录小米账号' };
         }
         return { status: 'degraded', message: '云端接口暂时不可用' };
@@ -1944,11 +2220,10 @@ function hasUsableSsecurity(auth2: any): boolean {
 }
 
 /** 把 auth2 的响应翻译成契约结果 */
-async function handleAuth2(auth2: any, account: string): Promise<LoginResult> {
-    // 从进入登录轮到真正落地要经过多轮网络往返，记下代数以便写回前校验
-    const epoch = captureEpoch();
+async function handleAuth2(auth2: any, account: string, epoch: number): Promise<LoginResult> {
+    if (loginCancelled(epoch)) return cancelledLogin();
     if (!auth2) {
-        pendingLogin = null;
+        resetPendingLogin();
         return { type: 'failure', message: '登录请求失败，请检查网络' };
     }
 
@@ -1977,7 +2252,7 @@ async function handleAuth2(auth2: any, account: string): Promise<LoginResult> {
     const notification = auth2.notificationUrl || '';
     if (notification) {
         log('i', '没有 ssecurity 且有 notificationUrl，进入 2FA 流程');
-        return await start2FA(notification, auth2.ssecurity || '', account);
+        return await start2FA(notification, auth2.ssecurity || '', account, epoch);
     }
 
     if (code === 0) {
@@ -1985,7 +2260,7 @@ async function handleAuth2(auth2: any, account: string): Promise<LoginResult> {
         // 也没告诉我们要二次验证。继续往下走必然得到一个用不了的凭据，
         // 不如在这里就明确失败——这正是「显示已登录、数据全空」的来源
         log('e', 'auth2 code=0 但缺少 ssecurity，且无 notificationUrl，无法继续');
-        pendingLogin = null;
+        resetPendingLogin();
         return {
             type: 'failure',
             message: '登录未完成：服务端返回成功但没有下发会话密钥（ssecurity）。' +
@@ -1998,18 +2273,24 @@ async function handleAuth2(auth2: any, account: string): Promise<LoginResult> {
     if (code === 87001 || code === 70016 || auth2.captchaUrl) {
         log('i', '需要图片验证码，code=' + code);
         pendingLogin!.stage = 'captcha';
+        // 阶段已变化：立刻落盘。正确性不能依赖 onUnload（宿主明确不保证调用）
+        savePendingLoginSnapshot();
         // 复用同一个 session：验证码与那次会话的 cookie（ick）绑定
-        const image = await fetchCaptcha(pendingLogin!.session);
-        return needCaptcha(pendingLogin!, image);
+        const pending = pendingLogin!;
+        const image = await fetchCaptcha(pending.session);
+        if (loginCancelled(epoch)) return cancelledLogin();
+        return needCaptcha(pending, image);
     }
 
     log('w', '登录被拒：code=' + code + ' desc=' + (auth2.desc || ''));
-    pendingLogin = null;
+    resetPendingLogin();
     return { type: 'failure', message: friendlyError(code, auth2.desc || '') };
 }
 
 async function needCaptcha(pending: PendingLogin, imageOverride?: string): Promise<LoginResult> {
+    const epoch = captureEpoch();
     const image = imageOverride != null ? imageOverride : await fetchCaptcha(pending.session);
+    if (loginCancelled(epoch)) return cancelledLogin();
     return {
         type: 'needInput',
         prompt: '需要输入图片验证码',
@@ -2030,16 +2311,17 @@ function needOtp(hint?: string): LoginResult {
 
 /** 提交图片验证码：往那份已算好的表单里补一个 captCode，不重走握手 */
 async function submitCaptcha(code: string): Promise<LoginResult> {
+    const epoch = captureEpoch();
     const pending = pendingLogin!;
     log('i', '提交图片验证码');
     const auth2 = await serviceLoginAuth2(
         pending.session,
         pending.account,
-        md5Upper(pending.password),
+        pending.passwordHash,
         pending.handshake,
         code,
     );
-    return await handleAuth2(auth2, pending.account);
+    return await handleAuth2(auth2, pending.account, epoch);
 }
 
 /**
@@ -2049,16 +2331,18 @@ async function submitCaptcha(code: string): Promise<LoginResult> {
  *   必须显式传入：它是 [handleAuth2] 的局部变量，本函数看不到外层作用域。
  */
 async function completeLogin(auth2: any, account: string, epoch: number): Promise<LoginResult> {
+    if (loginCancelled(epoch)) return cancelledLogin();
     const loc = auth2.location || '';
     if (!loc) {
         log('e', 'passport 返回成功但没有 location，无法换 serviceToken');
-        pendingLogin = null;
+        resetPendingLogin();
         return { type: 'failure', message: '登录成功但缺少 STS 回调地址' };
     }
 
     const pending = pendingLogin!;
     // STS 这一步不能跟随跳转：serviceToken 是在该跳的 Set-Cookie 里下发的
     const token = await fetchServiceToken(pending.session, loc, pending.userId || '');
+    if (loginCancelled(epoch)) return cancelledLogin();
     log('i', 'STS 回调完成，拿到 serviceToken=' + !!token);
     if (!token) {
         // STS 的 Set-Cookie 已经落在 session.jar 里了，再兜一次
@@ -2068,7 +2352,7 @@ async function completeLogin(auth2: any, account: string, epoch: number): Promis
         );
         if (!fromJar) {
             log('e', 'STS 回调未拿到 serviceToken，可能被风控拦截');
-            pendingLogin = null;
+            resetPendingLogin();
             return { type: 'failure', message: '未拿到 serviceToken，可能被风控拦截' };
         }
         return finishLogin(auth2, fromJar, account, epoch);
@@ -2127,6 +2411,7 @@ async function finishLogin(
     // cUserId 是 STS 那一跳的 Set-Cookie 里才下发的（实测 auth2.cUserId 为 null）。
     // 而数据接口要求 `Cookie: cUserId=...; serviceToken=...`，
     // cUserId 为空会稳定 401——这正是「登录显示成功、数据全空」的另一种成因。
+    if (loginCancelled(epoch)) return cancelledLogin();
     const session = pendingLogin && pendingLogin.session;
     const fromJar = (name: string): string => {
         try {
@@ -2146,13 +2431,13 @@ async function finishLogin(
     };
     if (!creds.ssecurity) {
         log('e', '缺少 ssecurity，无法派生 sessionKey');
-        pendingLogin = null;
+        resetPendingLogin();
         return { type: 'failure', message: '登录已通过但缺少 ssecurity，无法解密数据接口' };
     }
     if (!creds.cUserId) {
         // 宁可在这一步明确失败，也不要拿着空 cUserId 去请求、再让用户看一堆 401
         log('e', '缺少 cUserId：auth2 与会话 cookie 都没有');
-        pendingLogin = null;
+        resetPendingLogin();
         return {
             type: 'failure',
             message: '登录已通过但没有拿到用户标识（cUserId），无法访问数据接口。请重试登录。',
@@ -2160,9 +2445,8 @@ async function finishLogin(
     }
     if (epoch !== sessionEpoch) {
         // 期间用户登出：不落盘，也不报成功
-        log('w', '登录期间用户已登出，凭据不落盘');
-        pendingLogin = null;
-        return { type: 'failure', message: '登录已取消' };
+        log('w', '登录期间流程已取消，凭据不落盘');
+        return cancelledLogin();
     }
 
     log(
@@ -2175,8 +2459,9 @@ async function finishLogin(
 
     // 落盘前先验证这对凭据真的能取数，避免「登录成功但永远没数据」
     const probeError = await probeCredentials(creds);
+    if (loginCancelled(epoch)) return cancelledLogin();
     if (probeError) {
-        pendingLogin = null;
+        resetPendingLogin();
         return {
             type: 'failure',
             message: '登录已通过，但用这套凭据访问小米健康数据接口被拒绝（' + probeError + '）。' +
@@ -2185,7 +2470,7 @@ async function finishLogin(
     }
 
     saveCredentials(creds);
-    pendingLogin = null;
+    resetPendingLogin();
     log('i', '登录成功，凭据已保存，account=' + maskAccount(account));
     return { type: 'success' };
 }
@@ -2200,6 +2485,7 @@ async function start2FA(
     notificationUrl: string,
     auth2Ssecurity: string,
     account: string,
+    epoch: number,
 ): Promise<LoginResult> {
     const pending = pendingLogin!;
     const abs = absoluteUrl(ACCOUNT, notificationUrl);
@@ -2223,6 +2509,8 @@ async function start2FA(
     } catch (e) {
         log('w', 'start2FA: authStart failed: ' + describeError(e));
     }
+    // authStart 也是网络往返：已取消就不必继续打 /list、发短信
+    if (loginCancelled(epoch)) return cancelledLogin();
 
     const listUrl =
         IDENTITY +
@@ -2233,13 +2521,13 @@ async function start2FA(
         userAgent: identityUa(deviceId(), identityUserId),
         headers: { Referer: ACCOUNT + '/', 'Content-Type': 'application/x-www-form-urlencoded' },
     });
+    if (loginCancelled(epoch)) return cancelledLogin();
     const listJson = parseMiapi(listRes.body);
     if (!listJson) {
         log('e', '2FA 的 /list 返回无法解析：' + String(listRes.body || '').slice(0, 200));
-        pendingLogin = null;
+        resetPendingLogin();
         return { type: 'failure', message: '无法获取二次验证方式' };
     }
-
     const flag = typeof listJson.flag === 'number' ? listJson.flag : 4;
     const method = flag === 8 ? 'Email' : 'Phone';
     log('i', '2FA 方式：flag=' + flag + ' method=' + method + ' context=' + (ctxParam || '(空)'));
@@ -2276,6 +2564,8 @@ async function start2FA(
         'verify' + method + ' 状态=' + (verifyRes && verifyRes.status) +
             ' body=' + String((verifyRes && verifyRes.body) || '').replace(/^&&&START&&&/, '').slice(0, 200),
     );
+    // 已取消就别再发短信：用户已经重开/登出，发出去的码只会让人困惑
+    if (loginCancelled(epoch)) return cancelledLogin();
 
     if (method === 'Phone') {
         const sendUrl = IDENTITY + '/auth/sendPhoneTicket';
@@ -2295,6 +2585,7 @@ async function start2FA(
         );
     }
 
+    if (loginCancelled(epoch)) return cancelledLogin();
     const hint = ['mask', 'notification', 'email', 'phone', 'address']
         .map((k) => listJson[k])
         .find((v) => typeof v === 'string' && v !== '') || '';
@@ -2303,7 +2594,7 @@ async function start2FA(
         stage: 'twoFactor',
         session: pending.session,
         account: pending.account,
-        password: pending.password,
+        passwordHash: pending.passwordHash,
         handshake: pending.handshake,
         userId: identityUserId,
         context: ctxParam,
@@ -2312,6 +2603,9 @@ async function start2FA(
         hint,
         auth2Ssecurity,
     };
+
+    // 进入二次验证：立刻落盘，保证被回收后还能接着填验证码
+    savePendingLoginSnapshot();
 
     return needOtp(hint);
 }
@@ -2362,6 +2656,7 @@ async function submit2FA(code: string): Promise<LoginResult> {
     if (!loc) {
         return { type: 'failure', message: '验证码通过但未拿到跳转地址' };
     }
+    if (loginCancelled(epoch)) return cancelledLogin();
 
     // 访问 location 建立已认证会话，**整条跳转链必须走完**。
     //
@@ -2405,6 +2700,8 @@ async function submit2FA(code: string): Promise<LoginResult> {
     } catch (e) {
         log('w', 'submit2FA: visit location failed: ' + describeError(e));
     }
+    // 跳转链走完才发现已取消：后面的重做与续期都失去意义，立即返回
+    if (loginCancelled(epoch)) return cancelledLogin();
 
     // 2FA 之后是否真的有登录态，全看这几个 cookie。
     // 缺 passToken 就只剩「重做 serviceLogin」一条路，而那条路实测常返回没有 ssecurity，
@@ -2519,11 +2816,10 @@ async function submit2FA(code: string): Promise<LoginResult> {
     if (!ssecurity && passToken) {
         const refreshed = await refreshWithPassToken(passToken, cUserId, userId, pending.account);
         if (isValidCreds(refreshed)) {
-            pendingLogin = null;
-            if (epoch !== sessionEpoch) {
-                // 期间已登出：凭据不能落盘，但也别报成功误导用户
-                return { type: 'failure', message: '登录已取消' };
-            }
+            // 先判取消再清中间态：迟到的调用若已经过期，
+            // 它连「新一轮登录的 pendingLogin」都不该碰
+            if (loginCancelled(epoch)) return cancelledLogin();
+            resetPendingLogin();
             // 与 finishLogin 同一口径：落盘前必须真的能取到数，
             // 否则又是一次「显示已登录、数据全空」
             const refreshProbeError = await probeCredentials(refreshed);
@@ -2534,6 +2830,9 @@ async function submit2FA(code: string): Promise<LoginResult> {
                         '请在小米运动健康官方 App 中重新授权后再试。',
                 };
             }
+            // 探测也是一次网络往返：期间用户可能又点了登出或重开，
+            // 落盘前必须再校验一次，否则会把刚清掉的凭据装回去
+            if (loginCancelled(epoch)) return cancelledLogin();
             saveCredentials(refreshed);
             log('i', '经 passToken 续期登录成功，凭据已保存');
             return { type: 'success' };
@@ -2541,7 +2840,8 @@ async function submit2FA(code: string): Promise<LoginResult> {
     }
 
     if (!ssecurity || !serviceToken) {
-        pendingLogin = null;
+        // 迟到结果不能清掉新一轮的中间态
+        if (!loginCancelled(epoch)) resetPendingLogin();
         // 拿不到 ssecurity 就派生不出 sessionKey，任何数据接口都会失败，
         // 必须让用户看到原因而不是静默返回空数据
         log(
@@ -2559,11 +2859,8 @@ async function submit2FA(code: string): Promise<LoginResult> {
         };
     }
 
-    pendingLogin = null;
-    if (epoch !== sessionEpoch) {
-        // 期间已登出：凭据不落盘，按「已取消」返回
-        return { type: 'failure', message: '登录已取消' };
-    }
+    if (loginCancelled(epoch)) return cancelledLogin();
+    resetPendingLogin();
 
     const twoFactorCreds: Creds = {
         ssecurity,
@@ -2584,6 +2881,8 @@ async function submit2FA(code: string): Promise<LoginResult> {
                 '请在小米运动健康官方 App 中重新授权后再试。',
         };
     }
+    // 探测期间可能被登出/重启：迟到的成功不能覆盖刚发生的新状态
+    if (loginCancelled(epoch)) return cancelledLogin();
 
     saveCredentials(twoFactorCreds);
     log('i', '2FA 登录成功，凭据已保存，account=' + maskAccount(pending.account));

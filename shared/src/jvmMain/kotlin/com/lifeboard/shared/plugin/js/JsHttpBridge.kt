@@ -715,7 +715,10 @@ class JsHttpBridge(
         // 必须先取字节再决定怎么给 JS：图片这类二进制响应一旦走过 string()，
         // 字节会被按字符集解码成不可逆的乱码，插件再 base64Decode 只会得到垃圾。
         // 所以这里读 bytes()，文本按 UTF-8 解码，二进制额外给一份 base64。
-        val bodyBytes = response.body?.bytes() ?: ByteArray(0)
+        //
+        // **有界读取**：不能先 `bytes()` 再判断大小——那等于先把 100MB 读进内存
+        // 再拒绝，限额就失去意义了。超过上限直接抛错，由调用方翻译成 JS 异常。
+        val bodyBytes = readBounded(response.body)
         val isText = isTextual(response.body?.contentType())
         val bodyText = if (isText) String(bodyBytes, Charsets.UTF_8) else ""
         val obj = PluginJsonObject()
@@ -754,6 +757,35 @@ class JsHttpBridge(
         obj.put("setCookie", setCookie)
         return obj.toString()
     }
+
+    /**
+     * 有界读取响应体。
+     *
+     * 超限立即抛错而不是截断：截断的 JSON 会被插件当成"解析失败"，
+     * 与"响应太大"是两个完全不同的故障，不能混。
+     *
+     * @throws PayloadTooLargeException 超过 [MAX_RESPONSE_BYTES]
+     */
+    private fun readBounded(body: okhttp3.ResponseBody?): ByteArray {
+        if (body == null) return ByteArray(0)
+        val buffer = okio.Buffer()
+        var total = 0L
+        val source = body.source()
+        while (true) {
+            val read = source.read(buffer, CHUNK_BYTES)
+            if (read == -1L) break
+            total += read
+            if (total > MAX_RESPONSE_BYTES) {
+                throw PayloadTooLargeException(
+                    "响应体超过 ${MAX_RESPONSE_BYTES / 1024 / 1024} MiB 上限，已中止读取"
+                )
+            }
+        }
+        return buffer.readByteArray()
+    }
+
+    /** 响应体超过上限 */
+    class PayloadTooLargeException(message: String) : Exception(message)
 
     /**
      * 判断响应能否当文本交给插件。
@@ -815,6 +847,12 @@ class JsHttpBridge(
 
         /** 单次超时上限：再长就该怀疑接口卡死，不如让插件拿到超时错误 */
         private const val MAX_TIMEOUT_MS = 180_000L
+
+        /** 响应体上限：4 MiB。超过即中止读取，避免大响应把宿主内存打爆 */
+        private const val MAX_RESPONSE_BYTES = 4L * 1024 * 1024
+
+        /** 有界读取的块大小 */
+        private const val CHUNK_BYTES = 8L * 1024
 
         /**
          * 把 JSON 值编成 `application/x-www-form-urlencoded` 字符串。

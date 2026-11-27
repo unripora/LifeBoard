@@ -3,6 +3,7 @@ package com.lifeboard.server.platform
 import android.content.Context
 import com.lifeboard.plugin.api.ActionResult
 import com.lifeboard.plugin.api.AuthState
+import com.lifeboard.plugin.api.LoginOptions
 import com.lifeboard.plugin.api.LoginResult
 import com.lifeboard.plugin.api.MetricSample
 import com.lifeboard.plugin.api.MetricSeries
@@ -37,8 +38,11 @@ class AndroidPluginInvoker(
 
     private val appContext = context.applicationContext
 
-    override suspend fun login(pluginId: String, inputs: Map<String, String>): LoginResult =
-        PluginManager.login(appContext, pluginId, inputs)
+    override suspend fun login(
+        pluginId: String,
+        inputs: Map<String, String>,
+        options: LoginOptions?,
+    ): LoginResult = PluginManager.login(appContext, pluginId, inputs, options)
 
     override suspend fun logout(pluginId: String) {
         PluginManager.logout(appContext, pluginId)
